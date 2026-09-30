@@ -13,6 +13,11 @@ extern "C" {
 #define NEURON_TYPE_LIF 0
 #define NEURON_TYPE_IF  1
 
+#define ENCODING_DIRECT    0
+#define ENCODING_TTFS      1
+#define ENCODING_POISSON   2
+#define ENCODING_PERIODIC  3
+
 #define SNN_MAX_LAYERS 8
 
 typedef struct {
@@ -24,6 +29,7 @@ typedef struct {
     float threshold;
     int output_size;
     int neuron_type;
+    int encoding_type;
 } snn_config_t;
 
 extern const int g_model_type;

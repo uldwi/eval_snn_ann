@@ -2,11 +2,13 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 
 // TensorFlow Lite Micro (für ANN)
 #include "tensorflow/lite/micro/micro_interpreter.h"
@@ -42,10 +44,16 @@ static float s_snn_mem[SNN_MAX_LAYERS][SNN_MAX_NEURONS_PER_LAYER];
 static uint8_t s_snn_spk[SNN_MAX_LAYERS][SNN_MAX_NEURONS_PER_LAYER];
 static float s_snn_cur[SNN_MAX_LAYERS][SNN_MAX_NEURONS_PER_LAYER];
 static int s_snn_spk_sum[SNN_MAX_NEURONS_PER_LAYER];
+static int16_t s_snn_in_tf[SNN_MAX_NEURONS_PER_LAYER];
+static uint8_t s_snn_in_spk[SNN_MAX_NEURONS_PER_LAYER];
 
 static int run_snn_inference(const float *img, uint32_t *out_spikes) {
     const snn_config_t &cfg = g_snn_config;
     const int num_layers = cfg.hidden_layers_count + 1;
+    const int in_dim0 = cfg.layer_sizes[0];
+    const int out_dim0 = cfg.layer_sizes[1];
+    const float *w0 = g_snn_weights[0];
+    const float *b0 = g_snn_biases[0];
 
     // 1. Membranpotenziale & Spikes zurücksetzen
     for (int l = 0; l < num_layers; ++l) {
@@ -61,24 +69,90 @@ static int run_snn_inference(const float *img, uint32_t *out_spikes) {
 
     uint32_t total_spk = 0;
 
-    // 2. Eingangsstrom für Schicht 0 vorberechnen (statisches Bild: cur0 = W0 * img + b0)
-    int in_dim0 = cfg.layer_sizes[0];
-    int out_dim0 = cfg.layer_sizes[1];
-    const float *w0 = g_snn_weights[0];
-    const float *b0 = g_snn_biases[0];
-
-    for (int i = 0; i < out_dim0; ++i) {
-        float sum = b0[i];
-        const float *row = &w0[i * in_dim0];
-        for (int j = 0; j < in_dim0; ++j) {
-            sum += row[j] * img[j];
+    // 2. Eingangs-Encoding vorverarbeiten
+    if (cfg.encoding_type == ENCODING_DIRECT) {
+        // Direct / Constant current: cur0 = W0 * img + b0 (einmalig vorberechnen)
+        for (int i = 0; i < out_dim0; ++i) {
+            float sum = b0[i];
+            const float *row = &w0[i * in_dim0];
+            for (int j = 0; j < in_dim0; ++j) {
+                sum += row[j] * img[j];
+            }
+            s_snn_cur[0][i] = sum;
         }
-        s_snn_cur[0][i] = sum;
+    } else if (cfg.encoding_type == ENCODING_TTFS) {
+        // Time-To-First-Spike: t_f = round((num_steps - 1) * (1 - clamp(img, 0, 1)))
+        // Hintergrundpixel (img <= 0) feuern nie (tf = -1)
+        for (int j = 0; j < in_dim0; ++j) {
+            float val = img[j];
+            if (val > 0.0f) {
+                float clamped = (val > 1.0f) ? 1.0f : val;
+                s_snn_in_tf[j] = (int16_t)roundf((float)(cfg.num_steps - 1) * (1.0f - clamped));
+            } else {
+                s_snn_in_tf[j] = -1;
+            }
+        }
+    } else if (cfg.encoding_type == ENCODING_PERIODIC) {
+        // Periodic / Rate Periodic: k = round(clamp(img, 0, 1) * num_steps)
+        for (int j = 0; j < in_dim0; ++j) {
+            float val = img[j];
+            float clamped = (val < 0.0f) ? 0.0f : ((val > 1.0f) ? 1.0f : val);
+            s_snn_in_tf[j] = (int16_t)roundf(clamped * (float)cfg.num_steps);
+        }
     }
 
     // 3. Zeitschleife über num_steps
     for (int t = 0; t < cfg.num_steps; ++t) {
-        // Schicht 0 LIF-Schritt (SpikingJelly LIFNode hard-reset: v = beta * v_prev + cur; spike = (v >= th); v = spike ? 0 : v)
+        // Schicht 0 Eingangsstrom ermitteln
+        if (cfg.encoding_type == ENCODING_TTFS) {
+            // Event-driven Spikes für Schicht 0 zum Zeitschritt t
+            for (int j = 0; j < in_dim0; ++j) {
+                s_snn_in_spk[j] = (s_snn_in_tf[j] == t) ? 1 : 0;
+            }
+            for (int i = 0; i < out_dim0; ++i) {
+                float sum = b0[i];
+                const float *row = &w0[i * in_dim0];
+                for (int j = 0; j < in_dim0; ++j) {
+                    if (s_snn_in_spk[j]) {
+                        sum += row[j];
+                    }
+                }
+                s_snn_cur[0][i] = sum;
+            }
+        } else if (cfg.encoding_type == ENCODING_PERIODIC) {
+            for (int j = 0; j < in_dim0; ++j) {
+                s_snn_in_spk[j] = (t < s_snn_in_tf[j]) ? 1 : 0;
+            }
+            for (int i = 0; i < out_dim0; ++i) {
+                float sum = b0[i];
+                const float *row = &w0[i * in_dim0];
+                for (int j = 0; j < in_dim0; ++j) {
+                    if (s_snn_in_spk[j]) {
+                        sum += row[j];
+                    }
+                }
+                s_snn_cur[0][i] = sum;
+            }
+        } else if (cfg.encoding_type == ENCODING_POISSON) {
+            for (int j = 0; j < in_dim0; ++j) {
+                float r = (float)(esp_random() & 0xFFFF) / 65535.0f;
+                float clamped = (img[j] < 0.0f) ? 0.0f : ((img[j] > 1.0f) ? 1.0f : img[j]);
+                s_snn_in_spk[j] = (r < clamped) ? 1 : 0;
+            }
+            for (int i = 0; i < out_dim0; ++i) {
+                float sum = b0[i];
+                const float *row = &w0[i * in_dim0];
+                for (int j = 0; j < in_dim0; ++j) {
+                    if (s_snn_in_spk[j]) {
+                        sum += row[j];
+                    }
+                }
+                s_snn_cur[0][i] = sum;
+            }
+        }
+        // Bei ENCODING_DIRECT ist s_snn_cur[0] bereits vorberechnet
+
+        // Schicht 0 LIF/IF-Schritt
         for (int i = 0; i < out_dim0; ++i) {
             float v_new = cfg.beta * s_snn_mem[0][i] + s_snn_cur[0][i];
             uint8_t s = (v_new >= cfg.threshold) ? 1 : 0;
@@ -112,7 +186,7 @@ static int run_snn_inference(const float *img, uint32_t *out_spikes) {
                 s_snn_cur[l][i] = sum;
             }
 
-            // LIF-Schritt für Schicht l
+            // LIF/IF-Schritt für Schicht l
             for (int i = 0; i < out_dim; ++i) {
                 float v_new = cfg.beta * s_snn_mem[l][i] + s_snn_cur[l][i];
                 uint8_t s = (v_new >= cfg.threshold) ? 1 : 0;
@@ -190,8 +264,13 @@ extern "C" void app_main(void)
 
     if (g_model_type == MODEL_TYPE_SNN) {
         const char *ntype_str = (g_snn_config.neuron_type == NEURON_TYPE_IF) ? "IF" : "LIF";
-        ESP_LOGI(TAG, "SNN SpikingJelly Parameter: Neuron=%s, %d Schichten, %d Steps, Beta=%.2f, Thresh=%.2f",
-                 ntype_str, g_snn_config.hidden_layers_count + 1, g_snn_config.num_steps,
+        const char *enc_str = "DIRECT";
+        if (g_snn_config.encoding_type == ENCODING_TTFS) enc_str = "TTFS";
+        else if (g_snn_config.encoding_type == ENCODING_POISSON) enc_str = "POISSON";
+        else if (g_snn_config.encoding_type == ENCODING_PERIODIC) enc_str = "PERIODIC";
+
+        ESP_LOGI(TAG, "SNN SpikingJelly Parameter: Neuron=%s, Encoding=%s, %d Schichten, %d Steps, Beta=%.2f, Thresh=%.2f",
+                 ntype_str, enc_str, g_snn_config.hidden_layers_count + 1, g_snn_config.num_steps,
                  g_snn_config.beta, g_snn_config.threshold);
     }
 

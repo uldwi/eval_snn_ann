@@ -271,20 +271,20 @@ def print_comparison_summary(all_results: list):
     if not all_results:
         return
 
-    print("\n" + "=" * 126)
-    print("                              GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)")
-    print("=" * 126)
+    print("\n" + "=" * 136)
+    print("                                GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)")
+    print("=" * 136)
 
-    header = f"{'Modell-Name':<16} | {'Typ':<5} | {'Netzwerk-Architektur':<30} | {'Host Acc (10k)':<14} | {'ESP32 Acc (Test)':<18} | {'Größe':<9} | {'Zeit/Inf':<10} | {'Energie/Inf':<12} | {'Mittl. Leist.'}"
-    sub_hdr = f"{'':<16} | {'':<5} | {'':<30} | {'(%)':<14} | {'(% [korrekt])':<18} | {'(Bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)'}"
+    header = f"{'Modell-Name':<20} | {'Typ':<5} | {'Netzwerk-Architektur':<38} | {'Host Acc (10k)':<14} | {'ESP32 Acc (Test)':<18} | {'Größe':<9} | {'Zeit/Inf':<10} | {'Energie/Inf':<12} | {'Mittl. Leist.'}"
+    sub_hdr = f"{'':<20} | {'':<5} | {'':<38} | {'(%)':<14} | {'(% [korrekt])':<18} | {'(Bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)'}"
     print(header)
     print(sub_hdr)
-    print("-" * 126)
+    print("-" * 136)
 
     for res in all_results:
-        name = res.get("name", "Modell")[:16]
+        name = res.get("name", "Modell")[:20]
         m_type = str(res.get("type", "ANN")).upper()[:5]
-        structure = res.get("structure", "-")[:30]
+        structure = res.get("structure", "-")[:38]
         host_acc = f"{res['test_acc']:.2f} %" if res.get("test_acc") is not None else "N/A"
 
         esp32_acc_val = res.get("esp32_acc")
@@ -312,9 +312,9 @@ def print_comparison_summary(all_results: list):
         else:
             t_inf, e_inf, p_avg = "Keine Daten", "Keine Daten", "Keine Daten"
 
-        print(f"{name:<16} | {m_type:<5} | {structure:<30} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg}")
+        print(f"{name:<20} | {m_type:<5} | {structure:<38} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg}")
 
-    print("=" * 126 + "\n")
+    print("=" * 136 + "\n")
 
 
 def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_inferences: int = None) -> dict:

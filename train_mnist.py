@@ -204,12 +204,62 @@ class ConfigurableANN(nn.Module):
         return f"ANN [{' -> '.join(str(s) for s in all_sizes)}]{act_str}"
 
 
+def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.Tensor:
+    """
+    Kodiert Eingabedaten x (Batch, Features) über num_steps Zeitschritte.
+    Unterstützte Encoding-Typen:
+      - 'direct' (Standard): Konstanter Eingangswert über alle Zeitschritte (T, Batch, Features)
+      - 'ttfs' / 'latency': Time-To-First-Spike / Latency Coding.
+                            Helle Pixel feuern früher (t_f = round((T-1) * (1 - x))).
+                            Hintergrundpixel (x <= 0) feuern keinen Spike.
+      - 'poisson' / 'rate': Stochastisches Poisson-Rate-Coding mit Wahrscheinlichkeit proportional zu x.
+      - 'periodic' / 'rate_periodic': Deterministisches Rate-Coding (k = round(x * T) Spikes).
+    """
+    enc = str(encoding_type).lower().strip()
+    if enc in ("direct", "constant", "raw"):
+        return x.unsqueeze(0).repeat(num_steps, 1, 1)
+
+    elif enc in ("ttfs", "latency", "time_to_first_spike"):
+        x_clamped = torch.clamp(x, 0.0, 1.0)
+        t_f = ((num_steps - 1) * (1.0 - x_clamped)).round().long()
+        one_hot = F.one_hot(t_f, num_classes=num_steps).to(x.dtype).to(x.device)
+        mask = (x_clamped > 0.0).unsqueeze(-1).to(x.dtype)
+        one_hot = one_hot * mask
+        return one_hot.permute(2, 0, 1)
+
+    elif enc in ("poisson", "rate", "rate_poisson"):
+        x_clamped = torch.clamp(x, 0.0, 1.0)
+        rand_tensor = torch.rand((num_steps, *x.shape), device=x.device, dtype=x.dtype)
+        return (rand_tensor < x_clamped.unsqueeze(0)).to(x.dtype)
+
+    elif enc in ("periodic", "rate_periodic", "phase"):
+        x_clamped = torch.clamp(x, 0.0, 1.0)
+        k = (x_clamped * num_steps).round().long()
+        t_indices = torch.arange(num_steps, device=x.device).unsqueeze(1).unsqueeze(2)
+        return (t_indices < k.unsqueeze(0)).to(x.dtype)
+
+    else:
+        raise ValueError(f"Unbekannter Encoding-Algorithmus: '{encoding_type}'. Unterstützt: 'direct', 'ttfs', 'poisson', 'periodic'")
+
+
+def get_encoding_code(encoding_name: str) -> int:
+    enc = str(encoding_name).lower().strip()
+    if enc in ("ttfs", "latency", "time_to_first_spike"):
+        return 1
+    elif enc in ("poisson", "rate", "rate_poisson"):
+        return 2
+    elif enc in ("periodic", "rate_periodic", "phase"):
+        return 3
+    else:
+        return 0  # direct
+
+
 class ConfigurableSpikingJellySNN(nn.Module):
     """
     Spiking Neural Network (SNN) trainiert mit SpikingJelly.
     Unterstützt LIFNode (Leaky-Integrate-and-Fire) und IFNode (Integrate-and-Fire) Neuronen
-    mit surrogate gradient (ATan), konfigurierbaren Schichten, Zeitschritten (num_steps),
-    Membran-Decay (beta / tau bei LIF) und Schwellenwert (threshold).
+    mit konfigurierbaren Encodings (Direct, TTFS, Poisson, Periodic), Schichten,
+    Zeitschritten (num_steps), Membran-Decay (beta / tau bei LIF) und Schwellenwert (threshold).
     """
     def __init__(
         self,
@@ -217,6 +267,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
         hidden_layers: Any = None,
         output_size: int = 10,
         neuron_type: str = "lif",
+        encoding_type: str = "direct",
         num_steps: int = 10,
         beta: float = 0.9,
         threshold: float = 1.0,
@@ -228,6 +279,9 @@ class ConfigurableSpikingJellySNN(nn.Module):
         self.neuron_type = str(neuron_type).lower().strip()
         if self.neuron_type not in ("lif", "if"):
             self.neuron_type = "lif"
+        self.encoding_type = str(encoding_type).lower().strip() if encoding_type else "direct"
+        if self.encoding_type not in ("direct", "ttfs", "latency", "time_to_first_spike", "poisson", "rate", "rate_poisson", "periodic", "rate_periodic", "phase"):
+            self.encoding_type = "direct"
         self.num_steps = int(num_steps)
         self.threshold = float(threshold)
 
@@ -275,7 +329,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
         batch_size = x.size(0)
         x_flat = x.view(batch_size, -1)
         # Sequence input over num_steps (T, Batch, Features)
-        x_seq = x_flat.unsqueeze(0).repeat(self.num_steps, 1, 1)
+        x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
 
         cur = x_seq
         for fc, lif in zip(self.fcs, self.lif_layers):
@@ -290,10 +344,11 @@ class ConfigurableSpikingJellySNN(nn.Module):
     def get_structure_summary(self) -> str:
         all_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
         n_label = "SNN-IF" if self.neuron_type == "if" else "SNN-LIF"
+        enc_label = self.encoding_type.upper()
         if self.neuron_type == "if":
-            param_str = f"T={self.num_steps}, θ={self.threshold:.1f}"
+            param_str = f"T={self.num_steps}, Enc={enc_label}, θ={self.threshold:.1f}"
         else:
-            param_str = f"T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.1f}"
+            param_str = f"T={self.num_steps}, Enc={enc_label}, β={self.beta:.2f}, θ={self.threshold:.1f}"
         return f"SpikingJelly {n_label} [{' -> '.join(str(s) for s in all_sizes)}] ({param_str})"
 
 
@@ -326,6 +381,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
     if model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
+        encoding_type = str(model_cfg.get("encoding_type", model_cfg.get("encoding", "direct"))).lower()
         num_steps = int(model_cfg.get("num_steps", model_cfg.get("steps", 10)))
         beta = float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0
         threshold = float(model_cfg.get("threshold", 1.0))
@@ -334,6 +390,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
             hidden_layers=hidden_layers,
             output_size=output_size,
             neuron_type=neuron_type,
+            encoding_type=encoding_type,
             num_steps=num_steps,
             beta=beta,
             threshold=threshold,
@@ -353,6 +410,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     print(f"  - Verborgene Schichten:{hidden_layers}")
     if model_type == "snn":
         print(f"  - Neuronen-Typ:        {model.neuron_type.upper()}")
+        print(f"  - Encoding-Typ:        {model.encoding_type.upper()}")
         print(f"  - Zeitschritte (Steps):{model.num_steps}")
         if model.neuron_type == "lif":
             print(f"  - Membran-Decay (Beta):{model.beta}")
@@ -668,6 +726,10 @@ def export_c_files(
         f.write("#define MODEL_TYPE_SNN 1\n\n")
         f.write("#define NEURON_TYPE_LIF 0\n")
         f.write("#define NEURON_TYPE_IF  1\n\n")
+        f.write("#define ENCODING_DIRECT    0\n")
+        f.write("#define ENCODING_TTFS      1\n")
+        f.write("#define ENCODING_POISSON   2\n")
+        f.write("#define ENCODING_PERIODIC  3\n\n")
         f.write("#define SNN_MAX_LAYERS 8\n\n")
         f.write("typedef struct {\n")
         f.write("    int input_size;\n")
@@ -678,6 +740,7 @@ def export_c_files(
         f.write("    float threshold;\n")
         f.write("    int output_size;\n")
         f.write("    int neuron_type;\n")
+        f.write("    int encoding_type;\n")
         f.write("} snn_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
@@ -718,7 +781,7 @@ def export_c_files(
 
         if model_type == "ann":
             # Dummy SNN Symbole
-            f.write("const snn_config_t g_snn_config = {0, 0, {0}, 0, 0.0f, 0.0f, 0, 0};\n")
+            f.write("const snn_config_t g_snn_config = {0, 0, {0}, 0, 0.0f, 0.0f, 0, 0, 0};\n")
             f.write("const float* const g_snn_weights[] = {0};\n")
             f.write("const float* const g_snn_biases[] = {0};\n")
         elif model_type == "snn":
@@ -759,6 +822,7 @@ def export_c_files(
             f.write("};\n\n")
 
             n_type_code = 1 if getattr(model, "neuron_type", "lif") == "if" else 0
+            enc_code = get_encoding_code(getattr(model, "encoding_type", "direct"))
             layer_sizes_str = ", ".join(str(s) for s in layer_sizes)
             f.write("const snn_config_t g_snn_config = {\n")
             f.write(f"    .input_size = {input_size},\n")
@@ -769,6 +833,7 @@ def export_c_files(
             f.write(f"    .threshold = {model.threshold:.4f}f,\n")
             f.write(f"    .output_size = {output_size},\n")
             f.write(f"    .neuron_type = {n_type_code},\n")
+            f.write(f"    .encoding_type = {enc_code},\n")
             f.write("};\n")
 
     # 3. mnist_test_data.h (Testbilder und Labels)
@@ -841,6 +906,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
             if m_type == "snn":
                 model_dict["neuron_type"] = str(m.get("neuron_type", m.get("neuron", "lif"))).lower()
+                model_dict["encoding_type"] = str(m.get("encoding_type", m.get("encoding", "direct"))).lower()
                 model_dict["num_steps"] = int(m.get("num_steps", m.get("steps", 10)))
                 model_dict["beta"] = float(m.get("beta", 0.9))
                 model_dict["threshold"] = float(m.get("threshold", 1.0))
@@ -884,6 +950,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         }
         if m_type == "snn":
             model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
+            model_dict["encoding_type"] = str(single_m.get("encoding_type", single_m.get("encoding", "direct"))).lower()
             model_dict["num_steps"] = int(single_m.get("num_steps", single_m.get("steps", 10)))
             model_dict["beta"] = float(single_m.get("beta", 0.9))
             model_dict["threshold"] = float(single_m.get("threshold", 1.0))

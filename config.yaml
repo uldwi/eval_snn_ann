@@ -57,6 +57,11 @@ joulescope:
 #       Spiking Neural Network trainiert mit SpikingJelly.
 #       Optionen:
 #         - neuron_type: "lif" (Leaky-Integrate-and-Fire, Standard) oder "if" (Integrate-and-Fire)
+#         - encoding_type: Eingangs-Encoding-Algorithmus:
+#             * "direct"   (Standard): Konstanter analoger Eingangsstrom über alle Zeitschritte
+#             * "ttfs"     (Time-To-First-Spike / Latency Coding): Früheres Feuern bei höherer Intensität
+#             * "periodic" (Deterministisches Rate-Coding): Gleichmäßige Spike-Verteilung
+#             * "poisson"  (Stochastisches Poisson-Rate-Coding): Zufällige Spikes gemäß Pixel-Intensität
 #         - hidden_layers: z. B. [64] oder [128, 64]
 #         - num_steps: Zeitschritte (z. B. 10)
 #         - beta: Membran-Decay (nur bei LIF, z. B. 0.9)
@@ -74,38 +79,37 @@ models:
     hidden_layers: [64]
     activation: "relu"
 
-  - name: "SNN_LIF_64"
+  - name: "SNN_LIF_64_Direct"
     type: "snn"
     neuron_type: "lif"
+    encoding_type: "direct"
     hidden_layers: [64]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
 
-  - name: "SNN_IF_64"
-    type: "snn"
-    neuron_type: "if"
-    hidden_layers: [64]
-    num_steps: 10
-    threshold: 1.0
-
-  - name: "ANN_128_64"
-    type: "ann"
-    hidden_layers: [128, 64]
-    activation: "relu"
-
-  - name: "SNN_LIF_128_64"
+  - name: "SNN_LIF_64_TTFS"
     type: "snn"
     neuron_type: "lif"
-    hidden_layers: [128, 64]
+    encoding_type: "ttfs"
+    hidden_layers: [64]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
 
-  - name: "SNN_IF_128_64"
+  - name: "SNN_IF_64_TTFS"
     type: "snn"
     neuron_type: "if"
-    hidden_layers: [128, 64]
+    encoding_type: "ttfs"
+    hidden_layers: [64]
+    num_steps: 10
+    threshold: 1.0
+
+  - name: "SNN_IF_64_Periodic"
+    type: "snn"
+    neuron_type: "if"
+    encoding_type: "periodic"
+    hidden_layers: [64]
     num_steps: 10
     threshold: 1.0
 
