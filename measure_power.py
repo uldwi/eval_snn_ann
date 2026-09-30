@@ -207,6 +207,62 @@ def display_results(
     }
 
 
+def capture_esp32_serial_metrics(port: str = None, timeout: float = 6.0, baudrate: int = 115200) -> dict:
+    """
+    Versucht, über die serielle Schnittstelle die Genauigkeit und Inferenz-Metriken
+    direkt aus den Log-Ausgaben des ESP32 zu lesen.
+    """
+    try:
+        import serial
+        import glob
+    except ImportError:
+        return {}
+
+    if port is None:
+        ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+        if not ports:
+            return {}
+        port = ports[0]
+
+    if not os.path.exists(port):
+        return {}
+
+    metrics = {}
+    try:
+        with serial.Serial(port, baudrate=baudrate, timeout=1.0) as ser:
+            ser.reset_input_buffer()
+            start_t = time.time()
+            while time.time() - start_t < timeout:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                # Format: ESP32_METRICS: ACC=96.00;CORRECT=48;TOTAL=50;TIME_US=482000
+                if "ESP32_METRICS:" in line:
+                    parts = line.split("ESP32_METRICS:")[1].strip().split(";")
+                    for p in parts:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            k = k.strip()
+                            v = v.strip()
+                            if k == "ACC":
+                                metrics["esp32_acc"] = float(v)
+                            elif k == "CORRECT":
+                                metrics["esp32_correct"] = int(v)
+                            elif k == "TOTAL":
+                                metrics["esp32_total"] = int(v)
+                            elif k == "TIME_US":
+                                metrics["esp32_time_us"] = int(v)
+                    if "esp32_acc" in metrics:
+                        break
+    except Exception:
+        pass
+
+    return metrics
+
+
 def print_comparison_summary(all_results: list):
     """
     Gibt eine übersichtliche tabellarische Zusammenfassung und den Vergleich
@@ -215,21 +271,37 @@ def print_comparison_summary(all_results: list):
     if not all_results:
         return
 
-    print("\n" + "=" * 110)
-    print("                      GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)")
-    print("=" * 110)
+    print("\n" + "=" * 126)
+    print("                              GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)")
+    print("=" * 126)
 
-    header = f"{'Modell-Name':<16} | {'Typ':<5} | {'Netzwerk-Architektur':<32} | {'Test-Acc':<9} | {'Größe':<9} | {'Zeit/Inf':<11} | {'Energie/Inf':<13} | {'Mittl. Leist.'}"
-    sub_hdr = f"{'':<16} | {'':<5} | {'':<32} | {'(%)':<9} | {'(Bytes)':<9} | {'(ms)':<11} | {'(µJ)':<13} | {'(mW)'}"
+    header = f"{'Modell-Name':<16} | {'Typ':<5} | {'Netzwerk-Architektur':<30} | {'Host Acc (10k)':<14} | {'ESP32 Acc (Test)':<18} | {'Größe':<9} | {'Zeit/Inf':<10} | {'Energie/Inf':<12} | {'Mittl. Leist.'}"
+    sub_hdr = f"{'':<16} | {'':<5} | {'':<30} | {'(%)':<14} | {'(% [korrekt])':<18} | {'(Bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)'}"
     print(header)
     print(sub_hdr)
-    print("-" * 110)
+    print("-" * 126)
 
     for res in all_results:
         name = res.get("name", "Modell")[:16]
         m_type = str(res.get("type", "ANN")).upper()[:5]
-        structure = res.get("structure", "-")[:32]
-        test_acc = f"{res['test_acc']:.2f} %" if res.get("test_acc") is not None else "N/A"
+        structure = res.get("structure", "-")[:30]
+        host_acc = f"{res['test_acc']:.2f} %" if res.get("test_acc") is not None else "N/A"
+
+        esp32_acc_val = res.get("esp32_acc")
+        if esp32_acc_val is None:
+            esp32_acc_val = res.get("subset_test_acc")
+
+        corr = res.get("esp32_correct", res.get("subset_correct"))
+        tot = res.get("esp32_total", res.get("subset_total", res.get("num_test_samples")))
+
+        if esp32_acc_val is not None:
+            if corr is not None and tot is not None:
+                esp32_acc_str = f"{esp32_acc_val:.2f} % ({corr}/{tot})"
+            else:
+                esp32_acc_str = f"{esp32_acc_val:.2f} %"
+        else:
+            esp32_acc_str = "N/A"
+
         size_str = f"{res['model_size_bytes']:,}" if res.get("model_size_bytes") else "N/A"
 
         m = res.get("metrics")
@@ -240,9 +312,9 @@ def print_comparison_summary(all_results: list):
         else:
             t_inf, e_inf, p_avg = "Keine Daten", "Keine Daten", "Keine Daten"
 
-        print(f"{name:<16} | {m_type:<5} | {structure:<32} | {test_acc:<9} | {size_str:<9} | {t_inf:<11} | {e_inf:<13} | {p_avg}")
+        print(f"{name:<16} | {m_type:<5} | {structure:<30} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg}")
 
-    print("=" * 110 + "\n")
+    print("=" * 126 + "\n")
 
 
 def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_inferences: int = None) -> dict:
@@ -567,22 +639,29 @@ def main():
                 export_model_entry_to_main(model_entry, output_dir="main")
 
             # 2. ESP32 bei Bedarf bauen und flashen
+            serial_metrics = {}
             if args.flash and args.duration is None:
                 flash_ok = flash_esp32(port=args.port, build=not args.skip_build)
                 if not flash_ok:
                     print(f"[ESP-IDF] Warnung: Flashen für Modell '{model_name}' war nicht erfolgreich.", file=sys.stderr)
-                elif args.wait_unplug:
-                    print("\n" + "=" * 65)
-                    print(f">>> ESP32 erfolgreich für Modell '{model_name}' geflasht! <<<")
-                    print("Sie können jetzt das USB-Kabel vom ESP32 abziehen, damit die")
-                    print("USB-Versorgung das Messergebnis nicht beeinflusst.")
-                    print("(Hinweis: ESP32 muss weiterhin über Joulescope/3.3V versorgt sein).")
-                    print("=" * 65)
-                    try:
-                        input(f"\nDrücken Sie [Enter], um die Joulescope-Messung für '{model_name}' zu starten...")
-                    except (KeyboardInterrupt, EOFError):
-                        print("\nMessung durch Benutzer abgebrochen.")
-                        break
+                else:
+                    # Lese serielle Logs (falls USB noch verbunden ist)
+                    serial_metrics = capture_esp32_serial_metrics(port=args.port, timeout=4.5)
+                    if serial_metrics and "esp32_acc" in serial_metrics:
+                        print(f"[ESP32] Ermittelte Test-Genauigkeit (über UART): {serial_metrics['esp32_acc']:.2f}% ({serial_metrics.get('esp32_correct')}/{serial_metrics.get('esp32_total')} korrekt)")
+
+                    if args.wait_unplug:
+                        print("\n" + "=" * 65)
+                        print(f">>> ESP32 erfolgreich für Modell '{model_name}' geflasht! <<<")
+                        print("Sie können jetzt das USB-Kabel vom ESP32 abziehen, damit die")
+                        print("USB-Versorgung das Messergebnis nicht beeinflusst.")
+                        print("(Hinweis: ESP32 muss weiterhin über Joulescope/3.3V versorgt sein).")
+                        print("=" * 65)
+                        try:
+                            input(f"\nDrücken Sie [Enter], um die Joulescope-Messung für '{model_name}' zu starten...")
+                        except (KeyboardInterrupt, EOFError):
+                            print("\nMessung durch Benutzer abgebrochen.")
+                            break
 
             # 3. Joulescope-Messung durchführen
             if args.duration is not None and args.duration > 0:
@@ -590,11 +669,28 @@ def main():
             else:
                 metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples)
 
+            esp32_acc = model_entry.get("subset_test_acc")
+            esp32_corr = model_entry.get("subset_correct")
+            esp32_tot = model_entry.get("subset_total", model_samples)
+            if serial_metrics and "esp32_acc" in serial_metrics:
+                esp32_acc = serial_metrics["esp32_acc"]
+                esp32_corr = serial_metrics.get("esp32_correct", esp32_corr)
+                esp32_tot = serial_metrics.get("esp32_total", esp32_tot)
+
+            if esp32_acc is not None:
+                print(f"[ESP32 Test-Accuracy] Modell '{model_name}': {esp32_acc:.2f}% ({esp32_corr}/{esp32_tot} Samples korrekt klassifiziert)")
+
             all_results.append({
                 "name": model_name,
                 "type": model_entry.get("type", "ann"),
                 "structure": model_entry.get("structure", "-"),
                 "test_acc": model_entry.get("test_acc"),
+                "subset_test_acc": model_entry.get("subset_test_acc"),
+                "subset_correct": model_entry.get("subset_correct"),
+                "subset_total": model_entry.get("subset_total"),
+                "esp32_acc": esp32_acc,
+                "esp32_correct": esp32_corr,
+                "esp32_total": esp32_tot,
                 "model_size_bytes": model_entry.get("model_size_bytes"),
                 "metrics": metrics,
                 "num_test_samples": model_samples,

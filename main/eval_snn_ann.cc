@@ -78,11 +78,11 @@ static int run_snn_inference(const float *img, uint32_t *out_spikes) {
 
     // 3. Zeitschleife über num_steps
     for (int t = 0; t < cfg.num_steps; ++t) {
-        // Schicht 0 LIF-Schritt
+        // Schicht 0 LIF-Schritt (SpikingJelly LIFNode hard-reset: v = beta * v_prev + cur; spike = (v >= th); v = spike ? 0 : v)
         for (int i = 0; i < out_dim0; ++i) {
-            uint8_t s = (s_snn_mem[0][i] > cfg.threshold) ? 1 : 0;
-            float reset = s ? (cfg.beta * cfg.threshold) : 0.0f;
-            s_snn_mem[0][i] = cfg.beta * s_snn_mem[0][i] + s_snn_cur[0][i] - reset;
+            float v_new = cfg.beta * s_snn_mem[0][i] + s_snn_cur[0][i];
+            uint8_t s = (v_new >= cfg.threshold) ? 1 : 0;
+            s_snn_mem[0][i] = s ? 0.0f : v_new;
             s_snn_spk[0][i] = s;
             if (s) {
                 total_spk++;
@@ -114,9 +114,9 @@ static int run_snn_inference(const float *img, uint32_t *out_spikes) {
 
             // LIF-Schritt für Schicht l
             for (int i = 0; i < out_dim; ++i) {
-                uint8_t s = (s_snn_mem[l][i] > cfg.threshold) ? 1 : 0;
-                float reset = s ? (cfg.beta * cfg.threshold) : 0.0f;
-                s_snn_mem[l][i] = cfg.beta * s_snn_mem[l][i] + s_snn_cur[l][i] - reset;
+                float v_new = cfg.beta * s_snn_mem[l][i] + s_snn_cur[l][i];
+                uint8_t s = (v_new >= cfg.threshold) ? 1 : 0;
+                s_snn_mem[l][i] = s ? 0.0f : v_new;
                 s_snn_spk[l][i] = s;
                 if (s) {
                     total_spk++;
@@ -189,8 +189,9 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "TFLM Engine initialisiert. Input Dim=%d, Output Dim=%d", input->dims->data[1], output->dims->data[1]);
 
     if (g_model_type == MODEL_TYPE_SNN) {
-        ESP_LOGI(TAG, "SNN SpikingJelly Parameter: %d Schichten, %d Steps, Beta=%.2f, Thresh=%.2f",
-                 g_snn_config.hidden_layers_count + 1, g_snn_config.num_steps,
+        const char *ntype_str = (g_snn_config.neuron_type == NEURON_TYPE_IF) ? "IF" : "LIF";
+        ESP_LOGI(TAG, "SNN SpikingJelly Parameter: Neuron=%s, %d Schichten, %d Steps, Beta=%.2f, Thresh=%.2f",
+                 ntype_str, g_snn_config.hidden_layers_count + 1, g_snn_config.num_steps,
                  g_snn_config.beta, g_snn_config.threshold);
     }
 
@@ -244,15 +245,18 @@ extern "C" void app_main(void)
         double avg_time_ms = (double)total_time_us / (1000.0 * MNIST_TEST_SUBSET);
         double accuracy = (100.0 * correct_count) / MNIST_TEST_SUBSET;
 
-        ESP_LOGI(TAG, "=== Inferenz-Ergebnisse (%s: %s) ===",
-                 (g_model_type == MODEL_TYPE_SNN) ? "SNN" : "ANN", g_model_name);
-        ESP_LOGI(TAG, "Gesamtdauer:         %" PRId64 " us (%.2f ms)", total_time_us, (double)total_time_us / 1000.0);
-        ESP_LOGI(TAG, "Dauer pro Bild:      %.3f ms", avg_time_ms);
-        ESP_LOGI(TAG, "Klassifikationen:    %d / %d korrekt (Genauigkeit: %.2f %%)", correct_count, MNIST_TEST_SUBSET, accuracy);
+        ESP_LOGI(TAG, "================ ESP32 TEST ACCURACY ================");
+        ESP_LOGI(TAG, "Modell:               %s (%s)", g_model_name, (g_model_type == MODEL_TYPE_SNN) ? "SNN" : "ANN");
+        ESP_LOGI(TAG, "Gesamtdauer:          %" PRId64 " us (%.2f ms)", total_time_us, (double)total_time_us / 1000.0);
+        ESP_LOGI(TAG, "Dauer pro Bild:       %.3f ms", avg_time_ms);
+        ESP_LOGI(TAG, "Klassifikationen:     %d / %d korrekt (Genauigkeit: %.2f %%)", correct_count, MNIST_TEST_SUBSET, accuracy);
+        ESP_LOGI(TAG, "ESP32 Test Accuracy:  %.2f %%", accuracy);
+        ESP_LOGI(TAG, "ESP32_METRICS: ACC=%.2f;CORRECT=%d;TOTAL=%d;TIME_US=%" PRId64, accuracy, correct_count, MNIST_TEST_SUBSET, total_time_us);
         if (g_model_type == MODEL_TYPE_SNN) {
             double avg_spikes = (double)total_all_spikes / (double)MNIST_TEST_SUBSET;
-            ESP_LOGI(TAG, "Gesamt-Spikes:       %" PRIu64 " (durchschnittlich %.1f Spikes/Inferenz)", total_all_spikes, avg_spikes);
+            ESP_LOGI(TAG, "Gesamt-Spikes:        %" PRIu64 " (durchschnittlich %.1f Spikes/Inferenz)", total_all_spikes, avg_spikes);
         }
+        ESP_LOGI(TAG, "=====================================================\n");
         ESP_LOGI(TAG, "Messzyklus abgeschlossen. Warte 5 Sekunden bis zum naechsten Zyklus...\n");
 
         vTaskDelay(pdMS_TO_TICKS(5000));

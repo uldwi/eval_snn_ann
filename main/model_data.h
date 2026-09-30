@@ -10,6 +10,9 @@ extern "C" {
 #define MODEL_TYPE_ANN 0
 #define MODEL_TYPE_SNN 1
 
+#define NEURON_TYPE_LIF 0
+#define NEURON_TYPE_IF  1
+
 #define SNN_MAX_LAYERS 8
 
 typedef struct {
@@ -20,6 +23,7 @@ typedef struct {
     float beta;
     float threshold;
     int output_size;
+    int neuron_type;
 } snn_config_t;
 
 extern const int g_model_type;

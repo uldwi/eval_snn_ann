@@ -54,8 +54,13 @@ joulescope:
 #       Optionen: hidden_layers, activation ("relu", "none")
 #
 #   - type: "snn"
-#       Spiking Neural Network mit Leaky-Integrate-and-Fire (LIF) Neuronen.
-#       Optionen: hidden_layers, num_steps (z. B. 10), beta (0.9), threshold (1.0)
+#       Spiking Neural Network trainiert mit SpikingJelly.
+#       Optionen:
+#         - neuron_type: "lif" (Leaky-Integrate-and-Fire, Standard) oder "if" (Integrate-and-Fire)
+#         - hidden_layers: z. B. [64] oder [128, 64]
+#         - num_steps: Zeitschritte (z. B. 10)
+#         - beta: Membran-Decay (nur bei LIF, z. B. 0.9)
+#         - threshold: Schwellenwert (z. B. 1.0)
 #
 # Ablauf:
 #  1. Zuerst werden ALLE hier definierten Modelle nacheinander trainiert.
@@ -69,11 +74,19 @@ models:
     hidden_layers: [64]
     activation: "relu"
 
-  - name: "SNN_64"
+  - name: "SNN_LIF_64"
     type: "snn"
+    neuron_type: "lif"
     hidden_layers: [64]
     num_steps: 10
     beta: 0.9
+    threshold: 1.0
+
+  - name: "SNN_IF_64"
+    type: "snn"
+    neuron_type: "if"
+    hidden_layers: [64]
+    num_steps: 10
     threshold: 1.0
 
   - name: "ANN_128_64"
@@ -81,11 +94,19 @@ models:
     hidden_layers: [128, 64]
     activation: "relu"
 
-  - name: "SNN_128_64"
+  - name: "SNN_LIF_128_64"
     type: "snn"
+    neuron_type: "lif"
     hidden_layers: [128, 64]
     num_steps: 10
     beta: 0.9
+    threshold: 1.0
+
+  - name: "SNN_IF_128_64"
+    type: "snn"
+    neuron_type: "if"
+    hidden_layers: [128, 64]
+    num_steps: 10
     threshold: 1.0
 
 # Hinweis: Ein einzelnes Modell 'model' wird für Rückwärtskompatibilität weiterhin unterstützt:

@@ -207,14 +207,16 @@ class ConfigurableANN(nn.Module):
 class ConfigurableSpikingJellySNN(nn.Module):
     """
     Spiking Neural Network (SNN) trainiert mit SpikingJelly.
-    Verwendet LIFNode Neuronen mit surrogate gradient (ATan), konfigurierbaren Schichten,
-    Zeitschritten (num_steps), Membran-Decay (beta / tau) und Schwellenwert (threshold).
+    Unterstützt LIFNode (Leaky-Integrate-and-Fire) und IFNode (Integrate-and-Fire) Neuronen
+    mit surrogate gradient (ATan), konfigurierbaren Schichten, Zeitschritten (num_steps),
+    Membran-Decay (beta / tau bei LIF) und Schwellenwert (threshold).
     """
     def __init__(
         self,
         input_size: int = 784,
         hidden_layers: Any = None,
         output_size: int = 10,
+        neuron_type: str = "lif",
         num_steps: int = 10,
         beta: float = 0.9,
         threshold: float = 1.0,
@@ -223,32 +225,49 @@ class ConfigurableSpikingJellySNN(nn.Module):
         self.input_size = int(input_size)
         self.hidden_layers = parse_hidden_layers(hidden_layers)
         self.output_size = int(output_size)
+        self.neuron_type = str(neuron_type).lower().strip()
+        if self.neuron_type not in ("lif", "if"):
+            self.neuron_type = "lif"
         self.num_steps = int(num_steps)
-        self.beta = float(beta)
         self.threshold = float(threshold)
 
-        # tau in SpikingJelly entspricht: beta = 1 - 1/tau <=> tau = 1 / (1 - beta)
-        if self.beta >= 1.0:
+        if self.neuron_type == "if":
+            self.beta = 1.0
             self.tau = 1000.0
-        elif self.beta <= 0.0:
-            self.tau = 1.0
         else:
-            self.tau = float(1.0 / (1.0 - self.beta))
+            self.beta = float(beta)
+            # tau in SpikingJelly entspricht: beta = 1 - 1/tau <=> tau = 1 / (1 - beta)
+            if self.beta >= 1.0:
+                self.tau = 1000.0
+            elif self.beta <= 0.0:
+                self.tau = 1.0
+            else:
+                self.tau = float(1.0 / (1.0 - self.beta))
 
         all_layer_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
         self.fcs = nn.ModuleList([
             sj_layer.Linear(all_layer_sizes[i], all_layer_sizes[i + 1]) for i in range(len(all_layer_sizes) - 1)
         ])
-        self.lif_layers = nn.ModuleList([
-            neuron.LIFNode(
-                tau=self.tau,
-                decay_input=False,
-                v_threshold=self.threshold,
-                v_reset=0.0,
-                surrogate_function=surrogate.ATan(),
-                detach_reset=True,
-            ) for _ in range(len(all_layer_sizes) - 1)
-        ])
+        if self.neuron_type == "if":
+            self.lif_layers = nn.ModuleList([
+                neuron.IFNode(
+                    v_threshold=self.threshold,
+                    v_reset=0.0,
+                    surrogate_function=surrogate.ATan(),
+                    detach_reset=True,
+                ) for _ in range(len(all_layer_sizes) - 1)
+            ])
+        else:
+            self.lif_layers = nn.ModuleList([
+                neuron.LIFNode(
+                    tau=self.tau,
+                    decay_input=False,
+                    v_threshold=self.threshold,
+                    v_reset=0.0,
+                    surrogate_function=surrogate.ATan(),
+                    detach_reset=True,
+                ) for _ in range(len(all_layer_sizes) - 1)
+            ])
         if HAS_SPIKINGJELLY:
             functional.set_step_mode(self, 'm')
 
@@ -270,7 +289,12 @@ class ConfigurableSpikingJellySNN(nn.Module):
 
     def get_structure_summary(self) -> str:
         all_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
-        return f"SpikingJelly SNN [{' -> '.join(str(s) for s in all_sizes)}] (T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.1f})"
+        n_label = "SNN-IF" if self.neuron_type == "if" else "SNN-LIF"
+        if self.neuron_type == "if":
+            param_str = f"T={self.num_steps}, θ={self.threshold:.1f}"
+        else:
+            param_str = f"T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.1f}"
+        return f"SpikingJelly {n_label} [{' -> '.join(str(s) for s in all_sizes)}] ({param_str})"
 
 
 # -------------------------------------------------------------
@@ -301,13 +325,15 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         np.random.seed(random_seed)
 
     if model_type == "snn":
+        neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
         num_steps = int(model_cfg.get("num_steps", model_cfg.get("steps", 10)))
-        beta = float(model_cfg.get("beta", 0.9))
+        beta = float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0
         threshold = float(model_cfg.get("threshold", 1.0))
         model = ConfigurableSpikingJellySNN(
             input_size=input_size,
             hidden_layers=hidden_layers,
             output_size=output_size,
+            neuron_type=neuron_type,
             num_steps=num_steps,
             beta=beta,
             threshold=threshold,
@@ -326,8 +352,10 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     print(f"  - Netzwerk-Aufbau:     {model.get_structure_summary()}")
     print(f"  - Verborgene Schichten:{hidden_layers}")
     if model_type == "snn":
+        print(f"  - Neuronen-Typ:        {model.neuron_type.upper()}")
         print(f"  - Zeitschritte (Steps):{model.num_steps}")
-        print(f"  - Membran-Decay (Beta):{model.beta}")
+        if model.neuron_type == "lif":
+            print(f"  - Membran-Decay (Beta):{model.beta}")
         print(f"  - Schwellenwert (Thresh):{model.threshold}")
     else:
         print(f"  - Aktivierung:         {model.activation_name.upper()}")
@@ -396,6 +424,35 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
     print(f"[PyTorch] Training für '{config.get('name', 'Modell')}' abgeschlossen (Test-Genauigkeit: {test_acc:.2f}%).\n")
     return model, test_dataset, test_acc, avg_loss
+
+
+def evaluate_subset(
+    model: Union[ConfigurableANN, ConfigurableSpikingJellySNN],
+    test_dataset: datasets.MNIST,
+    num_samples: int = 50,
+    device: str = "cpu",
+) -> Tuple[float, int, int]:
+    """
+    Evaluiert das Modell auf einer definierten Teilmenge des Testdatensatzes (z. B. den auf den ESP32 exportierten Samples).
+    Gibt (genauigkeit_in_prozent, anzahl_korrekt, anzahl_gesamt) zurück.
+    """
+    model.eval()
+    total = min(num_samples, len(test_dataset))
+    if total <= 0:
+        return 0.0, 0, 0
+
+    correct = 0
+    with torch.no_grad():
+        for i in range(total):
+            img_tensor, label = test_dataset[i]
+            img_tensor = img_tensor.unsqueeze(0).to(device)
+            out = model(img_tensor)
+            pred = out.argmax(dim=1).item()
+            if pred == label:
+                correct += 1
+
+    acc = (100.0 * correct) / total
+    return acc, correct, total
 
 
 # -------------------------------------------------------------
@@ -609,6 +666,8 @@ def export_c_files(
         f.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         f.write("#define MODEL_TYPE_ANN 0\n")
         f.write("#define MODEL_TYPE_SNN 1\n\n")
+        f.write("#define NEURON_TYPE_LIF 0\n")
+        f.write("#define NEURON_TYPE_IF  1\n\n")
         f.write("#define SNN_MAX_LAYERS 8\n\n")
         f.write("typedef struct {\n")
         f.write("    int input_size;\n")
@@ -618,6 +677,7 @@ def export_c_files(
         f.write("    float beta;\n")
         f.write("    float threshold;\n")
         f.write("    int output_size;\n")
+        f.write("    int neuron_type;\n")
         f.write("} snn_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
@@ -658,7 +718,7 @@ def export_c_files(
 
         if model_type == "ann":
             # Dummy SNN Symbole
-            f.write("const snn_config_t g_snn_config = {0, 0, {0}, 0, 0.0f, 0.0f, 0};\n")
+            f.write("const snn_config_t g_snn_config = {0, 0, {0}, 0, 0.0f, 0.0f, 0, 0};\n")
             f.write("const float* const g_snn_weights[] = {0};\n")
             f.write("const float* const g_snn_biases[] = {0};\n")
         elif model_type == "snn":
@@ -698,6 +758,7 @@ def export_c_files(
                 f.write(f"    s_snn_b{l_idx},\n")
             f.write("};\n\n")
 
+            n_type_code = 1 if getattr(model, "neuron_type", "lif") == "if" else 0
             layer_sizes_str = ", ".join(str(s) for s in layer_sizes)
             f.write("const snn_config_t g_snn_config = {\n")
             f.write(f"    .input_size = {input_size},\n")
@@ -707,6 +768,7 @@ def export_c_files(
             f.write(f"    .beta = {model.beta:.4f}f,\n")
             f.write(f"    .threshold = {model.threshold:.4f}f,\n")
             f.write(f"    .output_size = {output_size},\n")
+            f.write(f"    .neuron_type = {n_type_code},\n")
             f.write("};\n")
 
     # 3. mnist_test_data.h (Testbilder und Labels)
@@ -778,6 +840,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "output_size": output_size,
             }
             if m_type == "snn":
+                model_dict["neuron_type"] = str(m.get("neuron_type", m.get("neuron", "lif"))).lower()
                 model_dict["num_steps"] = int(m.get("num_steps", m.get("steps", 10)))
                 model_dict["beta"] = float(m.get("beta", 0.9))
                 model_dict["threshold"] = float(m.get("threshold", 1.0))
@@ -820,6 +883,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "output_size": int(single_m.get("output_size", 10)),
         }
         if m_type == "snn":
+            model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
             model_dict["num_steps"] = int(single_m.get("num_steps", single_m.get("steps", 10)))
             model_dict["beta"] = float(single_m.get("beta", 0.9))
             model_dict["threshold"] = float(single_m.get("threshold", 1.0))
@@ -882,6 +946,9 @@ def train_all_models(
         print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' ---")
         model, test_dataset, test_acc, test_loss = train_model(m_cfg, device=device)
 
+        samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 50))
+        subset_acc, subset_corr, subset_tot = evaluate_subset(model, test_dataset, num_samples=samples_cnt, device=device)
+
         tflite_bytes = export_pytorch_to_tflite(model)
         model_size = len(tflite_bytes)
 
@@ -892,18 +959,21 @@ def train_all_models(
             "tflite_bytes": tflite_bytes,
             "test_dataset": test_dataset,
             "test_acc": test_acc,
+            "subset_test_acc": subset_acc,
+            "subset_correct": subset_corr,
+            "subset_total": subset_tot,
             "test_loss": test_loss,
             "config": m_cfg,
             "structure": model.get_structure_summary(),
             "model_size_bytes": model_size,
-            "num_test_samples": int(m_cfg.get("evaluation", {}).get("num_test_samples", 50)),
+            "num_test_samples": samples_cnt,
         })
 
     print("\n" + "=" * 70)
     print(f">>> PHASE 1 ABGESCHLOSSEN: {len(trained_models)} Modell{'e' if len(trained_models) > 1 else ''} erfolgreich trainiert! <<<")
     print("=" * 70)
     for m in trained_models:
-        print(f"  * {m['name']:<20} | Typ: {m['type'].upper():<4} | Aufbau: {m['structure']:<40} | Test-Acc: {m['test_acc']:.2f}% | Größe: {m['model_size_bytes']:,} Bytes")
+        print(f"  * {m['name']:<20} | Typ: {m['type'].upper():<4} | Test-Acc (10k): {m['test_acc']:.2f}% | Test-Acc (ESP32-Subset {m['num_test_samples']}): {m['subset_test_acc']:.2f}% ({m['subset_correct']}/{m['subset_total']}) | Größe: {m['model_size_bytes']:,} B")
     print("=" * 70 + "\n")
 
     return trained_models
