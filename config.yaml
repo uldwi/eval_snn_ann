@@ -1,0 +1,98 @@
+# =====================================================================
+# Konfigurationsdatei für Neuronale Netze (ANN & SNN) & Energiemessung
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# Globale Standardeinstellungen für das Training
+# ---------------------------------------------------------------------
+training:
+  # Anzahl der Trainingsepochen (Standardwert)
+  epochs: 5
+
+  # Batch-Größe für das Training
+  batch_size: 64
+
+  # Lernrate für den Optimierer
+  learning_rate: 0.001
+
+  # Optimierer ("adam" oder "sgd")
+  optimizer: "adam"
+
+  # Verzeichnis zum Speichern/Laden des MNIST-Datensatzes
+  data_dir: "./data"
+
+  # Random Seed für reproduzierbare Ergebnisse (z. B. 42 oder null für zufällig)
+  random_seed: 42
+
+# ---------------------------------------------------------------------
+# Globale Einstellungen für die Inferenz auf dem ESP32
+# ---------------------------------------------------------------------
+evaluation:
+  # Anzahl der Test-Samples, die auf den ESP32 für die Inferenzmessung exportiert werden
+  num_test_samples: 50
+
+# ---------------------------------------------------------------------
+# Hardware-Einstellungen (ESP32 & Joulescope)
+# ---------------------------------------------------------------------
+esp32:
+  # GPIO-Pin für das Triggersignal am ESP32 (wird mit Joulescope IN1 verbunden)
+  trigger_pin: 4
+
+joulescope:
+  # Joulescope digitaler Eingangskanal ("in1" oder "in2")
+  trigger_pin: "in1"
+
+  # Timeout in Sekunden beim Warten auf das Triggersignal
+  timeout: 60.0
+
+# ---------------------------------------------------------------------
+# Liste der Modelle für sequentielle Messungen
+#
+# Unterstützte Modelltypen:
+#   - type: "ann" (Standard)
+#       Künstliches neuronales Netz / MLP, ausgeführt mit TensorFlow Lite Micro.
+#       Optionen: hidden_layers, activation ("relu", "none")
+#
+#   - type: "snn"
+#       Spiking Neural Network mit Leaky-Integrate-and-Fire (LIF) Neuronen.
+#       Optionen: hidden_layers, num_steps (z. B. 10), beta (0.9), threshold (1.0)
+#
+# Ablauf:
+#  1. Zuerst werden ALLE hier definierten Modelle nacheinander trainiert.
+#  2. Anschließend wird jedes Modell nacheinander auf den ESP32 geflasht
+#     und mit dem Joulescope vermessen.
+#  3. Am Ende wird ein tabellarischer Gesamtvergleich aller Modelle ausgegeben.
+# ---------------------------------------------------------------------
+models:
+  - name: "ANN_64"
+    type: "ann"
+    hidden_layers: [64]
+    activation: "relu"
+
+  - name: "SNN_64"
+    type: "snn"
+    hidden_layers: [64]
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+
+  - name: "ANN_128_64"
+    type: "ann"
+    hidden_layers: [128, 64]
+    activation: "relu"
+
+  - name: "SNN_128_64"
+    type: "snn"
+    hidden_layers: [128, 64]
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+
+# Hinweis: Ein einzelnes Modell 'model' wird für Rückwärtskompatibilität weiterhin unterstützt:
+# model:
+#   name: "ANN_Default"
+#   type: "ann"
+#   input_size: 784
+#   hidden_layers: [128, 64]
+#   activation: "relu"
+#   output_size: 10

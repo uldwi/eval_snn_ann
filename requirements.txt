@@ -1,0 +1,8 @@
+joulescope>=1.4.0
+numpy>=1.20.0
+torch>=2.0.0
+torchvision>=0.15.0
+flatbuffers>=23.0.0
+tflite>=2.10.0
+pyyaml>=6.0.0
+spikingjelly>=0.0.0.0.14
