@@ -139,12 +139,18 @@ joulescope:
 models:
   # ===================================================================
   # 1. Computer Vision / Bildverarbeitung: MNIST
+  #    Optimierte LeNet/VGG-Stil 2-Stufen ConvNet-Architektur
   # ===================================================================
-  - name: "ANN_MNIST_Conv8_64"
+  - name: "ANN_MNIST_Conv16_32_64"
     type: "ann"
     dataset: "mnist"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
@@ -155,13 +161,18 @@ models:
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_MNIST_LIF_Conv8_TTFS"
+  - name: "SNN_MNIST_LIF_Conv16_32_64_TTFS"
     type: "snn"
     dataset: "mnist"
     neuron_type: "lif"
     encoding_type: "ttfs"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
@@ -176,34 +187,45 @@ models:
 
   # ===================================================================
   # 2. Computer Vision / Bildverarbeitung: Fashion-MNIST
+  #    Tiefere Faltungsstruktur für komplexere Texturen und Kanten
   # ===================================================================
-  - name: "ANN_FashionMNIST_Conv16_64"
+  - name: "ANN_FashionMNIST_Conv32_64_128"
     type: "ann"
     dataset: "fashion_mnist"
     conv_layers:
-      - out_channels: 16
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
         pool_size: 2
-    hidden_layers: [64]
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
     activation: "relu"
     epochs: 6
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_FashionMNIST_LIF_Conv8_Direct"
+  - name: "SNN_FashionMNIST_LIF_Conv32_64_128_Direct"
     type: "snn"
     dataset: "fashion_mnist"
     neuron_type: "lif"
     encoding_type: "direct"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
         pool_size: 2
-    hidden_layers: [64]
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -213,34 +235,45 @@ models:
 
   # ===================================================================
   # 3. Computer Vision / Bildverarbeitung: CIFAR-10 (16x16)
+  #    Multi-Kanal ConvNet zur Erfassung von Farb- und Formmustern
   # ===================================================================
-  - name: "ANN_CIFAR10_Conv16_64"
+  - name: "ANN_CIFAR10_Conv32_64_128"
     type: "ann"
     dataset: "cifar10"
     conv_layers:
-      - out_channels: 16
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
         pool_size: 2
-    hidden_layers: [64]
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
     activation: "relu"
     epochs: 8
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_CIFAR10_LIF_Conv16_Direct"
+  - name: "SNN_CIFAR10_LIF_Conv32_64_128_Direct"
     type: "snn"
     dataset: "cifar10"
     neuron_type: "lif"
     encoding_type: "direct"
     conv_layers:
-      - out_channels: 16
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
         pool_size: 2
-    hidden_layers: [64]
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -250,12 +283,18 @@ models:
 
   # ===================================================================
   # 4. Audio & Keyword Recognition: Speech Commands (KWS)
+  #    TinyML Standard 2D-ConvNet über Mel-Spektrogramme
   # ===================================================================
-  - name: "ANN_KWS_Conv8_64"
+  - name: "ANN_KWS_Conv16_32_64"
     type: "ann"
     dataset: "speech_commands"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
@@ -266,13 +305,18 @@ models:
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_KWS_LIF_Conv8_TTFS"
+  - name: "SNN_KWS_LIF_Conv16_32_64_TTFS"
     type: "snn"
     dataset: "speech_commands"
     neuron_type: "lif"
     encoding_type: "ttfs"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
         kernel_size: 3
         stride: 1
         padding: 1
@@ -287,22 +331,23 @@ models:
 
   # ===================================================================
   # 5. Sensordaten & Zeitreihen: Human Activity Recognition (HAR)
+  #    Deep Feature Pyramid MLP zur Bewegungserkennung
   # ===================================================================
-  - name: "ANN_HAR_64_32"
+  - name: "ANN_HAR_128_64_32"
     type: "ann"
     dataset: "har_time_series"
-    hidden_layers: [64, 32]
+    hidden_layers: [128, 64, 32]
     activation: "relu"
     epochs: 6
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_HAR_LIF_64_32_Direct"
+  - name: "SNN_HAR_LIF_128_64_32_Direct"
     type: "snn"
     dataset: "har_time_series"
     neuron_type: "lif"
     encoding_type: "direct"
-    hidden_layers: [64, 32]
+    hidden_layers: [128, 64, 32]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -312,22 +357,23 @@ models:
 
   # ===================================================================
   # 6. Sensordaten & Zeitreihen: Synthetische Zeitreihenmuster
+  #    Hierarchisches MLP für Zeitreihen-Mustererkennung
   # ===================================================================
-  - name: "ANN_TimeSeries_64_32"
+  - name: "ANN_TimeSeries_96_48"
     type: "ann"
     dataset: "synthetic_time_series"
-    hidden_layers: [64, 32]
+    hidden_layers: [96, 48]
     activation: "relu"
     epochs: 6
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_TimeSeries_LIF_64_32_TTFS"
+  - name: "SNN_TimeSeries_LIF_96_48_TTFS"
     type: "snn"
     dataset: "synthetic_time_series"
     neuron_type: "lif"
     encoding_type: "ttfs"
-    hidden_layers: [64, 32]
+    hidden_layers: [96, 48]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -337,33 +383,44 @@ models:
 
   # ===================================================================
   # 7. Biomedizinische Signale: EEG Gehirnwellen-Bänder
+  #    ConvNet zur Extraktion spektral-zeitlicher Gehirnaktivitätsmuster
   # ===================================================================
-  - name: "ANN_EEG_Conv8_32"
+  - name: "ANN_EEG_Conv16_32_32"
     type: "ann"
     dataset: "eeg_data"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 16
         kernel_size: 3
         stride: 1
         padding: 1
         pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 1
     hidden_layers: [32]
     activation: "relu"
     epochs: 6
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_EEG_LIF_Conv8_TTFS"
+  - name: "SNN_EEG_LIF_Conv16_32_32_TTFS"
     type: "snn"
     dataset: "eeg_data"
     neuron_type: "lif"
     encoding_type: "ttfs"
     conv_layers:
-      - out_channels: 8
+      - out_channels: 16
         kernel_size: 3
         stride: 1
         padding: 1
         pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 1
     hidden_layers: [32]
     num_steps: 10
     beta: 0.9
@@ -374,22 +431,23 @@ models:
 
   # ===================================================================
   # 8. Biomedizinische Signale: EEG Eye State (Augen Auf/Zu)
+  #    Mehrstufiges MLP zur Erkennung von Mikrospannungszuständen
   # ===================================================================
-  - name: "ANN_EEGEye_32"
+  - name: "ANN_EEGEye_64_32_16"
     type: "ann"
     dataset: "eeg_eye_state"
-    hidden_layers: [32]
+    hidden_layers: [64, 32, 16]
     activation: "relu"
     epochs: 5
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_EEGEye_LIF_32_Direct"
+  - name: "SNN_EEGEye_LIF_64_32_16_Direct"
     type: "snn"
     dataset: "eeg_eye_state"
     neuron_type: "lif"
     encoding_type: "direct"
-    hidden_layers: [32]
+    hidden_layers: [64, 32, 16]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -399,22 +457,23 @@ models:
 
   # ===================================================================
   # 9. Biomedizinische Signale: EKG Herzrhythmus (MIT-BIH Arrhythmie)
+  #    Deep Feature Extraction MLP zur Klassifikation von Herzschlägen
   # ===================================================================
-  - name: "ANN_ECG_64_32"
+  - name: "ANN_ECG_128_64_32"
     type: "ann"
     dataset: "ecg_data"
-    hidden_layers: [64, 32]
+    hidden_layers: [128, 64, 32]
     activation: "relu"
     epochs: 6
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_ECG_LIF_64_32_TTFS"
+  - name: "SNN_ECG_LIF_128_64_32_TTFS"
     type: "snn"
     dataset: "ecg_data"
     neuron_type: "lif"
     encoding_type: "ttfs"
-    hidden_layers: [64, 32]
+    hidden_layers: [128, 64, 32]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
