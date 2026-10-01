@@ -6,7 +6,7 @@
 # Globale Standardeinstellungen für das Training
 # ---------------------------------------------------------------------
 training:
-  # Anzahl der Trainingsepochen (Standardwert)
+  # Maximale Anzahl der Trainingsepochen (Standardwert)
   epochs: 5
 
   # Batch-Größe für das Training
@@ -17,6 +17,13 @@ training:
 
   # Optimierer ("adam" oder "sgd")
   optimizer: "adam"
+
+  # Early Stopping (Vorzeitiger Abbruch bei stagnierender Genauigkeit / Verlust)
+  early_stopping: false    # true oder false
+  patience: 3             # Anzahl an Epochen ohne Verbesserung vor vorzeitigem Abbruch
+  min_delta: 0.001        # Mindestverbesserung der Metrik (z. B. 0.001 = 0.1% Genauigkeit)
+  monitor: "test_acc"     # Zu überwachende Metrik: "test_acc" (Standard) oder "test_loss"
+  restore_best_weights: true # Stellt automatisch das beste Modell für Inferenz & Export wieder her
 
   # Verzeichnis zum Speichern/Laden des MNIST-Datensatzes
   data_dir: "./data"
@@ -67,6 +74,16 @@ joulescope:
 #         - beta: Membran-Decay (nur bei LIF, z. B. 0.9)
 #         - threshold: Schwellenwert (z. B. 1.0)
 #
+# Trainings-Parameter pro Modell (überschreiben globale Standardwerte):
+#   - epochs: Maximale Anzahl der Epochen (z. B. 5 oder 20)
+#   - batch_size: Batch-Größe (z. B. 64 oder 128)
+#   - learning_rate: Lernrate (z. B. 0.001 oder 0.005)
+#   - optimizer: "adam" oder "sgd"
+#   - early_stopping: true / false (Vorzeitiges Beenden bei Stagnation)
+#   - patience: Anzahl Epochen ohne Verbesserung vor Abbruch (z. B. 3)
+#   - min_delta: Mindestverbesserung (z. B. 0.001)
+#   - monitor: "test_acc" oder "test_loss"
+#
 # Ablauf:
 #  1. Zuerst werden ALLE hier definierten Modelle nacheinander trainiert.
 #  2. Anschließend wird jedes Modell nacheinander auf den ESP32 geflasht
@@ -78,6 +95,9 @@ models:
     type: "ann"
     hidden_layers: [64]
     activation: "relu"
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.001
 
   - name: "SNN_LIF_64_Direct"
     type: "snn"
@@ -87,6 +107,9 @@ models:
     num_steps: 10
     beta: 0.9
     threshold: 1.0
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
 
   - name: "SNN_LIF_64_TTFS"
     type: "snn"
@@ -96,6 +119,9 @@ models:
     num_steps: 10
     beta: 0.9
     threshold: 1.0
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
 
   - name: "SNN_IF_64_TTFS"
     type: "snn"
@@ -104,6 +130,9 @@ models:
     hidden_layers: [64]
     num_steps: 10
     threshold: 1.0
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
 
   - name: "SNN_IF_64_Periodic"
     type: "snn"
@@ -112,6 +141,9 @@ models:
     hidden_layers: [64]
     num_steps: 10
     threshold: 1.0
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
 
 # Hinweis: Ein einzelnes Modell 'model' wird für Rückwärtskompatibilität weiterhin unterstützt:
 # model:

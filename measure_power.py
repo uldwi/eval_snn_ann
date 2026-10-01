@@ -492,6 +492,50 @@ def main():
         help="Anzahl der Trainingsepochen fuer PyTorch (ueberschreibt Konfigurationsdatei)",
     )
     parser.add_argument(
+        "-b", "--batch-size",
+        type=int,
+        default=None,
+        help="Batch-Groesse fuer das Training (ueberschreibt Konfigurationsdatei)",
+    )
+    parser.add_argument(
+        "--lr", "--learning-rate",
+        type=float,
+        default=None,
+        dest="learning_rate",
+        help="Lernrate fuer das Training (ueberschreibt Konfigurationsdatei)",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        dest="early_stopping",
+        action="store_true",
+        default=None,
+        help="Aktiviert Early Stopping bei stagnierender Genauigkeit",
+    )
+    parser.add_argument(
+        "--no-early-stopping",
+        dest="early_stopping",
+        action="store_false",
+        help="Deaktiviert Early Stopping",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Anzahl der Epochen ohne Verbesserung vor vorzeitigem Trainingsabbruch",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=None,
+        help="Mindestverbesserung der Metrik fuer Early Stopping",
+    )
+    parser.add_argument(
+        "--monitor",
+        type=str,
+        default=None,
+        help="Zu ueberwachende Metrik fuer Early Stopping ('test_acc' oder 'test_loss')",
+    )
+    parser.add_argument(
         "--test-samples",
         type=int,
         default=None,
@@ -585,6 +629,12 @@ def main():
         trained_models = train_all_models(
             config_or_path=config,
             epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            early_stopping=args.early_stopping,
+            patience=args.patience,
+            min_delta=args.min_delta,
+            monitor=args.monitor,
             num_test_samples=args.test_samples,
         )
     else:

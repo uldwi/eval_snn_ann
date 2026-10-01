@@ -9,6 +9,7 @@ eine Konfigurationsdatei (z. B. config.yaml oder config.json) gesteuert werden.
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -60,6 +61,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "optimizer": "adam",
         "data_dir": "./data",
         "random_seed": 42,
+        "early_stopping": False,
+        "patience": 3,
+        "min_delta": 0.0,
+        "monitor": "test_acc",
+        "restore_best_weights": True,
     },
     "evaluation": {
         "num_test_samples": 50,
@@ -404,6 +410,21 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
             output_size=output_size,
         ).to(device)
 
+    # Early Stopping Konfiguration
+    es_cfg = train_cfg.get("early_stopping", False)
+    if isinstance(es_cfg, dict):
+        early_stopping_enabled = bool(es_cfg.get("enabled", True))
+        patience = int(es_cfg.get("patience", train_cfg.get("patience", 3)))
+        min_delta = float(es_cfg.get("min_delta", train_cfg.get("min_delta", 0.0)))
+        monitor = str(es_cfg.get("monitor", train_cfg.get("monitor", "test_acc"))).lower()
+        restore_best_weights = bool(es_cfg.get("restore_best_weights", train_cfg.get("restore_best_weights", True)))
+    else:
+        early_stopping_enabled = bool(es_cfg)
+        patience = int(train_cfg.get("patience", 3))
+        min_delta = float(train_cfg.get("min_delta", 0.0))
+        monitor = str(train_cfg.get("monitor", "test_acc")).lower()
+        restore_best_weights = bool(train_cfg.get("restore_best_weights", True))
+
     print("\n" + "=" * 65)
     print(f">>> PyTorch Modell-Konfiguration: {config.get('name', 'Modell')} ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
     print(f"  - Netzwerk-Aufbau:     {model.get_structure_summary()}")
@@ -421,6 +442,10 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     print(f"  - Batch-Größe:         {batch_size}")
     print(f"  - Lernrate (LR):       {lr}")
     print(f"  - Optimierer:          {optimizer_name.upper()}")
+    if early_stopping_enabled:
+        print(f"  - Early Stopping:      Aktiviert (Patience: {patience}, Min-Delta: {min_delta}, Metrik: {monitor}, Best-Weights: {restore_best_weights})")
+    else:
+        print(f"  - Early Stopping:      Deaktiviert (Best-Weights: {restore_best_weights})")
     print("=" * 65 + "\n")
 
     transform = transforms.Compose([
@@ -442,6 +467,12 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
     test_acc = 0.0
     avg_loss = 0.0
+    best_state_dict = None
+    best_epoch = 1
+    best_metric = None
+    best_test_acc = 0.0
+    best_test_loss = float("inf")
+    patience_counter = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -469,18 +500,55 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         model.eval()
         test_correct = 0
         test_total = 0
+        test_loss_total = 0.0
         with torch.no_grad():
             for data, target in test_loader:
                 data, target = data.to(device), target.to(device)
                 output = model(data)
+                loss = criterion(output, target)
+                test_loss_total += loss.item() * data.size(0)
                 pred = output.argmax(dim=1)
                 test_correct += (pred == target).sum().item()
                 test_total += data.size(0)
 
         test_acc = 100.0 * test_correct / test_total
-        print(f"[PyTorch] Epoche {epoch}/{epochs} - Verlust: {avg_loss:.4f} | Train-Genauigkeit: {train_acc:.2f}% | Test-Genauigkeit: {test_acc:.2f}%")
+        test_loss = test_loss_total / test_total if test_total > 0 else 0.0
 
-    print(f"[PyTorch] Training für '{config.get('name', 'Modell')}' abgeschlossen (Test-Genauigkeit: {test_acc:.2f}%).\n")
+        # Best Model Tracking
+        is_best = False
+        if monitor in ("test_loss", "val_loss", "loss"):
+            if best_metric is None or (best_metric - test_loss) > min_delta:
+                is_best = True
+                best_metric = test_loss
+        else:  # "test_acc", "val_acc", "acc"
+            if best_metric is None or (test_acc - best_metric) > min_delta:
+                is_best = True
+                best_metric = test_acc
+
+        if is_best:
+            best_state_dict = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+            best_test_acc = test_acc
+            best_test_loss = test_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        best_marker = " * (Bester Checkpoint)" if is_best else ""
+        print(f"[PyTorch] Epoche {epoch}/{epochs} - Train-Verlust: {avg_loss:.4f} | Test-Verlust: {test_loss:.4f} | Train-Acc: {train_acc:.2f}% | Test-Acc: {test_acc:.2f}%{best_marker}")
+
+        if early_stopping_enabled and patience_counter >= patience:
+            print(f"[Early Stopping] Vorzeitiger Abbruch in Epoche {epoch}/{epochs}: Keine Verbesserung der Metrik '{monitor}' seit {patience} Epochen (Bester Stand in Epoche {best_epoch}: Test-Acc: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
+            break
+
+    # Nach dem Training: Bestes Modell wiederherstellen falls gewünscht
+    if best_state_dict is not None and restore_best_weights:
+        model.load_state_dict(best_state_dict)
+        test_acc = best_test_acc
+        avg_loss = best_test_loss
+        print(f"[PyTorch] Bestes Modell aus Epoche {best_epoch} für Export und Inferenz aktiviert (Test-Genauigkeit: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
+
+    print(f"[PyTorch] Training für '{config.get('name', 'Modell')}' abgeschlossen (Beste Test-Genauigkeit: {test_acc:.2f}%).\n")
     return model, test_dataset, test_acc, avg_loss
 
 
@@ -874,6 +942,8 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Extrahiert alle konfigurierten Modelle aus der Konfiguration.
     Unterstützt sowohl 'models:' (Liste mehrerer Modelle) als auch 'model:' (einzelnes Modell).
+    Ermöglicht individuelle Trainingsparameter (epochs, batch_size, learning_rate / lr, optimizer)
+    pro Modell sowie globale Fallbacks aus dem 'training:'-Abschnitt.
     """
     models_list = config.get("models")
     resolved_models = []
@@ -913,15 +983,66 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             else:
                 model_dict["activation"] = str(m.get("activation", config.get("model", {}).get("activation", "relu")))
 
+            # 1. Globale Trainingsparameter als Basis
             model_training = dict(global_training)
-            for k in ("epochs", "batch_size", "learning_rate", "optimizer", "data_dir", "random_seed"):
+            # 2. Modell-spezifischer nested block
+            if isinstance(m.get("training"), dict):
+                nested_tr = dict(m["training"])
+                if "lr" in nested_tr and "learning_rate" not in nested_tr:
+                    nested_tr["learning_rate"] = nested_tr.pop("lr")
+                model_training.update(nested_tr)
+            # 3. Direkte Angaben auf oberster Ebene des Modell-Objekts
+            for k in ("epochs", "batch_size", "learning_rate", "lr", "optimizer", "data_dir", "random_seed", "early_stopping", "patience", "min_delta", "monitor", "restore_best_weights"):
                 if k in m:
-                    model_training[k] = m[k]
+                    if k == "lr":
+                        model_training["learning_rate"] = m[k]
+                    else:
+                        model_training[k] = m[k]
+
+            # Typen absichern
+            if "epochs" in model_training and model_training["epochs"] is not None:
+                model_training["epochs"] = int(model_training["epochs"])
+            if "batch_size" in model_training and model_training["batch_size"] is not None:
+                model_training["batch_size"] = int(model_training["batch_size"])
+            if "learning_rate" in model_training and model_training["learning_rate"] is not None:
+                model_training["learning_rate"] = float(model_training["learning_rate"])
+            if "patience" in model_training and model_training["patience"] is not None:
+                model_training["patience"] = int(model_training["patience"])
+            if "min_delta" in model_training and model_training["min_delta"] is not None:
+                model_training["min_delta"] = float(model_training["min_delta"])
+            if "monitor" in model_training and model_training["monitor"] is not None:
+                model_training["monitor"] = str(model_training["monitor"]).lower()
+            if "restore_best_weights" in model_training and model_training["restore_best_weights"] is not None:
+                model_training["restore_best_weights"] = bool(model_training["restore_best_weights"])
+            if "early_stopping" in model_training:
+                es = model_training["early_stopping"]
+                if isinstance(es, bool):
+                    model_training["early_stopping"] = es
+                elif isinstance(es, str):
+                    model_training["early_stopping"] = es.lower() in ("true", "1", "yes", "on")
+                elif isinstance(es, dict):
+                    if "enabled" in es:
+                        model_training["early_stopping"] = bool(es["enabled"])
+                    if "patience" in es:
+                        model_training["patience"] = int(es["patience"])
+                    if "min_delta" in es:
+                        model_training["min_delta"] = float(es["min_delta"])
+                    if "monitor" in es:
+                        model_training["monitor"] = str(es["monitor"]).lower()
+                    if "restore_best_weights" in es:
+                        model_training["restore_best_weights"] = bool(es["restore_best_weights"])
 
             model_evaluation = dict(global_evaluation)
-            for k in ("num_test_samples",):
+            if isinstance(m.get("evaluation"), dict):
+                model_evaluation.update(m["evaluation"])
+            for k in ("num_test_samples", "test_samples"):
                 if k in m:
-                    model_evaluation[k] = m[k]
+                    if k == "test_samples":
+                        model_evaluation["num_test_samples"] = m[k]
+                    else:
+                        model_evaluation[k] = m[k]
+            if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
+                model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
 
             resolved_models.append({
                 "name": name,
@@ -957,12 +1078,69 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         else:
             model_dict["activation"] = str(single_m.get("activation", "relu"))
 
+        model_training = dict(global_training)
+        if isinstance(single_m.get("training"), dict):
+            nested_tr = dict(single_m["training"])
+            if "lr" in nested_tr and "learning_rate" not in nested_tr:
+                nested_tr["learning_rate"] = nested_tr.pop("lr")
+            model_training.update(nested_tr)
+        for k in ("epochs", "batch_size", "learning_rate", "lr", "optimizer", "data_dir", "random_seed", "early_stopping", "patience", "min_delta", "monitor", "restore_best_weights"):
+            if k in single_m:
+                if k == "lr":
+                    model_training["learning_rate"] = single_m[k]
+                else:
+                    model_training[k] = single_m[k]
+
+        if "epochs" in model_training and model_training["epochs"] is not None:
+            model_training["epochs"] = int(model_training["epochs"])
+        if "batch_size" in model_training and model_training["batch_size"] is not None:
+            model_training["batch_size"] = int(model_training["batch_size"])
+        if "learning_rate" in model_training and model_training["learning_rate"] is not None:
+            model_training["learning_rate"] = float(model_training["learning_rate"])
+        if "patience" in model_training and model_training["patience"] is not None:
+            model_training["patience"] = int(model_training["patience"])
+        if "min_delta" in model_training and model_training["min_delta"] is not None:
+            model_training["min_delta"] = float(model_training["min_delta"])
+        if "monitor" in model_training and model_training["monitor"] is not None:
+            model_training["monitor"] = str(model_training["monitor"]).lower()
+        if "restore_best_weights" in model_training and model_training["restore_best_weights"] is not None:
+            model_training["restore_best_weights"] = bool(model_training["restore_best_weights"])
+        if "early_stopping" in model_training:
+            es = model_training["early_stopping"]
+            if isinstance(es, bool):
+                model_training["early_stopping"] = es
+            elif isinstance(es, str):
+                model_training["early_stopping"] = es.lower() in ("true", "1", "yes", "on")
+            elif isinstance(es, dict):
+                if "enabled" in es:
+                    model_training["early_stopping"] = bool(es["enabled"])
+                if "patience" in es:
+                    model_training["patience"] = int(es["patience"])
+                if "min_delta" in es:
+                    model_training["min_delta"] = float(es["min_delta"])
+                if "monitor" in es:
+                    model_training["monitor"] = str(es["monitor"]).lower()
+                if "restore_best_weights" in es:
+                    model_training["restore_best_weights"] = bool(es["restore_best_weights"])
+
+        model_evaluation = dict(global_evaluation)
+        if isinstance(single_m.get("evaluation"), dict):
+            model_evaluation.update(single_m["evaluation"])
+        for k in ("num_test_samples", "test_samples"):
+            if k in single_m:
+                if k == "test_samples":
+                    model_evaluation["num_test_samples"] = single_m[k]
+                else:
+                    model_evaluation[k] = single_m[k]
+        if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
+            model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
+
         resolved_models.append({
             "name": name,
             "type": m_type,
             "model": model_dict,
-            "training": global_training,
-            "evaluation": global_evaluation,
+            "training": model_training,
+            "evaluation": model_evaluation,
             "esp32": global_esp32,
             "joulescope": global_joulescope,
         })
@@ -983,6 +1161,12 @@ def export_model_entry_to_main(model_entry: Dict[str, Any], output_dir: str = "m
 def train_all_models(
     config_or_path: Union[str, Path, Dict[str, Any]] = None,
     epochs: int = None,
+    batch_size: int = None,
+    learning_rate: float = None,
+    early_stopping: bool = None,
+    patience: int = None,
+    min_delta: float = None,
+    monitor: str = None,
     num_test_samples: int = None,
     device: str = "cpu",
 ) -> List[Dict[str, Any]]:
@@ -1006,11 +1190,27 @@ def train_all_models(
     for idx, m_cfg in enumerate(model_configs, start=1):
         if epochs is not None:
             m_cfg["training"]["epochs"] = epochs
+        if batch_size is not None:
+            m_cfg["training"]["batch_size"] = batch_size
+        if learning_rate is not None:
+            m_cfg["training"]["learning_rate"] = learning_rate
+        if early_stopping is not None:
+            m_cfg["training"]["early_stopping"] = early_stopping
+        if patience is not None:
+            m_cfg["training"]["patience"] = patience
+        if min_delta is not None:
+            m_cfg["training"]["min_delta"] = min_delta
+        if monitor is not None:
+            m_cfg["training"]["monitor"] = monitor
         if num_test_samples is not None:
             m_cfg["evaluation"]["num_test_samples"] = num_test_samples
 
         m_type = m_cfg.get("type", "ann").lower()
-        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' ---")
+        ep = m_cfg["training"].get("epochs", "?")
+        bs = m_cfg["training"].get("batch_size", "?")
+        lr = m_cfg["training"].get("learning_rate", "?")
+        es_info = f", ES: Ja (P={m_cfg['training'].get('patience', 3)})" if m_cfg['training'].get('early_stopping') else ""
+        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Epochen: {ep}, Batch: {bs}, LR: {lr}{es_info}] ---")
         model, test_dataset, test_acc, test_loss = train_model(m_cfg, device=device)
 
         samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 50))
@@ -1050,6 +1250,12 @@ def train_and_export(
     config_path: Union[str, Path] = None,
     output_dir: str = "main",
     epochs: int = None,
+    batch_size: int = None,
+    learning_rate: float = None,
+    early_stopping: bool = None,
+    patience: int = None,
+    min_delta: float = None,
+    monitor: str = None,
     num_test_samples: int = None,
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], bytes]:
     """
@@ -1058,6 +1264,12 @@ def train_and_export(
     trained_models = train_all_models(
         config_or_path=config_path,
         epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        monitor=monitor,
         num_test_samples=num_test_samples,
     )
     if trained_models:
@@ -1067,7 +1279,7 @@ def train_and_export(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MNIST ANN Training & TFLite Micro Export")
+    parser = argparse.ArgumentParser(description="MNIST ANN & SNN Training & TFLite Micro Export")
     parser.add_argument(
         "-c", "--config",
         type=str,
@@ -1081,6 +1293,50 @@ if __name__ == "__main__":
         help="Überschreibt die Anzahl der Trainingsepochen",
     )
     parser.add_argument(
+        "-b", "--batch-size",
+        type=int,
+        default=None,
+        help="Überschreibt die Batch-Größe für das Training",
+    )
+    parser.add_argument(
+        "--lr", "--learning-rate",
+        type=float,
+        default=None,
+        dest="learning_rate",
+        help="Überschreibt die Lernrate für das Training",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        dest="early_stopping",
+        action="store_true",
+        default=None,
+        help="Aktiviert Early Stopping vorzeitigen Abbruch bei stagnierender Genauigkeit",
+    )
+    parser.add_argument(
+        "--no-early-stopping",
+        dest="early_stopping",
+        action="store_false",
+        help="Deaktiviert Early Stopping",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Anzahl der Epochen ohne Verbesserung vor vorzeitigem Trainingsabbruch",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=None,
+        help="Mindestverbesserung der Metrik für Early Stopping (z. B. 0.001)",
+    )
+    parser.add_argument(
+        "--monitor",
+        type=str,
+        default=None,
+        help="Zu überwachende Metrik für Early Stopping ('test_acc' oder 'test_loss')",
+    )
+    parser.add_argument(
         "-n", "--test-samples",
         type=int,
         default=None,
@@ -1091,5 +1347,11 @@ if __name__ == "__main__":
     train_and_export(
         config_path=args.config,
         epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        early_stopping=args.early_stopping,
+        patience=args.patience,
+        min_delta=args.min_delta,
+        monitor=args.monitor,
         num_test_samples=args.test_samples,
     )
