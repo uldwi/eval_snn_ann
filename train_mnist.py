@@ -1,33 +1,30 @@
 #!/usr/bin/env python3
 """
-Training eines konfigurierbaren künstlichen neuronalen Netzes (ANN/MLP) für den MNIST-Datensatz
-mit PyTorch und Export des Modells in das TensorFlow Lite FlatBuffer-Format (.tflite) sowie
-als C/C++ Header- und Quelldateien für TensorFlow Lite Micro auf dem ESP32.
+train_mnist.py
 
-Die Architektur des Netzes, Trainings- und Evaluierungsparameter können vollständig über
-eine Konfigurationsdatei (z. B. config.yaml oder config.json) gesteuert werden.
+Trainiert ein konfigurierbares künstliches neuronales Netz (ANN / CNN mit PyTorch)
+oder ein Spiking Neural Network (SNN / CSNN mit SpikingJelly) auf dem MNIST-Datensatz
+und exportiert das Modell wahlweise für TensorFlow Lite Micro oder die C++ SNN Inferenz-Engine
+auf dem ESP32-C6.
+
+Unterstützte Funktionen:
+- Flexible Schichtarchitekturen (Conv2D, MaxPool2D, AvgPool2D, Flatten, Linear/FullyConnected)
+- Frei konfigurierbare Hidden Layers (Tiefe und Breiten)
+- Wählbare Aktivierungsfunktionen (ReLU, None) für ANNs
+- SpikingJelly SNN-Unterstützung mit LIFNode (Leaky-Integrate-and-Fire) und IFNode (Integrate-and-Fire)
+- Wählbare SNN-Eingangs-Encodings: Direct, TTFS (Time-To-First-Spike), Poisson Rate, Periodic Rate
+- Individuelle Trainingshyperparameter pro Modell (Epochen, Batch-Größe, Lernrate, Optimierer)
+- Early Stopping mit konfigurierbarer Patience, Mindestverbesserung und automatischem Best-Model-Restore
+- TFLite FlatBuffer Generator für beliebige FC- und Conv-Netze
+- Automatische Erzeugung von model_data.h/cc und mnist_test_data.h für den ESP32
 """
 
-import argparse
-import copy
-import json
 import os
 import sys
+import argparse
+import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-
-try:
-    from spikingjelly.activation_based import neuron, functional, surrogate, layer as sj_layer
-    HAS_SPIKINGJELLY = True
-except ImportError:
-    HAS_SPIKINGJELLY = False
+from typing import Dict, Any, List, Tuple, Union, Optional
 
 try:
     import yaml
@@ -35,37 +32,37 @@ try:
 except ImportError:
     HAS_YAML = False
 
+import numpy as np
+import flatbuffers
+import tflite
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
 try:
-    import flatbuffers
-    import tflite
+    import spikingjelly.activation_based as sj_activation
+    from spikingjelly.activation_based import neuron, layer as sj_layer, functional, surrogate
+    HAS_SPIKINGJELLY = True
 except ImportError:
-    print("Fehler: 'flatbuffers' und 'tflite' werden für den Modellexport benötigt.", file=sys.stderr)
-    print("Bitte installieren mit: pip install flatbuffers tflite", file=sys.stderr)
-    sys.exit(1)
+    HAS_SPIKINGJELLY = False
 
-
-# -------------------------------------------------------------
 # Standardkonfiguration
-# -------------------------------------------------------------
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "model": {
-        "input_size": 784,
-        "hidden_layers": [64],
-        "activation": "relu",
-        "output_size": 10,
-    },
+DEFAULT_CONFIG = {
     "training": {
-        "epochs": 3,
+        "epochs": 5,
         "batch_size": 64,
         "learning_rate": 0.001,
         "optimizer": "adam",
-        "data_dir": "./data",
-        "random_seed": 42,
         "early_stopping": False,
         "patience": 3,
-        "min_delta": 0.0,
+        "min_delta": 0.001,
         "monitor": "test_acc",
         "restore_best_weights": True,
+        "data_dir": "./data",
+        "random_seed": 42,
     },
     "evaluation": {
         "num_test_samples": 50,
@@ -77,13 +74,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "trigger_pin": "in1",
         "timeout": 60.0,
     },
+    "model": {
+        "name": "ANN_64",
+        "type": "ann",
+        "input_size": 784,
+        "conv_layers": [],
+        "hidden_layers": [64],
+        "activation": "relu",
+        "output_size": 10,
+    },
 }
 
 
 def load_config(config_path: Union[str, Path] = None) -> Dict[str, Any]:
     """
-    Lädt die Konfiguration aus einer YAML- oder JSON-Datei.
-    Falls keine Datei angegeben ist, wird automatisch nach config.yaml oder config.json gesucht.
+    Lädt eine Konfigurationsdatei (YAML oder JSON).
     """
     if config_path is None:
         candidates = ["config.yaml", "config.yml", "config.json"]
@@ -92,7 +97,7 @@ def load_config(config_path: Union[str, Path] = None) -> Dict[str, Any]:
                 config_path = c
                 break
 
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # Deep copy der Defaults
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
 
     if config_path and os.path.isfile(config_path):
         print(f"[Config] Lade Konfiguration aus '{config_path}'...")
@@ -123,13 +128,6 @@ def load_config(config_path: Union[str, Path] = None) -> Dict[str, Any]:
 def parse_hidden_layers(val: Any) -> List[int]:
     """
     Parst und normalisiert die Konfiguration der verborgenen Schichten flexibel.
-    Unterstützt verschiedene Eingabeformate wie:
-      - [128, 64]
-      - [[128, 64]] (z. B. aus '- [128, 64]' in YAML)
-      - [128, 64, 32]
-      - 64 (einzelner Integer)
-      - "128, 64" oder "128 64"
-      - None / [] / ""
     """
     if val is None:
         return []
@@ -163,39 +161,204 @@ def parse_hidden_layers(val: Any) -> List[int]:
     return []
 
 
+def parse_conv_layers(val: Any) -> List[Dict[str, Any]]:
+    """
+    Parst und normalisiert die Konfiguration der Convolutional Layers flexibel.
+    Unterstützt verschiedene Formate wie:
+      - [{'out_channels': 8, 'kernel_size': 3, 'stride': 1, 'padding': 1, 'pool_size': 2}]
+      - [{'channels': 8, 'kernel': 3, 'pool': 2}]
+      - [[8, 3, 1, 1, 2]] (out_channels, kernel_size, stride, padding, pool_size)
+    """
+    if val is None:
+        return []
+    if isinstance(val, str):
+        val_str = val.strip()
+        if not val_str or val_str.lower() in ("none", "null", "[]"):
+            return []
+        try:
+            parsed = json.loads(val_str)
+            return parse_conv_layers(parsed)
+        except Exception:
+            return []
+    if isinstance(val, dict):
+        val = [val]
+    if isinstance(val, (list, tuple)):
+        if val and all(isinstance(x, (int, float)) for x in val):
+            val = [val]
+
+        result = []
+        for item in val:
+            if isinstance(item, dict):
+                out_channels = int(item.get("out_channels", item.get("channels", item.get("filters", 8))))
+                kernel_size = int(item.get("kernel_size", item.get("kernel", 3)))
+                stride = int(item.get("stride", 1))
+                padding = item.get("padding", None)
+                if padding is None:
+                    padding = 1 if kernel_size == 3 else 0
+                else:
+                    padding = int(padding) if isinstance(padding, (int, str)) and str(padding).isdigit() else 0
+
+                pool_size = item.get("pool_size", item.get("pool", item.get("max_pool", 0)))
+                pool_size = int(pool_size) if pool_size else 0
+                pool_stride = item.get("pool_stride", pool_size)
+                pool_stride = int(pool_stride) if pool_stride else pool_size
+                pool_type = str(item.get("pool_type", "max")).lower()
+
+                result.append({
+                    "out_channels": out_channels,
+                    "kernel_size": kernel_size,
+                    "stride": stride,
+                    "padding": padding,
+                    "pool_size": pool_size,
+                    "pool_stride": pool_stride,
+                    "pool_type": pool_type,
+                })
+            elif isinstance(item, (list, tuple)):
+                out_c = int(item[0]) if len(item) > 0 else 8
+                k_size = int(item[1]) if len(item) > 1 else 3
+                stride = int(item[2]) if len(item) > 2 else 1
+                padding = int(item[3]) if len(item) > 3 else (1 if k_size == 3 else 0)
+                pool_size = int(item[4]) if len(item) > 4 else 0
+                pool_stride = int(item[5]) if len(item) > 5 else pool_size
+                result.append({
+                    "out_channels": out_c,
+                    "kernel_size": k_size,
+                    "stride": stride,
+                    "padding": padding,
+                    "pool_size": pool_size,
+                    "pool_stride": pool_stride,
+                    "pool_type": "max",
+                })
+        return result
+    return []
+
+
+def compute_conv_layer_dims(conv_layers: List[Dict[str, Any]], in_c: int = 1, in_h: int = 28, in_w: int = 28) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Berechnet die Ein- und Ausgangsdimensionen für jeden Convolutional Layer und den resultierenden Flat-Tensor.
+    """
+    cur_c, cur_h, cur_w = in_c, in_h, in_w
+    resolved_layers = []
+    for cl in conv_layers:
+        out_c = cl["out_channels"]
+        k_size = cl["kernel_size"]
+        stride = cl["stride"]
+        pad = cl["padding"]
+        pool_size = cl["pool_size"]
+        pool_stride = cl["pool_stride"]
+
+        out_h = (cur_h + 2 * pad - k_size) // stride + 1
+        out_w = (cur_w + 2 * pad - k_size) // stride + 1
+
+        if pool_size > 1:
+            pool_out_h = (out_h - pool_size) // pool_stride + 1
+            pool_out_w = (out_w - pool_size) // pool_stride + 1
+        else:
+            pool_out_h = out_h
+            pool_out_w = out_w
+
+        resolved_layers.append({
+            **cl,
+            "in_channels": cur_c,
+            "in_h": cur_h,
+            "in_w": cur_w,
+            "out_h": out_h,
+            "out_w": out_w,
+            "pool_out_h": pool_out_h,
+            "pool_out_w": pool_out_w,
+        })
+        cur_c = out_c
+        cur_h = pool_out_h
+        cur_w = pool_out_w
+
+    flat_dim = cur_c * cur_h * cur_w
+    return resolved_layers, flat_dim
+
+
 # -------------------------------------------------------------
 # Konfigurierbare Modell-Architekturen (ANN & SNN)
 # -------------------------------------------------------------
 class ConfigurableANN(nn.Module):
     """
-    Flexibles Fully-Connected Neural Network (MLP / ANN), dessen Schichtstruktur,
+    Flexibles Neural Network (MLP oder CNN), dessen Faltungs- und Fully-Connected-Schichten,
     Eingangs-/Ausgangsgrößen und Aktivierungsfunktionen konfigurierbar sind.
     """
     def __init__(
         self,
         input_size: int = 784,
+        conv_layers: Any = None,
         hidden_layers: Any = None,
         activation: str = "relu",
         output_size: int = 10,
+        in_channels: int = 1,
+        in_height: int = 28,
+        in_width: int = 28,
     ):
         super().__init__()
         self.input_size = int(input_size)
+        self.in_channels = int(in_channels)
+        self.in_height = int(in_height)
+        self.in_width = int(in_width)
+        self.conv_cfg = parse_conv_layers(conv_layers)
         self.hidden_layers = parse_hidden_layers(hidden_layers)
         self.activation_name = (activation or "relu").lower()
         self.output_size = int(output_size)
 
-        all_layer_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
-        self.layers = nn.ModuleList()
-        for i in range(len(all_layer_sizes) - 1):
-            self.layers.append(nn.Linear(all_layer_sizes[i], all_layer_sizes[i + 1]))
+        self.has_conv = len(self.conv_cfg) > 0
+        if self.has_conv:
+            self.resolved_conv, self.flat_size = compute_conv_layer_dims(
+                self.conv_cfg, self.in_channels, self.in_height, self.in_width
+            )
+            self.conv_modules = nn.ModuleList()
+            for cl in self.resolved_conv:
+                mods = []
+                mods.append(nn.Conv2d(
+                    in_channels=cl["in_channels"],
+                    out_channels=cl["out_channels"],
+                    kernel_size=cl["kernel_size"],
+                    stride=cl["stride"],
+                    padding=cl["padding"],
+                    bias=True,
+                ))
+                if self.activation_name == "relu":
+                    mods.append(nn.ReLU())
+                if cl["pool_size"] > 1:
+                    if cl["pool_type"] == "avg":
+                        mods.append(nn.AvgPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                    else:
+                        mods.append(nn.MaxPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                self.conv_modules.append(nn.Sequential(*mods))
+            self.flatten = nn.Flatten()
+            fc_in = self.flat_size
+        else:
+            self.resolved_conv = []
+            self.flat_size = self.input_size
+            self.conv_modules = nn.ModuleList()
+            self.flatten = nn.Flatten()
+            fc_in = self.input_size
+
+        all_fc_sizes = [fc_in] + self.hidden_layers + [self.output_size]
+        self.fc_layers = nn.ModuleList()
+        for i in range(len(all_fc_sizes) - 1):
+            self.fc_layers.append(nn.Linear(all_fc_sizes[i], all_fc_sizes[i + 1]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x.view(x.size(0), -1)
-        num_layers = len(self.layers)
+        if self.has_conv:
+            if x.dim() == 2:
+                x = x.view(x.size(0), self.in_channels, self.in_height, self.in_width)
+            elif x.dim() == 3:
+                x = x.unsqueeze(1)
+            out = x
+            for block in self.conv_modules:
+                out = block(out)
+            out = self.flatten(out)
+        else:
+            out = x.view(x.size(0), -1)
 
-        for i, layer in enumerate(self.layers):
+        num_fc = len(self.fc_layers)
+        for i, layer in enumerate(self.fc_layers):
             out = layer(out)
-            if i < num_layers - 1:
+            if i < num_fc - 1:
                 if self.activation_name == "relu":
                     out = F.relu(out)
                 elif self.activation_name in ("none", "linear", "identity"):
@@ -205,33 +368,43 @@ class ConfigurableANN(nn.Module):
         return out
 
     def get_structure_summary(self) -> str:
-        all_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
-        act_str = f" mit {self.activation_name.upper()}" if self.hidden_layers else ""
-        return f"ANN [{' -> '.join(str(s) for s in all_sizes)}]{act_str}"
+        parts = []
+        if self.has_conv:
+            for cl in self.resolved_conv:
+                p_str = f",p{cl['pool_size']}" if cl['pool_size'] > 1 else ""
+                parts.append(f"Conv({cl['in_channels']}->{cl['out_channels']},{cl['kernel_size']}x{cl['kernel_size']}{p_str})")
+            parts.append(f"Flat({self.flat_size})")
+        else:
+            parts.append(str(self.input_size))
+
+        for h in self.hidden_layers:
+            parts.append(str(h))
+        parts.append(str(self.output_size))
+
+        act_str = f" mit {self.activation_name.upper()}" if (self.hidden_layers or self.has_conv) else ""
+        return f"ANN [{' -> '.join(parts)}]{act_str}"
 
 
 def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.Tensor:
     """
-    Kodiert Eingabedaten x (Batch, Features) über num_steps Zeitschritte.
+    Kodiert Eingabedaten x (Batch, Features) oder (Batch, C, H, W) über num_steps Zeitschritte.
     Unterstützte Encoding-Typen:
-      - 'direct' (Standard): Konstanter Eingangswert über alle Zeitschritte (T, Batch, Features)
+      - 'direct' (Standard): Konstanter Eingangswert über alle Zeitschritte (T, Batch, ...)
       - 'ttfs' / 'latency': Time-To-First-Spike / Latency Coding.
-                            Helle Pixel feuern früher (t_f = round((T-1) * (1 - x))).
-                            Hintergrundpixel (x <= 0) feuern keinen Spike.
       - 'poisson' / 'rate': Stochastisches Poisson-Rate-Coding mit Wahrscheinlichkeit proportional zu x.
       - 'periodic' / 'rate_periodic': Deterministisches Rate-Coding (k = round(x * T) Spikes).
     """
     enc = str(encoding_type).lower().strip()
     if enc in ("direct", "constant", "raw"):
-        return x.unsqueeze(0).repeat(num_steps, 1, 1)
+        return x.unsqueeze(0).repeat(num_steps, *([1] * x.dim()))
 
     elif enc in ("ttfs", "latency", "time_to_first_spike"):
         x_clamped = torch.clamp(x, 0.0, 1.0)
         t_f = ((num_steps - 1) * (1.0 - x_clamped)).round().long()
-        one_hot = F.one_hot(t_f, num_classes=num_steps).to(x.dtype).to(x.device)
-        mask = (x_clamped > 0.0).unsqueeze(-1).to(x.dtype)
-        one_hot = one_hot * mask
-        return one_hot.permute(2, 0, 1)
+        t_indices = torch.arange(num_steps, device=x.device).view(num_steps, *([1] * x.dim()))
+        spikes = (t_indices == t_f.unsqueeze(0)).to(x.dtype)
+        mask = (x_clamped > 0.0).unsqueeze(0).to(x.dtype)
+        return spikes * mask
 
     elif enc in ("poisson", "rate", "rate_poisson"):
         x_clamped = torch.clamp(x, 0.0, 1.0)
@@ -241,7 +414,7 @@ def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.T
     elif enc in ("periodic", "rate_periodic", "phase"):
         x_clamped = torch.clamp(x, 0.0, 1.0)
         k = (x_clamped * num_steps).round().long()
-        t_indices = torch.arange(num_steps, device=x.device).unsqueeze(1).unsqueeze(2)
+        t_indices = torch.arange(num_steps, device=x.device).view(num_steps, *([1] * x.dim()))
         return (t_indices < k.unsqueeze(0)).to(x.dtype)
 
     else:
@@ -262,14 +435,14 @@ def get_encoding_code(encoding_name: str) -> int:
 
 class ConfigurableSpikingJellySNN(nn.Module):
     """
-    Spiking Neural Network (SNN) trainiert mit SpikingJelly.
-    Unterstützt LIFNode (Leaky-Integrate-and-Fire) und IFNode (Integrate-and-Fire) Neuronen
-    mit konfigurierbaren Encodings (Direct, TTFS, Poisson, Periodic), Schichten,
-    Zeitschritten (num_steps), Membran-Decay (beta / tau bei LIF) und Schwellenwert (threshold).
+    Spiking Neural Network (SNN / CSNN) trainiert mit SpikingJelly.
+    Unterstützt LIFNode (Leaky-Integrate-and-Fire) und IFNode (Integrate-and-Fire) Neuronen,
+    Convolutional Layers, MaxPool2D, Flatten, Fully-Connected Layers und frei wählbare Encodings.
     """
     def __init__(
         self,
         input_size: int = 784,
+        conv_layers: Any = None,
         hidden_layers: Any = None,
         output_size: int = 10,
         neuron_type: str = "lif",
@@ -277,9 +450,16 @@ class ConfigurableSpikingJellySNN(nn.Module):
         num_steps: int = 10,
         beta: float = 0.9,
         threshold: float = 1.0,
+        in_channels: int = 1,
+        in_height: int = 28,
+        in_width: int = 28,
     ):
         super().__init__()
         self.input_size = int(input_size)
+        self.in_channels = int(in_channels)
+        self.in_height = int(in_height)
+        self.in_width = int(in_width)
+        self.conv_cfg = parse_conv_layers(conv_layers)
         self.hidden_layers = parse_hidden_layers(hidden_layers)
         self.output_size = int(output_size)
         self.neuron_type = str(neuron_type).lower().strip()
@@ -296,7 +476,6 @@ class ConfigurableSpikingJellySNN(nn.Module):
             self.tau = 1000.0
         else:
             self.beta = float(beta)
-            # tau in SpikingJelly entspricht: beta = 1 - 1/tau <=> tau = 1 / (1 - beta)
             if self.beta >= 1.0:
                 self.tau = 1000.0
             elif self.beta <= 0.0:
@@ -304,40 +483,88 @@ class ConfigurableSpikingJellySNN(nn.Module):
             else:
                 self.tau = float(1.0 / (1.0 - self.beta))
 
-        all_layer_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
-        self.fcs = nn.ModuleList([
-            sj_layer.Linear(all_layer_sizes[i], all_layer_sizes[i + 1]) for i in range(len(all_layer_sizes) - 1)
-        ])
-        if self.neuron_type == "if":
-            self.lif_layers = nn.ModuleList([
-                neuron.IFNode(
+        def create_neuron():
+            if self.neuron_type == "if":
+                return neuron.IFNode(
                     v_threshold=self.threshold,
                     v_reset=0.0,
                     surrogate_function=surrogate.ATan(),
                     detach_reset=True,
-                ) for _ in range(len(all_layer_sizes) - 1)
-            ])
-        else:
-            self.lif_layers = nn.ModuleList([
-                neuron.LIFNode(
+                )
+            else:
+                return neuron.LIFNode(
                     tau=self.tau,
                     decay_input=False,
                     v_threshold=self.threshold,
                     v_reset=0.0,
                     surrogate_function=surrogate.ATan(),
                     detach_reset=True,
-                ) for _ in range(len(all_layer_sizes) - 1)
-            ])
+                )
+
+        self.has_conv = len(self.conv_cfg) > 0
+        self.conv_layers_list = nn.ModuleList()
+        self.conv_lif_list = nn.ModuleList()
+        self.conv_pool_list = nn.ModuleList()
+
+        if self.has_conv:
+            self.resolved_conv, self.flat_size = compute_conv_layer_dims(
+                self.conv_cfg, self.in_channels, self.in_height, self.in_width
+            )
+            for cl in self.resolved_conv:
+                self.conv_layers_list.append(sj_layer.Conv2d(
+                    in_channels=cl["in_channels"],
+                    out_channels=cl["out_channels"],
+                    kernel_size=cl["kernel_size"],
+                    stride=cl["stride"],
+                    padding=cl["padding"],
+                    bias=True,
+                ))
+                self.conv_lif_list.append(create_neuron())
+                if cl["pool_size"] > 1:
+                    if cl["pool_type"] == "avg":
+                        self.conv_pool_list.append(sj_layer.AvgPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                    else:
+                        self.conv_pool_list.append(sj_layer.MaxPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                else:
+                    self.conv_pool_list.append(nn.Identity())
+            self.flatten = sj_layer.Flatten()
+            fc_in = self.flat_size
+        else:
+            self.resolved_conv = []
+            self.flat_size = self.input_size
+            self.flatten = sj_layer.Flatten()
+            fc_in = self.input_size
+
+        all_fc_sizes = [fc_in] + self.hidden_layers + [self.output_size]
+        self.fcs = nn.ModuleList([
+            sj_layer.Linear(all_fc_sizes[i], all_fc_sizes[i + 1]) for i in range(len(all_fc_sizes) - 1)
+        ])
+        self.lif_layers = nn.ModuleList([create_neuron() for _ in range(len(all_fc_sizes) - 1)])
+
         if HAS_SPIKINGJELLY:
             functional.set_step_mode(self, 'm')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)
-        x_flat = x.view(batch_size, -1)
-        # Sequence input over num_steps (T, Batch, Features)
-        x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+        if self.has_conv:
+            if x.dim() == 2:
+                x_4d = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
+            elif x.dim() == 3:
+                x_4d = x.unsqueeze(1)
+            else:
+                x_4d = x
+            x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
+            cur = x_seq
+            for conv, lif, pool in zip(self.conv_layers_list, self.conv_lif_list, self.conv_pool_list):
+                cur = conv(cur)
+                cur = lif(cur)
+                cur = pool(cur)
+            cur = self.flatten(cur)
+        else:
+            x_flat = x.view(batch_size, -1)
+            x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+            cur = x_seq
 
-        cur = x_seq
         for fc, lif in zip(self.fcs, self.lif_layers):
             cur = fc(cur)
             cur = lif(cur)
@@ -348,14 +575,26 @@ class ConfigurableSpikingJellySNN(nn.Module):
         return out_spikes
 
     def get_structure_summary(self) -> str:
-        all_sizes = [self.input_size] + self.hidden_layers + [self.output_size]
+        parts = []
+        if self.has_conv:
+            for cl in self.resolved_conv:
+                p_str = f",p{cl['pool_size']}" if cl['pool_size'] > 1 else ""
+                parts.append(f"Conv({cl['in_channels']}->{cl['out_channels']},{cl['kernel_size']}x{cl['kernel_size']}{p_str})")
+            parts.append(f"Flat({self.flat_size})")
+        else:
+            parts.append(str(self.input_size))
+
+        for h in self.hidden_layers:
+            parts.append(str(h))
+        parts.append(str(self.output_size))
+
         n_label = "SNN-IF" if self.neuron_type == "if" else "SNN-LIF"
         enc_label = self.encoding_type.upper()
         if self.neuron_type == "if":
             param_str = f"T={self.num_steps}, Enc={enc_label}, θ={self.threshold:.1f}"
         else:
             param_str = f"T={self.num_steps}, Enc={enc_label}, β={self.beta:.2f}, θ={self.threshold:.1f}"
-        return f"SpikingJelly {n_label} [{' -> '.join(str(s) for s in all_sizes)}] ({param_str})"
+        return f"SpikingJelly {n_label} [{' -> '.join(parts)}] ({param_str})"
 
 
 # -------------------------------------------------------------
@@ -371,6 +610,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     model_type = str(model_cfg.get("type", config.get("type", "ann"))).lower()
 
     input_size = model_cfg.get("input_size", 784)
+    conv_layers = model_cfg.get("conv_layers", [])
     hidden_layers = model_cfg.get("hidden_layers", [64])
     output_size = model_cfg.get("output_size", 10)
 
@@ -393,6 +633,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         threshold = float(model_cfg.get("threshold", 1.0))
         model = ConfigurableSpikingJellySNN(
             input_size=input_size,
+            conv_layers=conv_layers,
             hidden_layers=hidden_layers,
             output_size=output_size,
             neuron_type=neuron_type,
@@ -405,6 +646,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         activation = model_cfg.get("activation", "relu")
         model = ConfigurableANN(
             input_size=input_size,
+            conv_layers=conv_layers,
             hidden_layers=hidden_layers,
             activation=activation,
             output_size=output_size,
@@ -428,7 +670,9 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     print("\n" + "=" * 65)
     print(f">>> PyTorch Modell-Konfiguration: {config.get('name', 'Modell')} ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
     print(f"  - Netzwerk-Aufbau:     {model.get_structure_summary()}")
-    print(f"  - Verborgene Schichten:{hidden_layers}")
+    if getattr(model, "has_conv", False):
+        print(f"  - Conv-Schichten:      {len(model.resolved_conv)}")
+    print(f"  - Verborgene Schichten:{model.hidden_layers}")
     if model_type == "snn":
         print(f"  - Neuronen-Typ:        {model.neuron_type.upper()}")
         print(f"  - Encoding-Typ:        {model.encoding_type.upper()}")
@@ -450,7 +694,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.0,), (1.0,)),  # Wertebereich [0.0, 1.0]
+        transforms.Normalize((0.0,), (1.0,)),
     ])
 
     train_dataset = datasets.MNIST(root=data_dir, train=True, download=True, transform=transform)
@@ -468,19 +712,23 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     test_acc = 0.0
     avg_loss = 0.0
     best_state_dict = None
-    best_epoch = 1
-    best_metric = None
-    best_test_acc = 0.0
-    best_test_loss = float("inf")
+    best_epoch = 0
     patience_counter = 0
 
+    if monitor == "test_loss":
+        best_metric_val = float("inf")
+    else:
+        best_metric_val = -float("inf")
+    best_test_acc = 0.0
+    best_test_loss = float("inf")
+
+    print(f"[PyTorch] Starte Training über {epochs} Epochen...")
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        running_loss = 0.0
+        total_batches = 0
 
-        for data, target in train_loader:
+        for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
             output = model(data)
@@ -488,60 +736,59 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * data.size(0)
-            pred = output.argmax(dim=1)
-            correct += (pred == target).sum().item()
-            total += data.size(0)
+            running_loss += loss.item()
+            total_batches += 1
 
-        train_acc = 100.0 * correct / total
-        avg_loss = total_loss / total
-
-        # Test-Evaluierung
+        # Validierung nach jeder Epoche
         model.eval()
-        test_correct = 0
-        test_total = 0
-        test_loss_total = 0.0
+        test_loss = 0.0
+        correct = 0
         with torch.no_grad():
             for data, target in test_loader:
                 data, target = data.to(device), target.to(device)
                 output = model(data)
-                loss = criterion(output, target)
-                test_loss_total += loss.item() * data.size(0)
+                test_loss += criterion(output, target).item()
                 pred = output.argmax(dim=1)
-                test_correct += (pred == target).sum().item()
-                test_total += data.size(0)
+                correct += pred.eq(target).sum().item()
 
-        test_acc = 100.0 * test_correct / test_total
-        test_loss = test_loss_total / test_total if test_total > 0 else 0.0
+        test_loss /= len(test_loader)
+        test_acc = 100.0 * correct / len(test_dataset)
+        avg_loss = running_loss / max(1, total_batches)
 
-        # Best Model Tracking
+        # Early Stopping Überprüfung
         is_best = False
-        if monitor in ("test_loss", "val_loss", "loss"):
-            if best_metric is None or (best_metric - test_loss) > min_delta:
+        if monitor == "test_loss":
+            current_metric = test_loss
+            if current_metric < (best_metric_val - min_delta):
                 is_best = True
-                best_metric = test_loss
-        else:  # "test_acc", "val_acc", "acc"
-            if best_metric is None or (test_acc - best_metric) > min_delta:
+                best_metric_val = current_metric
+                patience_counter = 0
+            else:
+                patience_counter += 1
+        else:
+            current_metric = test_acc
+            if current_metric > (best_metric_val + min_delta):
                 is_best = True
-                best_metric = test_acc
+                best_metric_val = current_metric
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-        if is_best:
-            best_state_dict = copy.deepcopy(model.state_dict())
+        if is_best or best_state_dict is None:
             best_epoch = epoch
             best_test_acc = test_acc
             best_test_loss = test_loss
-            patience_counter = 0
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_tag = " [Bestes Modell]"
         else:
-            patience_counter += 1
+            best_tag = f" [Patience: {patience_counter}/{patience}]" if early_stopping_enabled else ""
 
-        best_marker = " * (Bester Checkpoint)" if is_best else ""
-        print(f"[PyTorch] Epoche {epoch}/{epochs} - Train-Verlust: {avg_loss:.4f} | Test-Verlust: {test_loss:.4f} | Train-Acc: {train_acc:.2f}% | Test-Acc: {test_acc:.2f}%{best_marker}")
+        print(f"  Epoche {epoch:02d}/{epochs:02d} | Train-Verlust: {avg_loss:.4f} | Test-Verlust: {test_loss:.4f} | Test-Genauigkeit: {test_acc:.2f}%{best_tag}")
 
         if early_stopping_enabled and patience_counter >= patience:
             print(f"[Early Stopping] Vorzeitiger Abbruch in Epoche {epoch}/{epochs}: Keine Verbesserung der Metrik '{monitor}' seit {patience} Epochen (Bester Stand in Epoche {best_epoch}: Test-Acc: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
             break
 
-    # Nach dem Training: Bestes Modell wiederherstellen falls gewünscht
     if best_state_dict is not None and restore_best_weights:
         model.load_state_dict(best_state_dict)
         test_acc = best_test_acc
@@ -559,8 +806,7 @@ def evaluate_subset(
     device: str = "cpu",
 ) -> Tuple[float, int, int]:
     """
-    Evaluiert das Modell auf einer definierten Teilmenge des Testdatensatzes (z. B. den auf den ESP32 exportierten Samples).
-    Gibt (genauigkeit_in_prozent, anzahl_korrekt, anzahl_gesamt) zurück.
+    Evaluiert das Modell auf einer definierten Teilmenge des Testdatensatzes.
     """
     model.eval()
     total = min(num_samples, len(test_dataset))
@@ -587,23 +833,11 @@ def evaluate_subset(
 def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJellySNN]) -> bytes:
     """
     Erstellt dynamisch einen standardkonformen TFLite FlatBuffer für ein
-    beliebiges mehrschichtiges Fully-Connected-Netzwerk (ANN oder SNN).
+    beliebiges Convolutional- oder Fully-Connected-Netzwerk (ANN).
     """
     model.eval()
-    if isinstance(model, ConfigurableSpikingJellySNN):
-        layers = list(model.fcs)
-        act_name = "none"
-    else:
-        layers = list(model.layers)
-        act_name = getattr(model, "activation_name", "relu")
-
-    num_layers = len(layers)
-    if num_layers == 0:
-        raise ValueError("Modell enthält keine Schichten!")
-
     bld = flatbuffers.Builder(2 * 1024 * 1024)
 
-    # 1. Buffers anlegen (Buffer 0 ist per TFLite-Spezifikation leer)
     tflite.BufferStart(bld)
     buf0 = tflite.BufferEnd(bld)
     buffers = [buf0]
@@ -615,25 +849,18 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
         tflite.BufferAddData(bld, vec)
         return tflite.BufferEnd(bld)
 
-    weights_buffers = []
-    biases_buffers = []
+    op_codes = []
+    op_code_map = {}
 
-    for layer in layers:
-        w = layer.weight.detach().cpu().numpy().astype(np.float32)  # Shape (out_dim, in_dim)
-        b = layer.bias.detach().cpu().numpy().astype(np.float32)    # Shape (out_dim,)
-        buf_w = make_buffer(w)
-        buf_b = make_buffer(b)
-        buffers.append(buf_w)
-        buffers.append(buf_b)
-        weights_buffers.append(len(buffers) - 2)
-        biases_buffers.append(len(buffers) - 1)
+    def get_opcode_idx(code):
+        if code not in op_code_map:
+            tflite.OperatorCodeStart(bld)
+            tflite.OperatorCodeAddBuiltinCode(bld, code)
+            op = tflite.OperatorCodeEnd(bld)
+            op_codes.append(op)
+            op_code_map[code] = len(op_codes) - 1
+        return op_code_map[code]
 
-    # 2. Operator Code (FULLY_CONNECTED)
-    tflite.OperatorCodeStart(bld)
-    tflite.OperatorCodeAddBuiltinCode(bld, tflite.BuiltinOperator.FULLY_CONNECTED)
-    op_code_fc = tflite.OperatorCodeEnd(bld)
-
-    # 3. Tensors erzeugen
     def make_tensor(name: str, shape: List[int], ttype: int, buf_idx: int) -> int:
         tflite.TensorStartShapeVector(bld, len(shape))
         for dim in reversed(shape):
@@ -648,65 +875,244 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
         return tflite.TensorEnd(bld)
 
     tensors = []
-    # Tensor 0: input
-    t_input = make_tensor("input", [1, model.input_size], tflite.TensorType.FLOAT32, 0)
-    tensors.append(t_input)
-
-    # Für jeden Layer: W, B, Output
-    for i, layer in enumerate(layers):
-        in_dim = layer.in_features
-        out_dim = layer.out_features
-        w_idx = weights_buffers[i]
-        b_idx = biases_buffers[i]
-
-        t_w = make_tensor(f"fc{i+1}_w", [out_dim, in_dim], tflite.TensorType.FLOAT32, w_idx)
-        t_b = make_tensor(f"fc{i+1}_b", [out_dim], tflite.TensorType.FLOAT32, b_idx)
-        out_name = "output" if i == num_layers - 1 else f"fc{i+1}_out"
-        t_out = make_tensor(out_name, [1, out_dim], tflite.TensorType.FLOAT32, 0)
-
-        tensors.extend([t_w, t_b, t_out])
-
-    # 4. Operatoren (FullyConnected für jeden Layer)
     ops = []
-    for i in range(num_layers):
-        is_last = (i == num_layers - 1)
-        use_relu = (not is_last) and (act_name == "relu")
 
-        tflite.FullyConnectedOptionsStart(bld)
-        act_type = tflite.ActivationFunctionType.RELU if use_relu else tflite.ActivationFunctionType.NONE
-        tflite.FullyConnectedOptionsAddFusedActivationFunction(bld, act_type)
-        opt_fc = tflite.FullyConnectedOptionsEnd(bld)
+    if getattr(model, "has_conv", False):
+        t_input = make_tensor("input", [1, model.in_height, model.in_width, model.in_channels], tflite.TensorType.FLOAT32, 0)
+        tensors.append(t_input)
+        cur_tensor_idx = 0
 
-        input_tensor_idx = 0 if i == 0 else (3 * i)
-        weight_tensor_idx = 3 * i + 1
-        bias_tensor_idx = 3 * i + 2
-        out_tensor_idx = 3 * i + 3
+        for c_idx, cl in enumerate(model.resolved_conv):
+            seq = model.conv_modules[c_idx]
+            conv_mod = seq[0]
+            # PyTorch: (out_c, in_c, kh, kw) -> TFLite: (out_c, kh, kw, in_c)
+            w = conv_mod.weight.detach().cpu().numpy().astype(np.float32).transpose(0, 2, 3, 1)
+            b = conv_mod.bias.detach().cpu().numpy().astype(np.float32)
+            w_buf = make_buffer(w)
+            b_buf = make_buffer(b)
+            buffers.extend([w_buf, b_buf])
+            w_buf_idx = len(buffers) - 2
+            b_buf_idx = len(buffers) - 1
 
-        tflite.OperatorStartInputsVector(bld, 3)
-        bld.PrependInt32(bias_tensor_idx)
-        bld.PrependInt32(weight_tensor_idx)
-        bld.PrependInt32(input_tensor_idx)
-        in_vec = bld.EndVector()
+            t_w = make_tensor(f"conv{c_idx+1}_w", [cl["out_channels"], cl["kernel_size"], cl["kernel_size"], cl["in_channels"]], tflite.TensorType.FLOAT32, w_buf_idx)
+            t_b = make_tensor(f"conv{c_idx+1}_b", [cl["out_channels"]], tflite.TensorType.FLOAT32, b_buf_idx)
+            t_conv_out = make_tensor(f"conv{c_idx+1}_out", [1, cl["out_h"], cl["out_w"], cl["out_channels"]], tflite.TensorType.FLOAT32, 0)
+
+            w_idx = len(tensors)
+            b_idx = len(tensors) + 1
+            conv_out_idx = len(tensors) + 2
+            tensors.extend([t_w, t_b, t_conv_out])
+
+            op_conv_idx = get_opcode_idx(tflite.BuiltinOperator.CONV_2D)
+            tflite.Conv2DOptionsStart(bld)
+            tflite.Conv2DOptionsAddPadding(bld, tflite.Padding.SAME if cl["padding"] > 0 else tflite.Padding.VALID)
+            tflite.Conv2DOptionsAddStrideH(bld, cl["stride"])
+            tflite.Conv2DOptionsAddStrideW(bld, cl["stride"])
+            act_type = tflite.ActivationFunctionType.RELU if getattr(model, "activation_name", "relu") == "relu" else tflite.ActivationFunctionType.NONE
+            tflite.Conv2DOptionsAddFusedActivationFunction(bld, act_type)
+            opt_conv = tflite.Conv2DOptionsEnd(bld)
+
+            tflite.OperatorStartInputsVector(bld, 3)
+            bld.PrependInt32(b_idx)
+            bld.PrependInt32(w_idx)
+            bld.PrependInt32(cur_tensor_idx)
+            in_conv = bld.EndVector()
+
+            tflite.OperatorStartOutputsVector(bld, 1)
+            bld.PrependInt32(conv_out_idx)
+            out_conv = bld.EndVector()
+
+            tflite.OperatorStart(bld)
+            tflite.OperatorAddOpcodeIndex(bld, op_conv_idx)
+            tflite.OperatorAddInputs(bld, in_conv)
+            tflite.OperatorAddOutputs(bld, out_conv)
+            tflite.OperatorAddBuiltinOptionsType(bld, tflite.BuiltinOptions.Conv2DOptions)
+            tflite.OperatorAddBuiltinOptions(bld, opt_conv)
+            ops.append(tflite.OperatorEnd(bld))
+            cur_tensor_idx = conv_out_idx
+
+            if cl["pool_size"] > 1:
+                t_pool_out = make_tensor(f"pool{c_idx+1}_out", [1, cl["pool_out_h"], cl["pool_out_w"], cl["out_channels"]], tflite.TensorType.FLOAT32, 0)
+                pool_out_idx = len(tensors)
+                tensors.append(t_pool_out)
+
+                pool_op_code = tflite.BuiltinOperator.MAX_POOL_2D if cl["pool_type"] == "max" else tflite.BuiltinOperator.AVERAGE_POOL_2D
+                op_pool_idx = get_opcode_idx(pool_op_code)
+                tflite.Pool2DOptionsStart(bld)
+                tflite.Pool2DOptionsAddPadding(bld, tflite.Padding.VALID)
+                tflite.Pool2DOptionsAddStrideH(bld, cl["pool_stride"])
+                tflite.Pool2DOptionsAddStrideW(bld, cl["pool_stride"])
+                tflite.Pool2DOptionsAddFilterHeight(bld, cl["pool_size"])
+                tflite.Pool2DOptionsAddFilterWidth(bld, cl["pool_size"])
+                tflite.Pool2DOptionsAddFusedActivationFunction(bld, tflite.ActivationFunctionType.NONE)
+                opt_pool = tflite.Pool2DOptionsEnd(bld)
+
+                tflite.OperatorStartInputsVector(bld, 1)
+                bld.PrependInt32(cur_tensor_idx)
+                in_pool = bld.EndVector()
+
+                tflite.OperatorStartOutputsVector(bld, 1)
+                bld.PrependInt32(pool_out_idx)
+                out_pool = bld.EndVector()
+
+                tflite.OperatorStart(bld)
+                tflite.OperatorAddOpcodeIndex(bld, op_pool_idx)
+                tflite.OperatorAddInputs(bld, in_pool)
+                tflite.OperatorAddOutputs(bld, out_pool)
+                tflite.OperatorAddBuiltinOptionsType(bld, tflite.BuiltinOptions.Pool2DOptions)
+                tflite.OperatorAddBuiltinOptions(bld, opt_pool)
+                ops.append(tflite.OperatorEnd(bld))
+                cur_tensor_idx = pool_out_idx
+
+        # Reshape / Flatten
+        shape_arr = np.array([1, model.flat_size], dtype=np.int32)
+        buf_shape = make_buffer(shape_arr)
+        buffers.append(buf_shape)
+        shape_buf_idx = len(buffers) - 1
+
+        t_shape = make_tensor("flat_shape", [2], tflite.TensorType.INT32, shape_buf_idx)
+        t_flat = make_tensor("flat_out", [1, model.flat_size], tflite.TensorType.FLOAT32, 0)
+        shape_tensor_idx = len(tensors)
+        flat_tensor_idx = len(tensors) + 1
+        tensors.extend([t_shape, t_flat])
+
+        op_reshape_idx = get_opcode_idx(tflite.BuiltinOperator.RESHAPE)
+        tflite.ReshapeOptionsStartNewShapeVector(bld, 2)
+        bld.PrependInt32(model.flat_size)
+        bld.PrependInt32(1)
+        new_shape_vec = bld.EndVector()
+        tflite.ReshapeOptionsStart(bld)
+        tflite.ReshapeOptionsAddNewShape(bld, new_shape_vec)
+        opt_reshape = tflite.ReshapeOptionsEnd(bld)
+
+        tflite.OperatorStartInputsVector(bld, 2)
+        bld.PrependInt32(shape_tensor_idx)
+        bld.PrependInt32(cur_tensor_idx)
+        in_reshape = bld.EndVector()
 
         tflite.OperatorStartOutputsVector(bld, 1)
-        bld.PrependInt32(out_tensor_idx)
-        out_vec = bld.EndVector()
+        bld.PrependInt32(flat_tensor_idx)
+        out_reshape = bld.EndVector()
 
         tflite.OperatorStart(bld)
-        tflite.OperatorAddOpcodeIndex(bld, 0)
-        tflite.OperatorAddInputs(bld, in_vec)
-        tflite.OperatorAddOutputs(bld, out_vec)
-        tflite.OperatorAddBuiltinOptionsType(bld, tflite.BuiltinOptions.FullyConnectedOptions)
-        tflite.OperatorAddBuiltinOptions(bld, opt_fc)
-        op = tflite.OperatorEnd(bld)
-        ops.append(op)
+        tflite.OperatorAddOpcodeIndex(bld, op_reshape_idx)
+        tflite.OperatorAddInputs(bld, in_reshape)
+        tflite.OperatorAddOutputs(bld, out_reshape)
+        tflite.OperatorAddBuiltinOptionsType(bld, tflite.BuiltinOptions.ReshapeOptions)
+        tflite.OperatorAddBuiltinOptions(bld, opt_reshape)
+        ops.append(tflite.OperatorEnd(bld))
+        cur_tensor_idx = flat_tensor_idx
 
-    # 5. Subgraph
+        # FC layers
+        op_fc_idx = get_opcode_idx(tflite.BuiltinOperator.FULLY_CONNECTED)
+        num_fc = len(model.fc_layers)
+        for f_idx, fc in enumerate(model.fc_layers):
+            is_last = (f_idx == num_fc - 1)
+            use_relu = (not is_last) and (getattr(model, "activation_name", "relu") == "relu")
+
+            w = fc.weight.detach().cpu().numpy().astype(np.float32)
+            b = fc.bias.detach().cpu().numpy().astype(np.float32)
+            w_buf = make_buffer(w)
+            b_buf = make_buffer(b)
+            buffers.extend([w_buf, b_buf])
+            w_buf_idx = len(buffers) - 2
+            b_buf_idx = len(buffers) - 1
+
+            t_w = make_tensor(f"fc{f_idx+1}_w", [fc.out_features, fc.in_features], tflite.TensorType.FLOAT32, w_buf_idx)
+            t_b = make_tensor(f"fc{f_idx+1}_b", [fc.out_features], tflite.TensorType.FLOAT32, b_buf_idx)
+            out_name = "output" if is_last else f"fc{f_idx+1}_out"
+            t_out = make_tensor(out_name, [1, fc.out_features], tflite.TensorType.FLOAT32, 0)
+
+            w_idx = len(tensors)
+            b_idx = len(tensors) + 1
+            out_idx = len(tensors) + 2
+            tensors.extend([t_w, t_b, t_out])
+
+            tflite.FullyConnectedOptionsStart(bld)
+            tflite.FullyConnectedOptionsAddFusedActivationFunction(bld, tflite.ActivationFunctionType.RELU if use_relu else tflite.ActivationFunctionType.NONE)
+            opt_fc = tflite.FullyConnectedOptionsEnd(bld)
+
+            tflite.OperatorStartInputsVector(bld, 3)
+            bld.PrependInt32(b_idx)
+            bld.PrependInt32(w_idx)
+            bld.PrependInt32(cur_tensor_idx)
+            in_fc = bld.EndVector()
+
+            tflite.OperatorStartOutputsVector(bld, 1)
+            bld.PrependInt32(out_idx)
+            out_fc = bld.EndVector()
+
+            tflite.OperatorStart(bld)
+            tflite.OperatorAddOpcodeIndex(bld, op_fc_idx)
+            tflite.OperatorAddInputs(bld, in_fc)
+            tflite.OperatorAddOutputs(bld, out_fc)
+            tflite.OperatorAddBuiltinOptionsType(bld, tflite.BuiltinOptions.FullyConnectedOptions)
+            tflite.OperatorAddBuiltinOptions(bld, opt_fc)
+            ops.append(tflite.OperatorEnd(bld))
+            cur_tensor_idx = out_idx
+
+    else:
+        # Pure FC Model
+        layers = list(model.fc_layers) if hasattr(model, "fc_layers") else list(model.layers)
+        num_layers = len(layers)
+        op_fc_idx = get_opcode_idx(tflite.BuiltinOperator.FULLY_CONNECTED)
+
+        t_input = make_tensor("input", [1, model.input_size], tflite.TensorType.FLOAT32, 0)
+        tensors.append(t_input)
+        cur_tensor_idx = 0
+
+        for i, layer in enumerate(layers):
+            is_last = (i == num_layers - 1)
+            use_relu = (not is_last) and (getattr(model, "activation_name", "relu") == "relu")
+
+            w = layer.weight.detach().cpu().numpy().astype(np.float32)
+            b = layer.bias.detach().cpu().numpy().astype(np.float32)
+            w_buf = make_buffer(w)
+            b_buf = make_buffer(b)
+            buffers.extend([w_buf, b_buf])
+            w_buf_idx = len(buffers) - 2
+            b_buf_idx = len(buffers) - 1
+
+            t_w = make_tensor(f"fc{i+1}_w", [layer.out_features, layer.in_features], tflite.TensorType.FLOAT32, w_buf_idx)
+            t_b = make_tensor(f"fc{i+1}_b", [layer.out_features], tflite.TensorType.FLOAT32, b_buf_idx)
+            out_name = "output" if is_last else f"fc{i+1}_out"
+            t_out = make_tensor(out_name, [1, layer.out_features], tflite.TensorType.FLOAT32, 0)
+
+            w_idx = len(tensors)
+            b_idx = len(tensors) + 1
+            out_idx = len(tensors) + 2
+            tensors.extend([t_w, t_b, t_out])
+
+            tflite.FullyConnectedOptionsStart(bld)
+            tflite.FullyConnectedOptionsAddFusedActivationFunction(bld, tflite.ActivationFunctionType.RELU if use_relu else tflite.ActivationFunctionType.NONE)
+            opt_fc = tflite.FullyConnectedOptionsEnd(bld)
+
+            tflite.OperatorStartInputsVector(bld, 3)
+            bld.PrependInt32(b_idx)
+            bld.PrependInt32(w_idx)
+            bld.PrependInt32(cur_tensor_idx)
+            in_fc = bld.EndVector()
+
+            tflite.OperatorStartOutputsVector(bld, 1)
+            bld.PrependInt32(out_idx)
+            out_fc = bld.EndVector()
+
+            tflite.OperatorStart(bld)
+            tflite.OperatorAddOpcodeIndex(bld, op_fc_idx)
+            tflite.OperatorAddInputs(bld, in_fc)
+            tflite.OperatorAddOutputs(bld, out_fc)
+            tflite.OperatorAddBuiltinOptionsType(bld, tflite.BuiltinOptions.FullyConnectedOptions)
+            tflite.OperatorAddBuiltinOptions(bld, opt_fc)
+            ops.append(tflite.OperatorEnd(bld))
+            cur_tensor_idx = out_idx
+
+    final_output_idx = cur_tensor_idx
+
+    # Subgraph
     tflite.SubGraphStartInputsVector(bld, 1)
-    bld.PrependInt32(0)  # Eingabetensor 0
+    bld.PrependInt32(0)
     sub_in = bld.EndVector()
 
-    final_output_idx = 3 * num_layers
     tflite.SubGraphStartOutputsVector(bld, 1)
     bld.PrependInt32(final_output_idx)
     sub_out = bld.EndVector()
@@ -728,9 +1134,10 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
     tflite.SubGraphAddOperators(bld, sub_ops)
     subgraph = tflite.SubGraphEnd(bld)
 
-    # 6. Model
-    tflite.ModelStartOperatorCodesVector(bld, 1)
-    bld.PrependUOffsetTRelative(op_code_fc)
+    # Model
+    tflite.ModelStartOperatorCodesVector(bld, len(op_codes))
+    for oc in reversed(op_codes):
+        bld.PrependUOffsetTRelative(oc)
     opcodes = bld.EndVector()
 
     tflite.ModelStartSubgraphsVector(bld, 1)
@@ -798,11 +1205,27 @@ def export_c_files(
         f.write("#define ENCODING_TTFS      1\n")
         f.write("#define ENCODING_POISSON   2\n")
         f.write("#define ENCODING_PERIODIC  3\n\n")
-        f.write("#define SNN_MAX_LAYERS 8\n\n")
+        f.write("#define SNN_MAX_FC_LAYERS   8\n")
+        f.write("#define SNN_MAX_CONV_LAYERS 4\n\n")
+        f.write("typedef struct {\n")
+        f.write("    int in_channels;\n")
+        f.write("    int out_channels;\n")
+        f.write("    int kernel_size;\n")
+        f.write("    int stride;\n")
+        f.write("    int padding;\n")
+        f.write("    int pool_size;\n")
+        f.write("    int pool_stride;\n")
+        f.write("    int in_h, in_w;\n")
+        f.write("    int out_h, out_w;\n")
+        f.write("    int pool_out_h, pool_out_w;\n")
+        f.write("} snn_conv_layer_cfg_t;\n\n")
         f.write("typedef struct {\n")
         f.write("    int input_size;\n")
+        f.write("    int num_conv_layers;\n")
+        f.write("    snn_conv_layer_cfg_t conv_layers[SNN_MAX_CONV_LAYERS];\n")
+        f.write("    int flat_size;\n")
         f.write("    int hidden_layers_count;\n")
-        f.write("    int layer_sizes[SNN_MAX_LAYERS + 1];\n")
+        f.write("    int fc_layer_sizes[SNN_MAX_FC_LAYERS + 1];\n")
         f.write("    int num_steps;\n")
         f.write("    float beta;\n")
         f.write("    float threshold;\n")
@@ -815,10 +1238,12 @@ def export_c_files(
         f.write("// ANN-Spezifisch (TensorFlow Lite Micro FlatBuffer)\n")
         f.write("extern const unsigned char g_model[];\n")
         f.write("extern const int g_model_len;\n\n")
-        f.write("// SNN-Spezifisch (LIF Neuronen Parameter & Gewichte)\n")
+        f.write("// SNN-Spezifisch (LIF/IF Neuronen Parameter & Gewichte)\n")
         f.write("extern const snn_config_t g_snn_config;\n")
-        f.write("extern const float* const g_snn_weights[];\n")
-        f.write("extern const float* const g_snn_biases[];\n\n")
+        f.write("extern const float* const g_snn_conv_weights[];\n")
+        f.write("extern const float* const g_snn_conv_biases[];\n")
+        f.write("extern const float* const g_snn_fc_weights[];\n")
+        f.write("extern const float* const g_snn_fc_biases[];\n\n")
         f.write("#ifdef __cplusplus\n}\n#endif\n")
 
     # 2. model_data.cc
@@ -848,22 +1273,56 @@ def export_c_files(
         f.write(f'const int g_model_len = {len(tflite_bytes)};\n\n')
 
         if model_type == "ann":
-            # Dummy SNN Symbole
-            f.write("const snn_config_t g_snn_config = {0, 0, {0}, 0, 0.0f, 0.0f, 0, 0, 0};\n")
-            f.write("const float* const g_snn_weights[] = {0};\n")
-            f.write("const float* const g_snn_biases[] = {0};\n")
+            f.write("const snn_config_t g_snn_config = {};\n")
+            f.write("const float* const g_snn_conv_weights[] = {0};\n")
+            f.write("const float* const g_snn_conv_biases[] = {0};\n")
+            f.write("const float* const g_snn_fc_weights[] = {0};\n")
+            f.write("const float* const g_snn_fc_biases[] = {0};\n")
         elif model_type == "snn":
-            # SNN Gewichte und Biases
+            num_conv = len(getattr(model, "conv_layers_list", []))
+            if num_conv > 0:
+                for c_idx, conv in enumerate(model.conv_layers_list):
+                    w = conv.weight.detach().cpu().numpy().astype(np.float32)
+                    b = conv.bias.detach().cpu().numpy().astype(np.float32)
+                    f.write(f"// SNN Conv {c_idx}: shape {w.shape}\n")
+                    f.write(f"static const float s_snn_conv_w{c_idx}[{w.size}] = {{\n")
+                    w_flat = w.flatten()
+                    for i, val in enumerate(w_flat):
+                        if i % 8 == 0:
+                            f.write('  ')
+                        f.write(f'{val:.7f}f, ')
+                        if i % 8 == 7:
+                            f.write('\n')
+                    if len(w_flat) % 8 != 0:
+                        f.write('\n')
+                    f.write("};\n\n")
+
+                    f.write(f"static const float s_snn_conv_b{c_idx}[{b.size}] = {{\n  ")
+                    f.write(", ".join(f"{val:.7f}f" for val in b))
+                    f.write("\n};\n\n")
+
+                f.write("const float* const g_snn_conv_weights[] = {\n")
+                for c_idx in range(num_conv):
+                    f.write(f"    s_snn_conv_w{c_idx},\n")
+                f.write("};\n\n")
+
+                f.write("const float* const g_snn_conv_biases[] = {\n")
+                for c_idx in range(num_conv):
+                    f.write(f"    s_snn_conv_b{c_idx},\n")
+                f.write("};\n\n")
+            else:
+                f.write("const float* const g_snn_conv_weights[] = {0};\n")
+                f.write("const float* const g_snn_conv_biases[] = {0};\n\n")
+
+            # FC Schichten
             fcs = model.fcs
-            num_layers = len(fcs)
-            layer_sizes = [input_size] + model.hidden_layers + [output_size]
-
+            num_fc = len(fcs)
             for l_idx, fc in enumerate(fcs):
-                w = fc.weight.detach().cpu().numpy().astype(np.float32)  # shape: (out_features, in_features)
-                b = fc.bias.detach().cpu().numpy().astype(np.float32)    # shape: (out_features,)
+                w = fc.weight.detach().cpu().numpy().astype(np.float32)
+                b = fc.bias.detach().cpu().numpy().astype(np.float32)
 
-                f.write(f"// SNN Schicht {l_idx}: {w.shape[1]} -> {w.shape[0]}\n")
-                f.write(f"static const float s_snn_w{l_idx}[{w.size}] = {{\n")
+                f.write(f"// SNN FC Schicht {l_idx}: {w.shape[1]} -> {w.shape[0]}\n")
+                f.write(f"static const float s_snn_fc_w{l_idx}[{w.size}] = {{\n")
                 w_flat = w.flatten()
                 for i, val in enumerate(w_flat):
                     if i % 8 == 0:
@@ -875,27 +1334,36 @@ def export_c_files(
                     f.write('\n')
                 f.write("};\n\n")
 
-                f.write(f"static const float s_snn_b{l_idx}[{b.size}] = {{\n  ")
+                f.write(f"static const float s_snn_fc_b{l_idx}[{b.size}] = {{\n  ")
                 f.write(", ".join(f"{val:.7f}f" for val in b))
                 f.write("\n};\n\n")
 
-            f.write("const float* const g_snn_weights[] = {\n")
-            for l_idx in range(num_layers):
-                f.write(f"    s_snn_w{l_idx},\n")
+            f.write("const float* const g_snn_fc_weights[] = {\n")
+            for l_idx in range(num_fc):
+                f.write(f"    s_snn_fc_w{l_idx},\n")
             f.write("};\n\n")
 
-            f.write("const float* const g_snn_biases[] = {\n")
-            for l_idx in range(num_layers):
-                f.write(f"    s_snn_b{l_idx},\n")
+            f.write("const float* const g_snn_fc_biases[] = {\n")
+            for l_idx in range(num_fc):
+                f.write(f"    s_snn_fc_b{l_idx},\n")
             f.write("};\n\n")
 
             n_type_code = 1 if getattr(model, "neuron_type", "lif") == "if" else 0
             enc_code = get_encoding_code(getattr(model, "encoding_type", "direct"))
-            layer_sizes_str = ", ".join(str(s) for s in layer_sizes)
+            fc_layer_sizes = [model.flat_size] + model.hidden_layers + [output_size]
+            fc_sizes_str = ", ".join(str(s) for s in fc_layer_sizes)
+
             f.write("const snn_config_t g_snn_config = {\n")
             f.write(f"    .input_size = {input_size},\n")
+            f.write(f"    .num_conv_layers = {num_conv},\n")
+            f.write("    .conv_layers = {\n")
+            if num_conv > 0:
+                for cl in model.resolved_conv:
+                    f.write(f"        {{{cl['in_channels']}, {cl['out_channels']}, {cl['kernel_size']}, {cl['stride']}, {cl['padding']}, {cl['pool_size']}, {cl['pool_stride']}, {cl['in_h']}, {cl['in_w']}, {cl['out_h']}, {cl['out_w']}, {cl['pool_out_h']}, {cl['pool_out_w']}}},\n")
+            f.write("    },\n")
+            f.write(f"    .flat_size = {model.flat_size},\n")
             f.write(f"    .hidden_layers_count = {len(model.hidden_layers)},\n")
-            f.write(f"    .layer_sizes = {{{layer_sizes_str}}},\n")
+            f.write(f"    .fc_layer_sizes = {{{fc_sizes_str}}},\n")
             f.write(f"    .num_steps = {model.num_steps},\n")
             f.write(f"    .beta = {model.beta:.4f}f,\n")
             f.write(f"    .threshold = {model.threshold:.4f}f,\n")
@@ -904,7 +1372,7 @@ def export_c_files(
             f.write(f"    .encoding_type = {enc_code},\n")
             f.write("};\n")
 
-    # 3. mnist_test_data.h (Testbilder und Labels)
+    # 3. mnist_test_data.h
     test_header_path = out_path / "mnist_test_data.h"
     with open(test_header_path, "w", encoding="utf-8") as f:
         f.write("#pragma once\n")
@@ -913,13 +1381,11 @@ def export_c_files(
         f.write(f"#define MNIST_IMAGE_SIZE {input_size}\n")
         f.write(f"#define MNIST_NUM_OUTPUTS {output_size}\n\n")
 
-        # Labels
         labels = [test_dataset[i][1] for i in range(num_test_samples)]
         f.write("static const uint8_t mnist_test_labels[MNIST_TEST_SUBSET] = {\n  ")
         f.write(", ".join(str(l) for l in labels))
         f.write("\n};\n\n")
 
-        # Images
         f.write("static const float mnist_test_images[MNIST_TEST_SUBSET][MNIST_IMAGE_SIZE] = {\n")
         for i in range(num_test_samples):
             img_tensor, _ = test_dataset[i]
@@ -941,9 +1407,6 @@ def export_c_files(
 def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Extrahiert alle konfigurierten Modelle aus der Konfiguration.
-    Unterstützt sowohl 'models:' (Liste mehrerer Modelle) als auch 'model:' (einzelnes Modell).
-    Ermöglicht individuelle Trainingsparameter (epochs, batch_size, learning_rate / lr, optimizer)
-    pro Modell sowie globale Fallbacks aus dem 'training:'-Abschnitt.
     """
     models_list = config.get("models")
     resolved_models = []
@@ -958,12 +1421,14 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not isinstance(m, dict):
                 continue
             m_type = str(m.get("type", "ann")).lower()
+            conv_layers = parse_conv_layers(m.get("conv_layers", m.get("conv", [])))
             hidden_layers = parse_hidden_layers(m.get("hidden_layers", [64]))
             name = m.get("name")
             if not name:
                 layer_str = "_".join(str(h) for h in hidden_layers) if hidden_layers else "linear"
+                conv_str = f"Conv{len(conv_layers)}_" if conv_layers else ""
                 prefix = "SNN" if m_type == "snn" else "ANN"
-                name = f"{prefix}_{layer_str}"
+                name = f"{prefix}_{conv_str}{layer_str}"
 
             input_size = int(m.get("input_size", config.get("model", {}).get("input_size", 784)))
             output_size = int(m.get("output_size", config.get("model", {}).get("output_size", 10)))
@@ -971,6 +1436,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             model_dict = {
                 "type": m_type,
                 "input_size": input_size,
+                "conv_layers": conv_layers,
                 "hidden_layers": hidden_layers,
                 "output_size": output_size,
             }
@@ -983,15 +1449,13 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             else:
                 model_dict["activation"] = str(m.get("activation", config.get("model", {}).get("activation", "relu")))
 
-            # 1. Globale Trainingsparameter als Basis
+            # Globale Trainingsparameter als Basis
             model_training = dict(global_training)
-            # 2. Modell-spezifischer nested block
             if isinstance(m.get("training"), dict):
                 nested_tr = dict(m["training"])
                 if "lr" in nested_tr and "learning_rate" not in nested_tr:
                     nested_tr["learning_rate"] = nested_tr.pop("lr")
                 model_training.update(nested_tr)
-            # 3. Direkte Angaben auf oberster Ebene des Modell-Objekts
             for k in ("epochs", "batch_size", "learning_rate", "lr", "optimizer", "data_dir", "random_seed", "early_stopping", "patience", "min_delta", "monitor", "restore_best_weights"):
                 if k in m:
                     if k == "lr":
@@ -999,7 +1463,6 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     else:
                         model_training[k] = m[k]
 
-            # Typen absichern
             if "epochs" in model_training and model_training["epochs"] is not None:
                 model_training["epochs"] = int(model_training["epochs"])
             if "batch_size" in model_training and model_training["batch_size"] is not None:
@@ -1010,27 +1473,6 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 model_training["patience"] = int(model_training["patience"])
             if "min_delta" in model_training and model_training["min_delta"] is not None:
                 model_training["min_delta"] = float(model_training["min_delta"])
-            if "monitor" in model_training and model_training["monitor"] is not None:
-                model_training["monitor"] = str(model_training["monitor"]).lower()
-            if "restore_best_weights" in model_training and model_training["restore_best_weights"] is not None:
-                model_training["restore_best_weights"] = bool(model_training["restore_best_weights"])
-            if "early_stopping" in model_training:
-                es = model_training["early_stopping"]
-                if isinstance(es, bool):
-                    model_training["early_stopping"] = es
-                elif isinstance(es, str):
-                    model_training["early_stopping"] = es.lower() in ("true", "1", "yes", "on")
-                elif isinstance(es, dict):
-                    if "enabled" in es:
-                        model_training["early_stopping"] = bool(es["enabled"])
-                    if "patience" in es:
-                        model_training["patience"] = int(es["patience"])
-                    if "min_delta" in es:
-                        model_training["min_delta"] = float(es["min_delta"])
-                    if "monitor" in es:
-                        model_training["monitor"] = str(es["monitor"]).lower()
-                    if "restore_best_weights" in es:
-                        model_training["restore_best_weights"] = bool(es["restore_best_weights"])
 
             model_evaluation = dict(global_evaluation)
             if isinstance(m.get("evaluation"), dict):
@@ -1053,109 +1495,84 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "esp32": global_esp32,
                 "joulescope": global_joulescope,
             })
+        return resolved_models
+
+    single_m = config.get("model", {})
+    m_type = str(single_m.get("type", "ann")).lower()
+    conv_layers = parse_conv_layers(single_m.get("conv_layers", single_m.get("conv", [])))
+    hidden_layers = parse_hidden_layers(single_m.get("hidden_layers", [64]))
+    name = single_m.get("name")
+    if not name:
+        layer_str = "_".join(str(h) for h in hidden_layers) if hidden_layers else "linear"
+        conv_str = f"Conv{len(conv_layers)}_" if conv_layers else ""
+        prefix = "SNN" if m_type == "snn" else "ANN"
+        name = f"{prefix}_{conv_str}{layer_str}"
+
+    input_size = int(single_m.get("input_size", 784))
+    output_size = int(single_m.get("output_size", 10))
+
+    model_dict = {
+        "type": m_type,
+        "input_size": input_size,
+        "conv_layers": conv_layers,
+        "hidden_layers": hidden_layers,
+        "output_size": output_size,
+    }
+    if m_type == "snn":
+        model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
+        model_dict["encoding_type"] = str(single_m.get("encoding_type", single_m.get("encoding", "direct"))).lower()
+        model_dict["num_steps"] = int(single_m.get("num_steps", single_m.get("steps", 10)))
+        model_dict["beta"] = float(single_m.get("beta", 0.9))
+        model_dict["threshold"] = float(single_m.get("threshold", 1.0))
     else:
-        single_m = config.get("model", {})
-        m_type = str(single_m.get("type", "ann")).lower()
-        hidden_layers = parse_hidden_layers(single_m.get("hidden_layers", [64]))
-        name = single_m.get("name")
-        if not name:
-            layer_str = "_".join(str(h) for h in hidden_layers) if hidden_layers else "linear"
-            prefix = "SNN" if m_type == "snn" else "ANN"
-            name = f"{prefix}_{layer_str}"
+        model_dict["activation"] = str(single_m.get("activation", "relu"))
 
-        model_dict = {
-            "type": m_type,
-            "input_size": int(single_m.get("input_size", 784)),
-            "hidden_layers": hidden_layers,
-            "output_size": int(single_m.get("output_size", 10)),
-        }
-        if m_type == "snn":
-            model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
-            model_dict["encoding_type"] = str(single_m.get("encoding_type", single_m.get("encoding", "direct"))).lower()
-            model_dict["num_steps"] = int(single_m.get("num_steps", single_m.get("steps", 10)))
-            model_dict["beta"] = float(single_m.get("beta", 0.9))
-            model_dict["threshold"] = float(single_m.get("threshold", 1.0))
-        else:
-            model_dict["activation"] = str(single_m.get("activation", "relu"))
+    model_training = dict(global_training)
+    if isinstance(single_m.get("training"), dict):
+        nested_tr = dict(single_m["training"])
+        if "lr" in nested_tr and "learning_rate" not in nested_tr:
+            nested_tr["learning_rate"] = nested_tr.pop("lr")
+        model_training.update(nested_tr)
+    for k in ("epochs", "batch_size", "learning_rate", "lr", "optimizer", "data_dir", "random_seed", "early_stopping", "patience", "min_delta", "monitor", "restore_best_weights"):
+        if k in single_m:
+            if k == "lr":
+                model_training["learning_rate"] = single_m[k]
+            else:
+                model_training[k] = single_m[k]
 
-        model_training = dict(global_training)
-        if isinstance(single_m.get("training"), dict):
-            nested_tr = dict(single_m["training"])
-            if "lr" in nested_tr and "learning_rate" not in nested_tr:
-                nested_tr["learning_rate"] = nested_tr.pop("lr")
-            model_training.update(nested_tr)
-        for k in ("epochs", "batch_size", "learning_rate", "lr", "optimizer", "data_dir", "random_seed", "early_stopping", "patience", "min_delta", "monitor", "restore_best_weights"):
-            if k in single_m:
-                if k == "lr":
-                    model_training["learning_rate"] = single_m[k]
-                else:
-                    model_training[k] = single_m[k]
+    if "epochs" in model_training and model_training["epochs"] is not None:
+        model_training["epochs"] = int(model_training["epochs"])
+    if "batch_size" in model_training and model_training["batch_size"] is not None:
+        model_training["batch_size"] = int(model_training["batch_size"])
+    if "learning_rate" in model_training and model_training["learning_rate"] is not None:
+        model_training["learning_rate"] = float(model_training["learning_rate"])
+    if "patience" in model_training and model_training["patience"] is not None:
+        model_training["patience"] = int(model_training["patience"])
+    if "min_delta" in model_training and model_training["min_delta"] is not None:
+        model_training["min_delta"] = float(model_training["min_delta"])
 
-        if "epochs" in model_training and model_training["epochs"] is not None:
-            model_training["epochs"] = int(model_training["epochs"])
-        if "batch_size" in model_training and model_training["batch_size"] is not None:
-            model_training["batch_size"] = int(model_training["batch_size"])
-        if "learning_rate" in model_training and model_training["learning_rate"] is not None:
-            model_training["learning_rate"] = float(model_training["learning_rate"])
-        if "patience" in model_training and model_training["patience"] is not None:
-            model_training["patience"] = int(model_training["patience"])
-        if "min_delta" in model_training and model_training["min_delta"] is not None:
-            model_training["min_delta"] = float(model_training["min_delta"])
-        if "monitor" in model_training and model_training["monitor"] is not None:
-            model_training["monitor"] = str(model_training["monitor"]).lower()
-        if "restore_best_weights" in model_training and model_training["restore_best_weights"] is not None:
-            model_training["restore_best_weights"] = bool(model_training["restore_best_weights"])
-        if "early_stopping" in model_training:
-            es = model_training["early_stopping"]
-            if isinstance(es, bool):
-                model_training["early_stopping"] = es
-            elif isinstance(es, str):
-                model_training["early_stopping"] = es.lower() in ("true", "1", "yes", "on")
-            elif isinstance(es, dict):
-                if "enabled" in es:
-                    model_training["early_stopping"] = bool(es["enabled"])
-                if "patience" in es:
-                    model_training["patience"] = int(es["patience"])
-                if "min_delta" in es:
-                    model_training["min_delta"] = float(es["min_delta"])
-                if "monitor" in es:
-                    model_training["monitor"] = str(es["monitor"]).lower()
-                if "restore_best_weights" in es:
-                    model_training["restore_best_weights"] = bool(es["restore_best_weights"])
+    model_evaluation = dict(global_evaluation)
+    if isinstance(single_m.get("evaluation"), dict):
+        model_evaluation.update(single_m["evaluation"])
+    for k in ("num_test_samples", "test_samples"):
+        if k in single_m:
+            if k == "test_samples":
+                model_evaluation["num_test_samples"] = single_m[k]
+            else:
+                model_evaluation[k] = single_m[k]
+    if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
+        model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
 
-        model_evaluation = dict(global_evaluation)
-        if isinstance(single_m.get("evaluation"), dict):
-            model_evaluation.update(single_m["evaluation"])
-        for k in ("num_test_samples", "test_samples"):
-            if k in single_m:
-                if k == "test_samples":
-                    model_evaluation["num_test_samples"] = single_m[k]
-                else:
-                    model_evaluation[k] = single_m[k]
-        if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
-            model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
-
-        resolved_models.append({
-            "name": name,
-            "type": m_type,
-            "model": model_dict,
-            "training": model_training,
-            "evaluation": model_evaluation,
-            "esp32": global_esp32,
-            "joulescope": global_joulescope,
-        })
-
+    resolved_models.append({
+        "name": name,
+        "type": m_type,
+        "model": model_dict,
+        "training": model_training,
+        "evaluation": model_evaluation,
+        "esp32": global_esp32,
+        "joulescope": global_joulescope,
+    })
     return resolved_models
-
-
-def export_model_entry_to_main(model_entry: Dict[str, Any], output_dir: str = "main"):
-    """
-    Schreibt die C/C++ Header- und Quelldateien für ein einzelnes trainiertes Modell nach output_dir.
-    """
-    export_c_files(
-        model_entry=model_entry,
-        output_dir=output_dir,
-    )
 
 
 def train_all_models(
@@ -1171,8 +1588,7 @@ def train_all_models(
     device: str = "cpu",
 ) -> List[Dict[str, Any]]:
     """
-    Trainiert alle in der Konfiguration definierten Modelle nacheinander
-    und erzeugt für jedes Modell die entsprechenden Parameter / FlatBuffer.
+    Trainiert ALLE in der Konfiguration definierten Modelle nacheinander (Batch-Training Phase 1).
     """
     if isinstance(config_or_path, dict):
         config = config_or_path
@@ -1181,12 +1597,12 @@ def train_all_models(
 
     model_configs = get_model_configs(config)
     total_models = len(model_configs)
-
-    print("\n" + "=" * 70)
-    print(f">>> PHASE 1: TRAINING ALLER MODELLE ({total_models} Modell{'e' if total_models > 1 else ''}) <<<")
-    print("=" * 70)
+    print(f"\n=================================================================")
+    print(f"=== BATCH-TRAINING: {total_models} Modell(e) werden trainiert ===")
+    print(f"=================================================================")
 
     trained_models = []
+
     for idx, m_cfg in enumerate(model_configs, start=1):
         if epochs is not None:
             m_cfg["training"]["epochs"] = epochs
@@ -1209,41 +1625,54 @@ def train_all_models(
         ep = m_cfg["training"].get("epochs", "?")
         bs = m_cfg["training"].get("batch_size", "?")
         lr = m_cfg["training"].get("learning_rate", "?")
-        es_info = f", ES: Ja (P={m_cfg['training'].get('patience', 3)})" if m_cfg['training'].get('early_stopping') else ""
-        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Epochen: {ep}, Batch: {bs}, LR: {lr}{es_info}] ---")
+        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Epochen: {ep}, Batch: {bs}, LR: {lr}] ---")
         model, test_dataset, test_acc, test_loss = train_model(m_cfg, device=device)
 
         samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 50))
-        subset_acc, subset_corr, subset_tot = evaluate_subset(model, test_dataset, num_samples=samples_cnt, device=device)
+        subset_acc, subset_correct, subset_total = evaluate_subset(
+            model=model,
+            test_dataset=test_dataset,
+            num_samples=samples_cnt,
+            device=device,
+        )
+        print(f"[Evaluation] Host-Genauigkeit auf ESP32-Testset ({subset_total} Samples): {subset_acc:.2f}% ({subset_correct}/{subset_total} korrekt).")
 
-        tflite_bytes = export_pytorch_to_tflite(model)
-        model_size = len(tflite_bytes)
+        tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" else b""
 
-        trained_models.append({
+        # Parameteranzahl & Modellgröße
+        total_params = sum(p.numel() for p in model.parameters())
+        model_size_bytes = (total_params * 4) if m_type == "snn" else len(tflite_bytes)
+
+        trained_entry = {
             "name": m_cfg["name"],
             "type": m_type,
+            "config": m_cfg,
             "model": model,
-            "tflite_bytes": tflite_bytes,
             "test_dataset": test_dataset,
             "test_acc": test_acc,
-            "subset_test_acc": subset_acc,
-            "subset_correct": subset_corr,
-            "subset_total": subset_tot,
             "test_loss": test_loss,
-            "config": m_cfg,
+            "subset_acc": subset_acc,
+            "subset_test_acc": subset_acc,
+            "subset_correct": subset_correct,
+            "subset_total": subset_total,
+            "tflite_bytes": tflite_bytes,
+            "model_size_bytes": model_size_bytes,
+            "total_params": total_params,
             "structure": model.get_structure_summary(),
-            "model_size_bytes": model_size,
-            "num_test_samples": samples_cnt,
-        })
+        }
+        trained_models.append(trained_entry)
 
-    print("\n" + "=" * 70)
-    print(f">>> PHASE 1 ABGESCHLOSSEN: {len(trained_models)} Modell{'e' if len(trained_models) > 1 else ''} erfolgreich trainiert! <<<")
-    print("=" * 70)
-    for m in trained_models:
-        print(f"  * {m['name']:<20} | Typ: {m['type'].upper():<4} | Test-Acc (10k): {m['test_acc']:.2f}% | Test-Acc (ESP32-Subset {m['num_test_samples']}): {m['subset_test_acc']:.2f}% ({m['subset_correct']}/{m['subset_total']}) | Größe: {m['model_size_bytes']:,} B")
-    print("=" * 70 + "\n")
-
+    print("\n=================================================================")
+    print(f"=== BATCH-TRAINING ABGESCHLOSSEN: {len(trained_models)} Modell(e) bereit ===")
+    print(f"=================================================================\n")
     return trained_models
+
+
+def export_model_entry_to_main(model_entry: Dict[str, Any], output_dir: str = "main"):
+    """
+    Exportiert ein einzelnes bereits trainiertes Modell nach 'main/model_data.h/cc'.
+    """
+    export_c_files(model_entry, output_dir=output_dir)
 
 
 def train_and_export(
@@ -1259,7 +1688,7 @@ def train_and_export(
     num_test_samples: int = None,
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], bytes]:
     """
-    Hauptfunktion für Einzelausführung: Lädt Konfiguration, trainiert alle Modelle und exportiert das erste Modell.
+    Trainiert alle Modelle und exportiert das erste Modell nach output_dir.
     """
     trained_models = train_all_models(
         config_or_path=config_path,
@@ -1275,7 +1704,7 @@ def train_and_export(
     if trained_models:
         export_model_entry_to_main(trained_models[0], output_dir=output_dir)
         return trained_models[0]["model"], trained_models[0]["tflite_bytes"]
-    raise RuntimeError("Keine Modelle zum Trainieren gefunden.")
+    return None, b""
 
 
 if __name__ == "__main__":
@@ -1283,8 +1712,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--config",
         type=str,
-        default=None,
-        help="Pfad zur Konfigurationsdatei (YAML oder JSON, Standard: config.yaml / config.json)",
+        default="config.yaml",
+        help="Pfad zur YAML- oder JSON-Konfigurationsdatei (Standard: 'config.yaml')",
     )
     parser.add_argument(
         "-e", "--epochs",
@@ -1307,43 +1736,44 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--early-stopping",
-        dest="early_stopping",
         action="store_true",
         default=None,
-        help="Aktiviert Early Stopping vorzeitigen Abbruch bei stagnierender Genauigkeit",
+        help="Aktiviert Early Stopping für das Training",
     )
     parser.add_argument(
         "--no-early-stopping",
-        dest="early_stopping",
         action="store_false",
-        help="Deaktiviert Early Stopping",
+        dest="early_stopping",
+        help="Deaktiviert Early Stopping für das Training",
     )
     parser.add_argument(
         "--patience",
         type=int,
         default=None,
-        help="Anzahl der Epochen ohne Verbesserung vor vorzeitigem Trainingsabbruch",
+        help="Anzahl an Epochen ohne Verbesserung vor vorzeitigem Abbruch",
     )
     parser.add_argument(
         "--min-delta",
         type=float,
         default=None,
-        help="Mindestverbesserung der Metrik für Early Stopping (z. B. 0.001)",
+        help="Mindestverbesserung der Metrik für Early Stopping",
     )
     parser.add_argument(
         "--monitor",
         type=str,
         default=None,
-        help="Zu überwachende Metrik für Early Stopping ('test_acc' oder 'test_loss')",
+        choices=["test_acc", "test_loss"],
+        help="Zu überwachende Metrik: 'test_acc' (Standard) oder 'test_loss'",
     )
     parser.add_argument(
         "-n", "--test-samples",
         type=int,
         default=None,
-        help="Überschreibt die Anzahl der Test-Samples für den ESP32",
+        dest="test_samples",
+        help="Überschreibt die Anzahl der zu exportierenden Test-Samples",
     )
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     train_and_export(
         config_path=args.config,
         epochs=args.epochs,

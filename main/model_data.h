@@ -18,12 +18,29 @@ extern "C" {
 #define ENCODING_POISSON   2
 #define ENCODING_PERIODIC  3
 
-#define SNN_MAX_LAYERS 8
+#define SNN_MAX_FC_LAYERS   8
+#define SNN_MAX_CONV_LAYERS 4
+
+typedef struct {
+    int in_channels;
+    int out_channels;
+    int kernel_size;
+    int stride;
+    int padding;
+    int pool_size;
+    int pool_stride;
+    int in_h, in_w;
+    int out_h, out_w;
+    int pool_out_h, pool_out_w;
+} snn_conv_layer_cfg_t;
 
 typedef struct {
     int input_size;
+    int num_conv_layers;
+    snn_conv_layer_cfg_t conv_layers[SNN_MAX_CONV_LAYERS];
+    int flat_size;
     int hidden_layers_count;
-    int layer_sizes[SNN_MAX_LAYERS + 1];
+    int fc_layer_sizes[SNN_MAX_FC_LAYERS + 1];
     int num_steps;
     float beta;
     float threshold;
@@ -39,10 +56,12 @@ extern const char* const g_model_name;
 extern const unsigned char g_model[];
 extern const int g_model_len;
 
-// SNN-Spezifisch (LIF Neuronen Parameter & Gewichte)
+// SNN-Spezifisch (LIF/IF Neuronen Parameter & Gewichte)
 extern const snn_config_t g_snn_config;
-extern const float* const g_snn_weights[];
-extern const float* const g_snn_biases[];
+extern const float* const g_snn_conv_weights[];
+extern const float* const g_snn_conv_biases[];
+extern const float* const g_snn_fc_weights[];
+extern const float* const g_snn_fc_biases[];
 
 #ifdef __cplusplus
 }

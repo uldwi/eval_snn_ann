@@ -57,12 +57,17 @@ joulescope:
 #
 # Unterstützte Modelltypen:
 #   - type: "ann" (Standard)
-#       Künstliches neuronales Netz / MLP, ausgeführt mit TensorFlow Lite Micro.
-#       Optionen: hidden_layers, activation ("relu", "none")
+#       Künstliches neuronales Netz (MLP oder CNN), ausgeführt mit TensorFlow Lite Micro.
+#       Optionen:
+#         - conv_layers: Liste von Faltungs- und Pooling-Schichten, z. B.:
+#             - out_channels: 8, kernel_size: 3, stride: 1, padding: 1, pool_size: 2
+#         - hidden_layers: Vollständig verbundene Schichten (z. B. [64])
+#         - activation: "relu", "none"
 #
 #   - type: "snn"
-#       Spiking Neural Network trainiert mit SpikingJelly.
+#       Spiking Neural Network (Fully-Connected oder Convolutional CSNN) trainiert mit SpikingJelly.
 #       Optionen:
+#         - conv_layers: Liste von Faltungs- und Pooling-Schichten (z. B. 8 Filter, 3x3, MaxPool 2x2)
 #         - neuron_type: "lif" (Leaky-Integrate-and-Fire, Standard) oder "if" (Integrate-and-Fire)
 #         - encoding_type: Eingangs-Encoding-Algorithmus:
 #             * "direct"   (Standard): Konstanter analoger Eingangsstrom über alle Zeitschritte
@@ -99,6 +104,20 @@ models:
     batch_size: 64
     learning_rate: 0.001
 
+  - name: "ANN_Conv8_64"
+    type: "ann"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    activation: "relu"
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.001
+
   - name: "SNN_LIF_64_Direct"
     type: "snn"
     neuron_type: "lif"
@@ -123,6 +142,24 @@ models:
     batch_size: 64
     learning_rate: 0.005
 
+  - name: "SNN_LIF_Conv8_TTFS"
+    type: "snn"
+    neuron_type: "lif"
+    encoding_type: "ttfs"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
+
   - name: "SNN_IF_64_TTFS"
     type: "snn"
     neuron_type: "if"
@@ -134,22 +171,19 @@ models:
     batch_size: 64
     learning_rate: 0.005
 
-  - name: "SNN_IF_64_Periodic"
+  - name: "SNN_IF_Conv8_TTFS"
     type: "snn"
     neuron_type: "if"
-    encoding_type: "periodic"
+    encoding_type: "ttfs"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
     hidden_layers: [64]
     num_steps: 10
     threshold: 1.0
     epochs: 5
     batch_size: 64
     learning_rate: 0.005
-
-# Hinweis: Ein einzelnes Modell 'model' wird für Rückwärtskompatibilität weiterhin unterstützt:
-# model:
-#   name: "ANN_Default"
-#   type: "ann"
-#   input_size: 784
-#   hidden_layers: [128, 64]
-#   activation: "relu"
-#   output_size: 10

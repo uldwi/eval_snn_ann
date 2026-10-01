@@ -289,7 +289,7 @@ def print_comparison_summary(all_results: list):
 
         esp32_acc_val = res.get("esp32_acc")
         if esp32_acc_val is None:
-            esp32_acc_val = res.get("subset_test_acc")
+            esp32_acc_val = res.get("subset_acc", res.get("subset_test_acc"))
 
         corr = res.get("esp32_correct", res.get("subset_correct"))
         tot = res.get("esp32_total", res.get("subset_total", res.get("num_test_samples")))
@@ -486,7 +486,7 @@ def main():
         help="Training ueberspringen und vorhandenes exportiertes Modell verwenden",
     )
     parser.add_argument(
-        "--epochs",
+        "-e", "--epochs",
         type=int,
         default=None,
         help="Anzahl der Trainingsepochen fuer PyTorch (ueberschreibt Konfigurationsdatei)",
@@ -719,7 +719,7 @@ def main():
             else:
                 metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples)
 
-            esp32_acc = model_entry.get("subset_test_acc")
+            esp32_acc = model_entry.get("subset_acc", model_entry.get("subset_test_acc"))
             esp32_corr = model_entry.get("subset_correct")
             esp32_tot = model_entry.get("subset_total", model_samples)
             if serial_metrics and "esp32_acc" in serial_metrics:
@@ -735,7 +735,8 @@ def main():
                 "type": model_entry.get("type", "ann"),
                 "structure": model_entry.get("structure", "-"),
                 "test_acc": model_entry.get("test_acc"),
-                "subset_test_acc": model_entry.get("subset_test_acc"),
+                "subset_acc": model_entry.get("subset_acc", model_entry.get("subset_test_acc")),
+                "subset_test_acc": model_entry.get("subset_test_acc", model_entry.get("subset_acc")),
                 "subset_correct": model_entry.get("subset_correct"),
                 "subset_total": model_entry.get("subset_total"),
                 "esp32_acc": esp32_acc,
