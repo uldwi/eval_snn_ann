@@ -42,6 +42,10 @@ from train_mnist import (
     export_model_entry_to_main,
     train_and_export,
 )
+from datasets_hub import (
+    list_available_datasets,
+    print_available_datasets_table,
+)
 
 
 def find_esp_idf_export() -> str:
@@ -473,11 +477,22 @@ def main():
 
     # Trainings-Optionen
     parser.add_argument(
+        "-D", "--dataset",
+        type=str,
+        default=None,
+        help="Waehlt den Datensatz (z.B. 'mnist', 'fashion_mnist', 'cifar10', 'speech_commands', 'har_time_series', 'eeg_data', 'ecg_data', 'synthetic_time_series')",
+    )
+    parser.add_argument(
+        "--list-datasets",
+        action="store_true",
+        help="Zeigt alle verfuegbaren Datensaetze und Domaenen in einer Tabelle an",
+    )
+    parser.add_argument(
         "--train",
         dest="train",
         action="store_true",
         default=True,
-        help="MNIST PyTorch-Modelle vor dem Flashen trainieren und exportieren (Standard: aktiviert)",
+        help="PyTorch-Modelle vor dem Flashen trainieren und exportieren (Standard: aktiviert)",
     )
     parser.add_argument(
         "--no-train",
@@ -604,8 +619,15 @@ def main():
 
     args = parser.parse_args()
 
+    if args.list_datasets:
+        print_available_datasets_table()
+        sys.exit(0)
+
     # Konfiguration laden
     config = load_config(args.config)
+    if args.dataset:
+        config["dataset"] = args.dataset
+
     num_test_samples = (
         args.test_samples
         if args.test_samples is not None
@@ -628,6 +650,7 @@ def main():
     if args.train:
         trained_models = train_all_models(
             config_or_path=config,
+            dataset=args.dataset,
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
@@ -643,6 +666,7 @@ def main():
         for m in model_configs:
             trained_models.append({
                 "name": m["name"],
+                "dataset": m.get("dataset", "mnist"),
                 "structure": f"Input {m['model']['input_size']} -> {m['model']['hidden_layers']} -> {m['model']['output_size']}",
                 "config": m,
                 "test_acc": None,

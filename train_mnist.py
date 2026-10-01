@@ -39,8 +39,16 @@ import tflite
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
+
+from datasets_hub import (
+    AVAILABLE_DATASETS,
+    DatasetInfo,
+    get_dataset,
+    list_available_datasets,
+    print_available_datasets_table,
+)
 
 try:
     import spikingjelly.activation_based as sj_activation
@@ -600,19 +608,14 @@ class ConfigurableSpikingJellySNN(nn.Module):
 # -------------------------------------------------------------
 # Training
 # -------------------------------------------------------------
-def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], datasets.MNIST, float, float]:
+def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], Dataset, float, float]:
     """
-    Trainiert das konfigurierte PyTorch-Netzwerk (ANN oder SNN mit SpikingJelly) auf dem MNIST-Datensatz.
+    Trainiert das konfigurierte PyTorch-Netzwerk (ANN oder SNN mit SpikingJelly) auf dem gewählten Datensatz.
     Gibt (model, test_dataset, test_acc, avg_loss) zurück.
     """
     model_cfg = config.get("model", {})
     train_cfg = config.get("training", {})
     model_type = str(model_cfg.get("type", config.get("type", "ann"))).lower()
-
-    input_size = model_cfg.get("input_size", 784)
-    conv_layers = model_cfg.get("conv_layers", [])
-    hidden_layers = model_cfg.get("hidden_layers", [64])
-    output_size = model_cfg.get("output_size", 10)
 
     epochs = train_cfg.get("epochs", 3)
     batch_size = train_cfg.get("batch_size", 64)
@@ -624,6 +627,27 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     if random_seed is not None:
         torch.manual_seed(random_seed)
         np.random.seed(random_seed)
+
+    # Datensatz laden
+    dataset_name = model_cfg.get("dataset", config.get("dataset", train_cfg.get("dataset", "mnist")))
+    if isinstance(dataset_name, dict):
+        dataset_name = dataset_name.get("name", "mnist")
+    dataset_name = str(dataset_name).strip().lower()
+
+    train_dataset, test_dataset, dataset_info = get_dataset(
+        name=dataset_name,
+        data_dir=data_dir,
+        seed=random_seed if random_seed is not None else 42,
+    )
+
+    in_channels = int(model_cfg.get("in_channels", dataset_info.in_channels))
+    in_height = int(model_cfg.get("in_height", dataset_info.in_height))
+    in_width = int(model_cfg.get("in_width", dataset_info.in_width))
+    input_size = int(model_cfg.get("input_size", dataset_info.input_size))
+    output_size = int(model_cfg.get("output_size", dataset_info.num_classes))
+
+    conv_layers = model_cfg.get("conv_layers", [])
+    hidden_layers = model_cfg.get("hidden_layers", [64])
 
     if model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
@@ -641,6 +665,9 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
             num_steps=num_steps,
             beta=beta,
             threshold=threshold,
+            in_channels=in_channels,
+            in_height=in_height,
+            in_width=in_width,
         ).to(device)
     else:
         activation = model_cfg.get("activation", "relu")
@@ -650,6 +677,9 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
             hidden_layers=hidden_layers,
             activation=activation,
             output_size=output_size,
+            in_channels=in_channels,
+            in_height=in_height,
+            in_width=in_width,
         ).to(device)
 
     # Early Stopping Konfiguration
@@ -669,6 +699,8 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
     print("\n" + "=" * 65)
     print(f">>> PyTorch Modell-Konfiguration: {config.get('name', 'Modell')} ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
+    print(f"  - Datensatz:           {dataset_info.name} ({dataset_info.domain})")
+    print(f"  - Eingabedimensionen:  {in_channels}x{in_height}x{in_width} ({input_size} Werte) -> {output_size} Klassen")
     print(f"  - Netzwerk-Aufbau:     {model.get_structure_summary()}")
     if getattr(model, "has_conv", False):
         print(f"  - Conv-Schichten:      {len(model.resolved_conv)}")
@@ -691,14 +723,6 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     else:
         print(f"  - Early Stopping:      Deaktiviert (Best-Weights: {restore_best_weights})")
     print("=" * 65 + "\n")
-
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.0,), (1.0,)),
-    ])
-
-    train_dataset = datasets.MNIST(root=data_dir, train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root=data_dir, train=False, download=True, transform=transform)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
@@ -801,7 +825,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
 def evaluate_subset(
     model: Union[ConfigurableANN, ConfigurableSpikingJellySNN],
-    test_dataset: datasets.MNIST,
+    test_dataset: Any,
     num_samples: int = 50,
     device: str = "cpu",
 ) -> Tuple[float, int, int]:
@@ -1372,16 +1396,24 @@ def export_c_files(
             f.write(f"    .encoding_type = {enc_code},\n")
             f.write("};\n")
 
+    dataset_name = config.get("dataset", config.get("training", {}).get("dataset", "mnist"))
+    if isinstance(dataset_name, dict):
+        dataset_name = dataset_name.get("name", "mnist")
+    dataset_name = str(dataset_name).strip().lower()
+
     # 3. mnist_test_data.h
     test_header_path = out_path / "mnist_test_data.h"
     with open(test_header_path, "w", encoding="utf-8") as f:
         f.write("#pragma once\n")
         f.write("#include <stdint.h>\n\n")
+        f.write(f"#define DATASET_NAME \"{dataset_name}\"\n")
+        f.write(f"#define DATASET_INPUT_SIZE {input_size}\n")
+        f.write(f"#define DATASET_NUM_CLASSES {output_size}\n\n")
         f.write(f"#define MNIST_TEST_SUBSET {num_test_samples}\n")
         f.write(f"#define MNIST_IMAGE_SIZE {input_size}\n")
         f.write(f"#define MNIST_NUM_OUTPUTS {output_size}\n\n")
 
-        labels = [test_dataset[i][1] for i in range(num_test_samples)]
+        labels = [int(test_dataset[i][1]) for i in range(num_test_samples)]
         f.write("static const uint8_t mnist_test_labels[MNIST_TEST_SUBSET] = {\n  ")
         f.write(", ".join(str(l) for l in labels))
         f.write("\n};\n\n")
@@ -1416,6 +1448,11 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     global_esp32 = dict(config.get("esp32", {}))
     global_joulescope = dict(config.get("joulescope", {}))
 
+    global_dataset = config.get("dataset", global_training.get("dataset", "mnist"))
+    if isinstance(global_dataset, dict):
+        global_dataset = global_dataset.get("name", "mnist")
+    global_dataset = str(global_dataset).strip().lower()
+
     if isinstance(models_list, list) and len(models_list) > 0:
         for idx, m in enumerate(models_list):
             if not isinstance(m, dict):
@@ -1430,12 +1467,25 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 prefix = "SNN" if m_type == "snn" else "ANN"
                 name = f"{prefix}_{conv_str}{layer_str}"
 
-            input_size = int(m.get("input_size", config.get("model", {}).get("input_size", 784)))
-            output_size = int(m.get("output_size", config.get("model", {}).get("output_size", 10)))
+            m_ds = m.get("dataset", global_dataset)
+            if isinstance(m_ds, dict):
+                m_ds = m_ds.get("name", global_dataset)
+            m_ds = str(m_ds).strip().lower()
+            ds_info = AVAILABLE_DATASETS.get(m_ds, AVAILABLE_DATASETS["mnist"])
+
+            input_size = int(m.get("input_size", config.get("model", {}).get("input_size", ds_info["input_size"])))
+            output_size = int(m.get("output_size", config.get("model", {}).get("output_size", ds_info["num_classes"])))
+            in_channels = int(m.get("in_channels", ds_info["in_channels"]))
+            in_height = int(m.get("in_height", ds_info["in_height"]))
+            in_width = int(m.get("in_width", ds_info["in_width"]))
 
             model_dict = {
                 "type": m_type,
+                "dataset": m_ds,
                 "input_size": input_size,
+                "in_channels": in_channels,
+                "in_height": in_height,
+                "in_width": in_width,
                 "conv_layers": conv_layers,
                 "hidden_layers": hidden_layers,
                 "output_size": output_size,
@@ -1451,6 +1501,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
 
             # Globale Trainingsparameter als Basis
             model_training = dict(global_training)
+            model_training["dataset"] = m_ds
             if isinstance(m.get("training"), dict):
                 nested_tr = dict(m["training"])
                 if "lr" in nested_tr and "learning_rate" not in nested_tr:
@@ -1489,6 +1540,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             resolved_models.append({
                 "name": name,
                 "type": m_type,
+                "dataset": m_ds,
                 "model": model_dict,
                 "training": model_training,
                 "evaluation": model_evaluation,
@@ -1508,12 +1560,25 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         prefix = "SNN" if m_type == "snn" else "ANN"
         name = f"{prefix}_{conv_str}{layer_str}"
 
-    input_size = int(single_m.get("input_size", 784))
-    output_size = int(single_m.get("output_size", 10))
+    single_ds = single_m.get("dataset", global_dataset)
+    if isinstance(single_ds, dict):
+        single_ds = single_ds.get("name", global_dataset)
+    single_ds = str(single_ds).strip().lower()
+    ds_info = AVAILABLE_DATASETS.get(single_ds, AVAILABLE_DATASETS["mnist"])
+
+    input_size = int(single_m.get("input_size", ds_info["input_size"]))
+    output_size = int(single_m.get("output_size", ds_info["num_classes"]))
+    in_channels = int(single_m.get("in_channels", ds_info["in_channels"]))
+    in_height = int(single_m.get("in_height", ds_info["in_height"]))
+    in_width = int(single_m.get("in_width", ds_info["in_width"]))
 
     model_dict = {
         "type": m_type,
+        "dataset": single_ds,
         "input_size": input_size,
+        "in_channels": in_channels,
+        "in_height": in_height,
+        "in_width": in_width,
         "conv_layers": conv_layers,
         "hidden_layers": hidden_layers,
         "output_size": output_size,
@@ -1528,6 +1593,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         model_dict["activation"] = str(single_m.get("activation", "relu"))
 
     model_training = dict(global_training)
+    model_training["dataset"] = single_ds
     if isinstance(single_m.get("training"), dict):
         nested_tr = dict(single_m["training"])
         if "lr" in nested_tr and "learning_rate" not in nested_tr:
@@ -1566,6 +1632,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     resolved_models.append({
         "name": name,
         "type": m_type,
+        "dataset": single_ds,
         "model": model_dict,
         "training": model_training,
         "evaluation": model_evaluation,
@@ -1577,6 +1644,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def train_all_models(
     config_or_path: Union[str, Path, Dict[str, Any]] = None,
+    dataset: str = None,
     epochs: int = None,
     batch_size: int = None,
     learning_rate: float = None,
@@ -1595,6 +1663,9 @@ def train_all_models(
     else:
         config = load_config(config_or_path)
 
+    if dataset is not None:
+        config["dataset"] = str(dataset).strip().lower()
+
     model_configs = get_model_configs(config)
     total_models = len(model_configs)
     print(f"\n=================================================================")
@@ -1604,6 +1675,9 @@ def train_all_models(
     trained_models = []
 
     for idx, m_cfg in enumerate(model_configs, start=1):
+        if dataset is not None:
+            m_cfg["dataset"] = str(dataset).strip().lower()
+            m_cfg["model"]["dataset"] = str(dataset).strip().lower()
         if epochs is not None:
             m_cfg["training"]["epochs"] = epochs
         if batch_size is not None:
@@ -1625,7 +1699,8 @@ def train_all_models(
         ep = m_cfg["training"].get("epochs", "?")
         bs = m_cfg["training"].get("batch_size", "?")
         lr = m_cfg["training"].get("learning_rate", "?")
-        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Epochen: {ep}, Batch: {bs}, LR: {lr}] ---")
+        ds = m_cfg.get("dataset", m_cfg["model"].get("dataset", "mnist"))
+        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Datensatz: {ds}, Epochen: {ep}, Batch: {bs}, LR: {lr}] ---")
         model, test_dataset, test_acc, test_loss = train_model(m_cfg, device=device)
 
         samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 50))
@@ -1646,6 +1721,7 @@ def train_all_models(
         trained_entry = {
             "name": m_cfg["name"],
             "type": m_type,
+            "dataset": ds,
             "config": m_cfg,
             "model": model,
             "test_dataset": test_dataset,
@@ -1677,6 +1753,7 @@ def export_model_entry_to_main(model_entry: Dict[str, Any], output_dir: str = "m
 
 def train_and_export(
     config_path: Union[str, Path] = None,
+    dataset: str = None,
     output_dir: str = "main",
     epochs: int = None,
     batch_size: int = None,
@@ -1692,6 +1769,7 @@ def train_and_export(
     """
     trained_models = train_all_models(
         config_or_path=config_path,
+        dataset=dataset,
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
@@ -1708,12 +1786,23 @@ def train_and_export(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MNIST ANN & SNN Training & TFLite Micro Export")
+    parser = argparse.ArgumentParser(description="Neuronale Netze (ANN & SNN) Training, Datensatzauswahl & TFLite/C-Export")
     parser.add_argument(
         "-c", "--config",
         type=str,
         default="config.yaml",
         help="Pfad zur YAML- oder JSON-Konfigurationsdatei (Standard: 'config.yaml')",
+    )
+    parser.add_argument(
+        "-d", "--dataset",
+        type=str,
+        default=None,
+        help="Wählt den Datensatz (z.B. 'mnist', 'fashion_mnist', 'cifar10', 'speech_commands', 'har_time_series', 'eeg_data', 'ecg_data', 'synthetic_time_series')",
+    )
+    parser.add_argument(
+        "--list-datasets",
+        action="store_true",
+        help="Zeigt alle verfügbaren Datensätze und Domänen in einer Tabelle an",
     )
     parser.add_argument(
         "-e", "--epochs",
@@ -1774,8 +1863,14 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if args.list_datasets:
+        print_available_datasets_table()
+        sys.exit(0)
+
     train_and_export(
         config_path=args.config,
+        dataset=args.dataset,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,

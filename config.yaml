@@ -3,9 +3,54 @@
 # =====================================================================
 
 # ---------------------------------------------------------------------
+# Datensatz-Auswahl (Domänenübergreifend)
+#
+# Verfügbare Datensätze aus unterschiedlichen Bereichen:
+#
+# 1. Computer Vision / Bildverarbeitung:
+#      - "mnist":
+#          Handgeschriebene Ziffern (0-9), 1x28x28 = 784 Features, 10 Klassen
+#      - "fashion_mnist":
+#          Kleidungsstücke (Zalando), 1x28x28 = 784 Features, 10 Klassen
+#      - "cifar10":
+#          10 Objektklassen (herunterskaliert auf 1x16x16 = 256 Features für MCU), 10 Klassen
+#
+# 2. Audio & Keyword Recognition (Sprachbefehlserkennung / KWS):
+#      - "speech_commands" (oder Alias "kws"):
+#          10 Schlüsselwörter ("yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go")
+#          Akkustisches Zeit-Frequenz-Spektrogramm: 1x16x16 = 256 Features, 10 Klassen
+#
+# 3. Sensordaten & Zeitreihen (Human Activity Recognition / Inertialsensoren):
+#      - "har_time_series" (oder Alias "uci_har"):
+#          6-Kanal IMU (3x Beschleunigung, 3x Gyroskop, je 20 Zeitschritte = 120 Features)
+#          6 Klassen: Gehen, Treppe auf, Treppe ab, Sitzen, Stehen, Liegen
+#      - "synthetic_time_series":
+#          Musterklassifikation von 1D-Zeitreihen (Sinus, Impuls, Trend, Chirp), 1x128 Features, 4 Klassen
+#
+# 4. Biomedizinische Signale / Gehirnwellen (EEG):
+#      - "eeg_data" (oder Alias "eeg_bands"):
+#          8-Kanal Elektroenzephalogramm (Delta, Theta, Alpha, Beta Bänder), 8x16 = 128 Features
+#          4 Klassen: Tiefschlaf (Delta), Schlaefrig (Theta), Entspannt (Alpha), Konzentriert (Beta)
+#      - "eeg_eye_state":
+#          Zustandserkennung Augen geöffnet vs. geschlossen, 1x64 Features, 2 Klassen
+#
+# 5. Biomedizinische Signale / Kardiologie (EKG / ECG):
+#      - "ecg_data" (oder Alias "ecg_heartbeat"):
+#          EKG-Herzschlag-Klassifikation nach MIT-BIH Arrhythmie Standard, 1x128 Features
+#          5 Klassen: Normal (N), Supraventrikulaer (S), Ventrikulaer (V), Fusion (F), Schrittmacher (Q)
+#
+# Hinweis: Der Datensatz kann global hier oder individuell pro Modell unter "models:" definiert werden.
+# ---------------------------------------------------------------------
+dataset:
+  name: "mnist"
+
+# ---------------------------------------------------------------------
 # Globale Standardeinstellungen für das Training
 # ---------------------------------------------------------------------
 training:
+  # Standard-Datensatz für alle Modelle (sofern nicht im Modell überschrieben)
+  dataset: "mnist"
+
   # Maximale Anzahl der Trainingsepochen (Standardwert)
   epochs: 5
 
@@ -25,7 +70,7 @@ training:
   monitor: "test_acc"     # Zu überwachende Metrik: "test_acc" (Standard) oder "test_loss"
   restore_best_weights: true # Stellt automatisch das beste Modell für Inferenz & Export wieder her
 
-  # Verzeichnis zum Speichern/Laden des MNIST-Datensatzes
+  # Verzeichnis zum Speichern/Laden von Datensätzen
   data_dir: "./data"
 
   # Random Seed für reproduzierbare Ergebnisse (z. B. 42 oder null für zufällig)
@@ -59,6 +104,7 @@ joulescope:
 #   - type: "ann" (Standard)
 #       Künstliches neuronales Netz (MLP oder CNN), ausgeführt mit TensorFlow Lite Micro.
 #       Optionen:
+#         - dataset: optionaler Datensatz pro Modell (z. B. "mnist", "speech_commands", "eeg_data", "har_time_series", "ecg_data")
 #         - conv_layers: Liste von Faltungs- und Pooling-Schichten, z. B.:
 #             - out_channels: 8, kernel_size: 3, stride: 1, padding: 1, pool_size: 2
 #         - hidden_layers: Vollständig verbundene Schichten (z. B. [64])
@@ -67,6 +113,7 @@ joulescope:
 #   - type: "snn"
 #       Spiking Neural Network (Fully-Connected oder Convolutional CSNN) trainiert mit SpikingJelly.
 #       Optionen:
+#         - dataset: optionaler Datensatz pro Modell
 #         - conv_layers: Liste von Faltungs- und Pooling-Schichten (z. B. 8 Filter, 3x3, MaxPool 2x2)
 #         - neuron_type: "lif" (Leaky-Integrate-and-Fire, Standard) oder "if" (Integrate-and-Fire)
 #         - encoding_type: Eingangs-Encoding-Algorithmus:
@@ -88,24 +135,14 @@ joulescope:
 #   - patience: Anzahl Epochen ohne Verbesserung vor Abbruch (z. B. 3)
 #   - min_delta: Mindestverbesserung (z. B. 0.001)
 #   - monitor: "test_acc" oder "test_loss"
-#
-# Ablauf:
-#  1. Zuerst werden ALLE hier definierten Modelle nacheinander trainiert.
-#  2. Anschließend wird jedes Modell nacheinander auf den ESP32 geflasht
-#     und mit dem Joulescope vermessen.
-#  3. Am Ende wird ein tabellarischer Gesamtvergleich aller Modelle ausgegeben.
 # ---------------------------------------------------------------------
 models:
-  - name: "ANN_64"
+  # ===================================================================
+  # 1. Computer Vision / Bildverarbeitung: MNIST
+  # ===================================================================
+  - name: "ANN_MNIST_Conv8_64"
     type: "ann"
-    hidden_layers: [64]
-    activation: "relu"
-    epochs: 5
-    batch_size: 64
-    learning_rate: 0.001
-
-  - name: "ANN_Conv8_64"
-    type: "ann"
+    dataset: "mnist"
     conv_layers:
       - out_channels: 8
         kernel_size: 3
@@ -118,32 +155,120 @@ models:
     batch_size: 64
     learning_rate: 0.001
 
-  - name: "SNN_LIF_64_Direct"
+  - name: "SNN_MNIST_LIF_Conv8_TTFS"
     type: "snn"
+    dataset: "mnist"
+    neuron_type: "lif"
+    encoding_type: "ttfs"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # 2. Computer Vision / Bildverarbeitung: Fashion-MNIST
+  # ===================================================================
+  - name: "ANN_FashionMNIST_Conv16_64"
+    type: "ann"
+    dataset: "fashion_mnist"
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_FashionMNIST_LIF_Conv8_Direct"
+    type: "snn"
+    dataset: "fashion_mnist"
     neuron_type: "lif"
     encoding_type: "direct"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
     hidden_layers: [64]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
-    epochs: 5
+    epochs: 6
     batch_size: 64
     learning_rate: 0.005
 
-  - name: "SNN_LIF_64_TTFS"
+  # ===================================================================
+  # 3. Computer Vision / Bildverarbeitung: CIFAR-10 (16x16)
+  # ===================================================================
+  - name: "ANN_CIFAR10_Conv16_64"
+    type: "ann"
+    dataset: "cifar10"
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    activation: "relu"
+    epochs: 8
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_CIFAR10_LIF_Conv16_Direct"
     type: "snn"
+    dataset: "cifar10"
     neuron_type: "lif"
-    encoding_type: "ttfs"
+    encoding_type: "direct"
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
     hidden_layers: [64]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
-    epochs: 5
+    epochs: 8
     batch_size: 64
     learning_rate: 0.005
 
-  - name: "SNN_LIF_Conv8_TTFS"
+  # ===================================================================
+  # 4. Audio & Keyword Recognition: Speech Commands (KWS)
+  # ===================================================================
+  - name: "ANN_KWS_Conv8_64"
+    type: "ann"
+    dataset: "speech_commands"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_KWS_LIF_Conv8_TTFS"
     type: "snn"
+    dataset: "speech_commands"
     neuron_type: "lif"
     encoding_type: "ttfs"
     conv_layers:
@@ -156,24 +281,82 @@ models:
     num_steps: 10
     beta: 0.9
     threshold: 1.0
-    epochs: 5
+    epochs: 6
     batch_size: 64
     learning_rate: 0.005
 
-  - name: "SNN_IF_64_TTFS"
+  # ===================================================================
+  # 5. Sensordaten & Zeitreihen: Human Activity Recognition (HAR)
+  # ===================================================================
+  - name: "ANN_HAR_64_32"
+    type: "ann"
+    dataset: "har_time_series"
+    hidden_layers: [64, 32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_HAR_LIF_64_32_Direct"
     type: "snn"
-    neuron_type: "if"
-    encoding_type: "ttfs"
-    hidden_layers: [64]
+    dataset: "har_time_series"
+    neuron_type: "lif"
+    encoding_type: "direct"
+    hidden_layers: [64, 32]
     num_steps: 10
+    beta: 0.9
     threshold: 1.0
-    epochs: 5
+    epochs: 6
     batch_size: 64
     learning_rate: 0.005
 
-  - name: "SNN_IF_Conv8_TTFS"
+  # ===================================================================
+  # 6. Sensordaten & Zeitreihen: Synthetische Zeitreihenmuster
+  # ===================================================================
+  - name: "ANN_TimeSeries_64_32"
+    type: "ann"
+    dataset: "synthetic_time_series"
+    hidden_layers: [64, 32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_TimeSeries_LIF_64_32_TTFS"
     type: "snn"
-    neuron_type: "if"
+    dataset: "synthetic_time_series"
+    neuron_type: "lif"
+    encoding_type: "ttfs"
+    hidden_layers: [64, 32]
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # 7. Biomedizinische Signale: EEG Gehirnwellen-Bänder
+  # ===================================================================
+  - name: "ANN_EEG_Conv8_32"
+    type: "ann"
+    dataset: "eeg_data"
+    conv_layers:
+      - out_channels: 8
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_EEG_LIF_Conv8_TTFS"
+    type: "snn"
+    dataset: "eeg_data"
+    neuron_type: "lif"
     encoding_type: "ttfs"
     conv_layers:
       - out_channels: 8
@@ -181,9 +364,60 @@ models:
         stride: 1
         padding: 1
         pool_size: 2
-    hidden_layers: [64]
+    hidden_layers: [32]
     num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # 8. Biomedizinische Signale: EEG Eye State (Augen Auf/Zu)
+  # ===================================================================
+  - name: "ANN_EEGEye_32"
+    type: "ann"
+    dataset: "eeg_eye_state"
+    hidden_layers: [32]
+    activation: "relu"
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_EEGEye_LIF_32_Direct"
+    type: "snn"
+    dataset: "eeg_eye_state"
+    neuron_type: "lif"
+    encoding_type: "direct"
+    hidden_layers: [32]
+    num_steps: 10
+    beta: 0.9
     threshold: 1.0
     epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # 9. Biomedizinische Signale: EKG Herzrhythmus (MIT-BIH Arrhythmie)
+  # ===================================================================
+  - name: "ANN_ECG_64_32"
+    type: "ann"
+    dataset: "ecg_data"
+    hidden_layers: [64, 32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.001
+
+  - name: "SNN_ECG_LIF_64_32_TTFS"
+    type: "snn"
+    dataset: "ecg_data"
+    neuron_type: "lif"
+    encoding_type: "ttfs"
+    hidden_layers: [64, 32]
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    epochs: 6
     batch_size: 64
     learning_rate: 0.005

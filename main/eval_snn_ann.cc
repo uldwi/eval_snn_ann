@@ -398,8 +398,11 @@ static int run_snn_inference(const float *img, uint32_t *out_spikes) {
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Initialisiere ESP32 MNIST Inferenz: %s (%s) ===",
-             g_model_name, (g_model_type == MODEL_TYPE_SNN) ? "SNN" : "ANN");
+#ifndef DATASET_NAME
+#define DATASET_NAME "mnist"
+#endif
+    ESP_LOGI(TAG, "=== Initialisiere ESP32 Inferenz: %s (%s, Datensatz: %s) ===",
+             g_model_name, (g_model_type == MODEL_TYPE_SNN) ? "SNN" : "ANN", DATASET_NAME);
 
     // 1. Trigger-GPIO konfigurieren
     gpio_config_t io_conf = {
