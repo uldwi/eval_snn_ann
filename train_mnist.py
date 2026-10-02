@@ -44,9 +44,11 @@ from torchvision import datasets, transforms
 
 from datasets_hub import (
     AVAILABLE_DATASETS,
+    DATASET_ALIASES,
     DatasetInfo,
     get_dataset,
     list_available_datasets,
+    normalize_dataset_name,
     print_available_datasets_table,
 )
 
@@ -632,7 +634,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     dataset_name = model_cfg.get("dataset", config.get("dataset", train_cfg.get("dataset", "mnist")))
     if isinstance(dataset_name, dict):
         dataset_name = dataset_name.get("name", "mnist")
-    dataset_name = str(dataset_name).strip().lower()
+    dataset_name = normalize_dataset_name(dataset_name)
 
     train_dataset, test_dataset, dataset_info = get_dataset(
         name=dataset_name,
@@ -640,11 +642,11 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         seed=random_seed if random_seed is not None else 42,
     )
 
-    in_channels = int(model_cfg.get("in_channels", dataset_info.in_channels))
-    in_height = int(model_cfg.get("in_height", dataset_info.in_height))
-    in_width = int(model_cfg.get("in_width", dataset_info.in_width))
-    input_size = int(model_cfg.get("input_size", dataset_info.input_size))
-    output_size = int(model_cfg.get("output_size", dataset_info.num_classes))
+    in_channels = int(dataset_info.in_channels)
+    in_height = int(dataset_info.in_height)
+    in_width = int(dataset_info.in_width)
+    input_size = int(dataset_info.input_size)
+    output_size = int(dataset_info.num_classes)
 
     conv_layers = model_cfg.get("conv_layers", [])
     hidden_layers = model_cfg.get("hidden_layers", [64])
@@ -1436,9 +1438,10 @@ def export_c_files(
     print(f"  - {test_header_path}\n")
 
 
-def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Extrahiert alle konfigurierten Modelle aus der Konfiguration.
+    Optional kann nach einem spezifischen Datensatz gefiltert werden.
     """
     models_list = config.get("models")
     resolved_models = []
@@ -1448,15 +1451,41 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     global_esp32 = dict(config.get("esp32", {}))
     global_joulescope = dict(config.get("joulescope", {}))
 
-    global_dataset = config.get("dataset", global_training.get("dataset", "mnist"))
+    target_ds_filter = normalize_dataset_name(dataset_filter) if dataset_filter else None
+
+    global_dataset = target_ds_filter or config.get("dataset", global_training.get("dataset", "mnist"))
     if isinstance(global_dataset, dict):
         global_dataset = global_dataset.get("name", "mnist")
-    global_dataset = str(global_dataset).strip().lower()
+    global_dataset = normalize_dataset_name(global_dataset)
 
     if isinstance(models_list, list) and len(models_list) > 0:
+        has_specific_matches = False
+        if target_ds_filter:
+            for m in models_list:
+                if isinstance(m, dict):
+                    m_d = m.get("dataset", "")
+                    if isinstance(m_d, dict):
+                        m_d = m_d.get("name", "")
+                    if normalize_dataset_name(m_d) == target_ds_filter:
+                        has_specific_matches = True
+                        break
+
         for idx, m in enumerate(models_list):
             if not isinstance(m, dict):
                 continue
+
+            m_ds = m.get("dataset", global_dataset)
+            if isinstance(m_ds, dict):
+                m_ds = m_ds.get("name", global_dataset)
+            m_ds = normalize_dataset_name(m_ds)
+
+            # Wenn nach einem Datensatz gefiltert wird und passende Modelle existieren, nur diese wählen
+            if target_ds_filter and has_specific_matches and m_ds != target_ds_filter:
+                continue
+
+            if target_ds_filter and not has_specific_matches:
+                m_ds = target_ds_filter
+
             m_type = str(m.get("type", "ann")).lower()
             conv_layers = parse_conv_layers(m.get("conv_layers", m.get("conv", [])))
             hidden_layers = parse_hidden_layers(m.get("hidden_layers", [64]))
@@ -1467,14 +1496,10 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 prefix = "SNN" if m_type == "snn" else "ANN"
                 name = f"{prefix}_{conv_str}{layer_str}"
 
-            m_ds = m.get("dataset", global_dataset)
-            if isinstance(m_ds, dict):
-                m_ds = m_ds.get("name", global_dataset)
-            m_ds = str(m_ds).strip().lower()
             ds_info = AVAILABLE_DATASETS.get(m_ds, AVAILABLE_DATASETS["mnist"])
 
-            input_size = int(m.get("input_size", config.get("model", {}).get("input_size", ds_info["input_size"])))
-            output_size = int(m.get("output_size", config.get("model", {}).get("output_size", ds_info["num_classes"])))
+            input_size = int(m.get("input_size", ds_info["input_size"]))
+            output_size = int(m.get("output_size", ds_info["num_classes"]))
             in_channels = int(m.get("in_channels", ds_info["in_channels"]))
             in_height = int(m.get("in_height", ds_info["in_height"]))
             in_width = int(m.get("in_width", ds_info["in_width"]))
@@ -1563,7 +1588,7 @@ def get_model_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     single_ds = single_m.get("dataset", global_dataset)
     if isinstance(single_ds, dict):
         single_ds = single_ds.get("name", global_dataset)
-    single_ds = str(single_ds).strip().lower()
+    single_ds = normalize_dataset_name(single_ds)
     ds_info = AVAILABLE_DATASETS.get(single_ds, AVAILABLE_DATASETS["mnist"])
 
     input_size = int(single_m.get("input_size", ds_info["input_size"]))
@@ -1663,10 +1688,11 @@ def train_all_models(
     else:
         config = load_config(config_or_path)
 
-    if dataset is not None:
-        config["dataset"] = str(dataset).strip().lower()
+    target_dataset = normalize_dataset_name(dataset) if dataset is not None else None
+    if target_dataset is not None:
+        config["dataset"] = target_dataset
 
-    model_configs = get_model_configs(config)
+    model_configs = get_model_configs(config, dataset_filter=target_dataset)
     total_models = len(model_configs)
     print(f"\n=================================================================")
     print(f"=== BATCH-TRAINING: {total_models} Modell(e) werden trainiert ===")
@@ -1675,9 +1701,15 @@ def train_all_models(
     trained_models = []
 
     for idx, m_cfg in enumerate(model_configs, start=1):
-        if dataset is not None:
-            m_cfg["dataset"] = str(dataset).strip().lower()
-            m_cfg["model"]["dataset"] = str(dataset).strip().lower()
+        if target_dataset is not None:
+            m_cfg["dataset"] = target_dataset
+            m_cfg["model"]["dataset"] = target_dataset
+            ds_info = AVAILABLE_DATASETS.get(target_dataset, AVAILABLE_DATASETS["mnist"])
+            m_cfg["model"]["input_size"] = ds_info["input_size"]
+            m_cfg["model"]["output_size"] = ds_info["num_classes"]
+            m_cfg["model"]["in_channels"] = ds_info["in_channels"]
+            m_cfg["model"]["in_height"] = ds_info["in_height"]
+            m_cfg["model"]["in_width"] = ds_info["in_width"]
         if epochs is not None:
             m_cfg["training"]["epochs"] = epochs
         if batch_size is not None:

@@ -82,6 +82,53 @@ class TestDatasetsHub(unittest.TestCase):
         self.assertEqual(x0.numel(), 128)
         self.assertTrue(0 <= int(y0) < 4)
 
+    def test_alias_normalization(self):
+        from datasets_hub import normalize_dataset_name
+        self.assertEqual(normalize_dataset_name("kws"), "speech_commands")
+        self.assertEqual(normalize_dataset_name("uci_har"), "har_time_series")
+        self.assertEqual(normalize_dataset_name("eeg_bands"), "eeg_data")
+        self.assertEqual(normalize_dataset_name("ecg_heartbeat"), "ecg_data")
+        self.assertEqual(normalize_dataset_name("mnist"), "mnist")
+
+    def test_config_models_dimensions_match_datasets(self):
+        import torch
+        from train_mnist import load_config, get_model_configs, ConfigurableANN, ConfigurableSpikingJellySNN
+        from datasets_hub import get_dataset, normalize_dataset_name
+
+        cfg = load_config("config.yaml")
+        all_models = get_model_configs(cfg)
+        self.assertEqual(len(all_models), 18)
+
+        for m_cfg in all_models:
+            ds_name = m_cfg["dataset"]
+            canon = normalize_dataset_name(ds_name)
+            train_ds, _, dinfo = get_dataset(canon)
+            batch_x = torch.stack([train_ds[i][0] for i in range(4)])
+            m_dict = m_cfg["model"]
+            if m_cfg["type"] == "snn":
+                net = ConfigurableSpikingJellySNN(
+                    input_size=dinfo.input_size,
+                    conv_layers=m_dict.get("conv_layers", []),
+                    hidden_layers=m_dict.get("hidden_layers", []),
+                    output_size=dinfo.num_classes,
+                    in_channels=dinfo.in_channels,
+                    in_height=dinfo.in_height,
+                    in_width=dinfo.in_width,
+                    num_steps=2,
+                )
+            else:
+                net = ConfigurableANN(
+                    input_size=dinfo.input_size,
+                    conv_layers=m_dict.get("conv_layers", []),
+                    hidden_layers=m_dict.get("hidden_layers", []),
+                    output_size=dinfo.num_classes,
+                    in_channels=dinfo.in_channels,
+                    in_height=dinfo.in_height,
+                    in_width=dinfo.in_width,
+                )
+            out = net(batch_x)
+            self.assertEqual(out.shape, (4, dinfo.num_classes))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -661,7 +661,7 @@ def main():
             num_test_samples=args.test_samples,
         )
     else:
-        model_configs = get_model_configs(config)
+        model_configs = get_model_configs(config, dataset_filter=args.dataset)
         trained_models = []
         for m in model_configs:
             trained_models.append({

@@ -194,6 +194,20 @@ AVAILABLE_DATASETS: Dict[str, Dict[str, Union[str, int, List[str]]]] = {
 }
 
 
+DATASET_ALIASES: Dict[str, str] = {
+    "kws": "speech_commands",
+    "uci_har": "har_time_series",
+    "eeg_bands": "eeg_data",
+    "ecg_heartbeat": "ecg_data",
+}
+
+
+def normalize_dataset_name(name: str) -> str:
+    """Normalisiert Alias-Namen auf den kanonischen Datensatznamen."""
+    key = str(name).strip().lower()
+    return DATASET_ALIASES.get(key, key)
+
+
 def list_available_datasets() -> List[DatasetInfo]:
     """Gibt eine Liste aller verfügbaren Datensätze und deren Metadaten zurück."""
     unique_names = ["mnist", "fashion_mnist", "cifar10", "speech_commands", "har_time_series", "synthetic_time_series", "eeg_data", "eeg_eye_state", "ecg_data"]
