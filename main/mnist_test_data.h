@@ -1,6 +1,10 @@
 #pragma once
 #include <stdint.h>
 
+#define DATASET_NAME "mnist"
+#define DATASET_INPUT_SIZE 784
+#define DATASET_NUM_CLASSES 10
+
 #define MNIST_TEST_SUBSET 50
 #define MNIST_IMAGE_SIZE 784
 #define MNIST_NUM_OUTPUTS 10

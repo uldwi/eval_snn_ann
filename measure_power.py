@@ -321,7 +321,13 @@ def print_comparison_summary(all_results: list):
     print("=" * 136 + "\n")
 
 
-def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_inferences: int = None) -> dict:
+def measure_triggered(
+    device,
+    pin: str = "in1",
+    timeout: float = 60.0,
+    num_inferences: int = None,
+    max_duration: float = None,
+) -> dict:
     """
     Misst den Energieverbrauch synchron zu einem digitalen Triggersignal an IN1 (oder IN0).
     Startet die Abtastung, wartet auf HIGH, erfasst Daten solange HIGH anliegt, und stoppt bei LOW.
@@ -329,9 +335,13 @@ def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_infer
     gpi_field = "gpi1" if pin.lower() in ("in1", "gpi1", "1") else "gpi0"
     channel_label = "IN1 (ESP32-C6 Pin 4)" if gpi_field == "gpi1" else "IN0"
 
-    # Puffergröße sicherstellen
+    # Berechne maximal zulässige Messdauer während HIGH aktiv ist (z. B. 600 s oder dynamisch nach Anzahl Samples)
+    if max_duration is None:
+        max_duration = max(600.0, (num_inferences or 50) * 15.0)
+
+    # Puffergröße sicherstellen (mindestens max_duration + Puffer)
     try:
-        device.parameter_set("buffer_duration", 60)
+        device.parameter_set("buffer_duration", min(600, int(max_duration) + 60))
     except Exception:
         pass
 
@@ -339,7 +349,9 @@ def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_infer
     print(f"Abtastrate Joulescope:   {sampling_freq / 1e6:.2f} MSPS")
     print(f"Warte auf Startsignal an {channel_label} (Pegel = HIGH)...")
     if timeout > 0:
-        print(f"Timeout:                 {timeout:.1f} Sekunden (Abbruch jederzeit mit Strg+C)")
+        print(f"Trigger-Timeout:         {timeout:.1f} Sekunden (Warten auf Start)")
+    if max_duration > 0:
+        print(f"Max. Messdauer:          {max_duration:.1f} Sekunden (Warten auf Inferenzende)")
 
     device.start()
 
@@ -347,14 +359,22 @@ def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_infer
     collected_voltage = []
     last_processed_id = None
     measuring = False
-    t_start = time.time()
+    t_wait_start = time.time()
+    t_measure_start = None
 
     try:
         while True:
-            if timeout > 0 and (time.time() - t_start) > timeout:
-                raise TimeoutError(
-                    f"Zeitueberschreitung: Kein Triggersignal an {channel_label} innerhalb von {timeout:.1f} s empfangen."
-                )
+            now = time.time()
+            if not measuring:
+                if timeout > 0 and (now - t_wait_start) > timeout:
+                    raise TimeoutError(
+                        f"Zeitueberschreitung: Kein Start-Triggersignal (HIGH) an {channel_label} innerhalb von {timeout:.1f} s empfangen."
+                    )
+            else:
+                if max_duration > 0 and (now - t_measure_start) > max_duration:
+                    raise TimeoutError(
+                        f"Zeitueberschreitung: Messung an {channel_label} dauerte laenger als {max_duration:.1f} s ohne Rueckkehr auf LOW."
+                    )
 
             time.sleep(0.01)  # 10 ms Polling-Intervall
             s1, s2 = device.stream_buffer.sample_id_range
@@ -392,6 +412,7 @@ def measure_triggered(device, pin: str = "in1", timeout: float = 60.0, num_infer
 
                 first_high = high_indices[0]
                 measuring = True
+                t_measure_start = time.time()
                 print(f"\n[Trigger] >>> Start-Signal erkannt ({channel_label} = HIGH)! Messung laeuft... <<<")
 
                 # Prüfen, ob Signal bereits im selben Chunk wieder auf LOW gefallen ist
@@ -738,10 +759,19 @@ def main():
                             break
 
             # 3. Joulescope-Messung durchführen
-            if args.duration is not None and args.duration > 0:
-                metrics = measure_duration(device, duration=args.duration, num_inferences=model_samples)
-            else:
-                metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples)
+            metrics = {}
+            try:
+                if args.duration is not None and args.duration > 0:
+                    metrics = measure_duration(device, duration=args.duration, num_inferences=model_samples)
+                else:
+                    metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples)
+            except TimeoutError as te:
+                print(f"\n[Messung fehlgeschlagen] {te}", file=sys.stderr)
+            except KeyboardInterrupt:
+                print("\nMessung durch Benutzer abgebrochen.", file=sys.stderr)
+                break
+            except Exception as e:
+                print(f"\n[Messung fehlgeschlagen] Unerwarteter Fehler bei Modell '{model_name}': {e}", file=sys.stderr)
 
             esp32_acc = model_entry.get("subset_acc", model_entry.get("subset_test_acc"))
             esp32_corr = model_entry.get("subset_correct")
