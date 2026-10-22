@@ -19,10 +19,13 @@ python3 -m pip install torch torchvision --index-url https://download.pytorch.or
 
 python3 -m pip install -r $HOME/code/eval_snn_ann/requirements.txt
 
+# Datenverzeichnis von $HOME nach $TMPDIR rsyncen.
+# WICHTIG: Vorher sollte auf dem Login-Node einmal
+#   sbatch dachs_setup.sh (oder manuell python run) ausgeführt werden,
+#   damit die Daten in $HOME/code/eval_snn_ann/data/ liegen.
 rsync -avz $HOME/code/eval_snn_ann/data/ $TMPDIR/data/
 
-# Training; Checkpoints werden ins persistente Home-Verzeichnis geschrieben
-# (nicht in $TMPDIR, das nach dem Slurm-Job gelöscht wird)
+# Training: Konfiguration nutzen, Evaluation überspringen (kein Joulescope/ESP32)
 python3 $HOME/code/eval_snn_ann/train_mnist.py \
     --config $HOME/code/eval_snn_ann/config.yaml \
     --save-dir $HOME/code/eval_snn_ann/saved_models \

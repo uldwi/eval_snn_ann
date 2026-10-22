@@ -5,39 +5,38 @@
 - DACHS Zugang (Login) über SSH
 - Registriert auf dem bwHPC Cluster
 
-## Aufbau / Setup
+## Aufbau / Setup (zwei Schritte)
 
-1. **Anmelden:**
+### Schritt 1: Daten herunterladen (Login-Node – **hat Internet**)
+
+Da `data/` im `.gitignore` ist, liegen die Datensätze **nicht** im Git-Repo. Auf den Compute-Nodes gibt es **kein Internet**, daher muss der Download **einmalig auf dem Login-Node** erfolgen.
 
 ```bash
 ssh <username>@login.dachs.bwhpc.de
+cd $HOME/code/eval_snn_ann
+./dachs_setup.sh
 ```
 
-2. **CUDA-Modul laden (für NVIDIA GPU Teil):**
+Das Skript `dachs_setup.sh`:
+- Erstellt eine `dachs_env` Python-Umgebung auf dem Login-Node
+- Installiert PyTorch (CUDA 12.4) + Dependencies
+- Lädt **alle** Datensätze (MNIST, Fashion-MNIST, CIFAR-10, Speech Commands, HAR, EEG, ECG, Synthetic) in `$HOME/code/eval_snn_ann/data/`
+- Nach Abschluss sind die Daten lokal persistenter Speicher verfügbar
 
-```bash
-module load devel/cuda/12.4
-```
-
-3. **Virtuelle Umgebung mit PyTorch (CUDA 12.4) erstellen:**
-
-```bash
-python3 -m venv dachs_env
-source dachs_env/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-python3 -m pip install -r /home/<username>/code/eval_snn_ann/requirements.txt
-```
-
-## GPU Trainingslauf einreichen
-
-Das bereitgestellte Skript `dachs_train.sh` nutzt die Konfigurationsdatei `config.yaml`:
+### Schritt 2: Training starten (Compute-Node – **kein Internet**)
 
 ```bash
 sbatch dachs_train.sh
 ```
 
-Alternativ manuell (Batch Job):
+Das Skript `dachs_train.sh`:
+- Erstellt auf dem Compute-Node (`$TMPDIR`) eine neue `dachs_env` Umgebung
+- Installiert PyTorch (CUDA 12.4) + Dependencies
+- Rsync't die **bereits heruntergeladenen** Daten aus `$HOME/code/eval_snn_ann/data/` nach `$TMPDIR/data/`
+- Startet das Training mit `--device cuda --skip-evaluation --force-train` und `config.yaml`
+- Checkpoints (`.pt`, `.json`) landen in `$HOME/code/eval_snn_ann/saved_models/`
+
+## Alternativ: Manuell (Batch Job)
 
 ```bash
 sbatch --job-name=dl_mnist_ann --partition=gpu1 --gres=gpu:1 \
@@ -57,20 +56,18 @@ sbatch --job-name=dl_mnist_ann --partition=gpu1 --gres=gpu:1 \
 | `--time` | `24:00:00` | Maximaler Walltime |
 | `--mail-user` | `hansert.jonas@gmail.com` | Benachrichtigung |
 
-## GPU Batch-Skript
-
-- `dachs_train.sh` – L40S GPU, PyTorch CUDA 12.4, `config.yaml`, `--device cuda`, `--skip-evaluation`
-
 ## Wichtige Hinweise
 
 - **Nicht vergessen:** `--gres=gpu:1` muss im Batch Job gesetzt sein, sonst wird kein
   GPU zugewiesen und Training läuft auf CPU.
 - Das CUDA Modul muss vor dem Start der Python-Prozesse geladen sein
   (`module load devel/cuda/12.4`).
-- Das Skript nutzt `$TMPDIR` als Scratch-Verzeichnis und führt nach dem Training
-  den Skript-Ende aus, um Ressourcen freizugeben.
-- Die Konfiguration wird aus `config.yaml` gelesen (`--config`). Keine CLI-Überschreibungen
-  nötig außer `--device cuda` und `--skip-evaluation`.
+- **Schritt 1 (`dachs_setup.sh`) ist Pflicht**, damit CIFAR-10 & Co. auf den Compute-Nodes
+  verfügbar sind. Ohne Internetzugang dort schlägt der Download fehl.
+- Das Skript nutzt `$TMPDIR` als Scratch-Verzeichnis. Nach Job-Ende wird es gelöscht –
+  nur `$HOME/code/eval_snn_ann/saved_models/` bleibt persistent.
+- `train_mnist.py` CLI: `--device cuda` (GPU), `--skip-evaluation` (kein ESP32/Joulescope),
+  `--config config.yaml` (alle Modell-Einstellungen aus YAML).
 
 ## GPU Trainingsaufruf (manuell)
 
