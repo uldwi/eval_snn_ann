@@ -21,10 +21,16 @@ python3 -m pip install -r $HOME/code/eval_snn_ann/requirements.txt
 
 rsync -avz $HOME/code/eval_snn_ann/data/ $TMPDIR/data/
 
+# Training; Checkpoints werden ins persistente Home-Verzeichnis geschrieben
+# (nicht in $TMPDIR, das nach dem Slurm-Job gelöscht wird)
 python3 $HOME/code/eval_snn_ann/train_mnist.py \
     --config $HOME/code/eval_snn_ann/config.yaml \
+    --save-dir $HOME/code/eval_snn_ann/saved_models \
     --device cuda \
     --skip-evaluation \
     --force-train
+
+# Exporte (model_data.h/cc) landen ebenfalls im Home-Verzeichnis
+mkdir -p $HOME/code/eval_snn_ann/main
 
 time deactivate
