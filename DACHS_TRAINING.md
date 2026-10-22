@@ -31,7 +31,7 @@ python3 -m pip install -r /home/<username>/code/eval_snn_ann/requirements.txt
 
 ## GPU Trainingslauf einreichen
 
-Das bereitgestellte Skript `dachs_train.sh`:
+Das bereitgestellte Skript `dachs_train.sh` nutzt die Konfigurationsdatei `config.yaml`:
 
 ```bash
 sbatch dachs_train.sh
@@ -42,7 +42,7 @@ Alternativ manuell (Batch Job):
 ```bash
 sbatch --job-name=dl_mnist_ann --partition=gpu1 --gres=gpu:1 \
        --ntasks-per-gpu=48 --time=24:00:00 \
-       --mail-type=all --mail-user=<email>@hs-esslingen.de \
+       --mail-type=all --mail-user=hansert.jonas@gmail.com \
        dachs_train.sh
 ```
 
@@ -55,27 +55,27 @@ sbatch --job-name=dl_mnist_ann --partition=gpu1 --gres=gpu:1 \
 | Partition | `gpu4` | AMD MI300A APU (ROCm) |
 | `--gres=gpu:1` | 1 GPU | Anzahl der GPUs |
 | `--time` | `24:00:00` | Maximaler Walltime |
-| `--mail-user` | `<email>@hs-esslingen.de` | Benachrichtigung |
+| `--mail-user` | `hansert.jonas@gmail.com` | Benachrichtigung |
 
 ## GPU Batch-Skript
 
-- `dachs_train.sh` – L40S GPU, PyTorch CUDA 12.4, MNIST, `--device cuda`
+- `dachs_train.sh` – L40S GPU, PyTorch CUDA 12.4, `config.yaml`, `--device cuda`, `--skip-evaluation`
 
 ## Wichtige Hinweise
 
-- **Nicht vergessen:** `--gres=gpu:1` muss im Batch Job gesetzt sein, sonst wird
-  kein GPU zugewiesen und Training läuft auf CPU.
+- **Nicht vergessen:** `--gres=gpu:1` muss im Batch Job gesetzt sein, sonst wird kein
+  GPU zugewiesen und Training läuft auf CPU.
 - Das CUDA Modul muss vor dem Start der Python-Prozesse geladen sein
   (`module load devel/cuda/12.4`).
 - Das Skript nutzt `$TMPDIR` als Scratch-Verzeichnis und führt nach dem Training
   den Skript-Ende aus, um Ressourcen freizugeben.
-- Für das Training mit SpikingJelly wird das Device mit `--device cuda` (oder `cpu`)
-  übergeben.
+- Die Konfiguration wird aus `config.yaml` gelesen (`--config`). Keine CLI-Überschreibungen
+  nötig außer `--device cuda` und `--skip-evaluation`.
 
 ## GPU Trainingsaufruf (manuell)
 
 ```bash
-python3 train_mnist.py --device cuda --dataset mnist --epochs 5 --batch-size 64 --force-train
+python3 train_mnist.py --config config.yaml --device cuda --skip-evaluation --force-train
 ```
 
 Für eine andere GPU-Partition (z. B. H100) im Skript ändern:
