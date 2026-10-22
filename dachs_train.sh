@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-gpu=48
 #SBATCH --time=24:00:00
 #SBATCH --mail-type=all
-#SBATCH --mail-user=hansert.jonas@gmail.com
+#SBATCH --mail-user=jonas@hs-esslingen.de
 
 module load devel/cuda/12.4
 
@@ -23,7 +23,10 @@ rsync -avz $HOME/code/eval_snn_ann/data/ $TMPDIR/data/
 
 python3 $HOME/code/eval_snn_ann/train_mnist.py \
     --device cuda \
-    --force-train \
-    -c $HOME/code/eval_snn_ann/config.yaml
+    --dataset mnist \
+    --epochs 5 \
+    --batch-size 64 \
+    --skip-evaluation \
+    --force-train
 
 time deactivate

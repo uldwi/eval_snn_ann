@@ -2620,6 +2620,7 @@ def train_all_models(
     num_clusters: int = None,
     fine_tune_epochs: int = None,
     device: str = "cpu",
+    skip_evaluation: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Trainiert ALLE in der Konfiguration definierten Modelle nacheinander (Batch-Training Phase 1)
@@ -2715,44 +2716,47 @@ def train_all_models(
             save_dir=m_save_dir,
         )
 
-        samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 500))
-        subset_acc, subset_correct, subset_total = evaluate_subset(
-            model=model,
-            test_dataset=test_dataset,
-            num_samples=samples_cnt,
-            device=device,
-        )
-        print(f"[Evaluation] Host-Genauigkeit auf ESP32-Testset ({subset_total} Samples): {subset_acc:.2f}% ({subset_correct}/{subset_total} korrekt).")
+        if not skip_evaluation:
+            samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 500))
+            subset_acc, subset_correct, subset_total = evaluate_subset(
+                model=model,
+                test_dataset=test_dataset,
+                num_samples=samples_cnt,
+                device=device,
+            )
+            print(f"[Evaluation] Host-Genauigkeit auf ESP32-Testset ({subset_total} Samples): {subset_acc:.2f}% ({subset_correct}/{subset_total} korrekt).")
 
-        tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" else b""
+            tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" else b""
 
-        # Parameteranzahl, Sparsity & Modellgröße
-        total_params = sum(p.numel() for p in model.parameters())
-        sparsity_info = compute_model_sparsity(model)
-        model_size_bytes = (total_params * 4) if m_type == "snn" else len(tflite_bytes)
+            # Parameteranzahl, Sparsity & Modellgröße
+            total_params = sum(p.numel() for p in model.parameters())
+            sparsity_info = compute_model_sparsity(model)
+            model_size_bytes = (total_params * 4) if m_type == "snn" else len(tflite_bytes)
 
-        num_steps = m_cfg["model"].get("num_steps") if m_type == "snn" else None
-        trained_entry = {
-            "name": f"{m_cfg['name']}{'_T' + str(num_steps) if num_steps is not None else ''}",
-            "type": m_type,
-            "dataset": ds,
-            "config": m_cfg,
-            "model": model,
-            "test_dataset": test_dataset,
-            "test_acc": test_acc,
-            "test_loss": test_loss,
-            "subset_acc": subset_acc,
-            "subset_test_acc": subset_acc,
-            "subset_correct": subset_correct,
-            "subset_total": subset_total,
-            "tflite_bytes": tflite_bytes,
-            "model_size_bytes": model_size_bytes,
-            "total_params": total_params,
-            "sparsity_pct": sparsity_info["sparsity_pct"],
-            "zero_weights": sparsity_info["zero_weights"],
-            "structure": model.get_structure_summary(),
-        }
-        trained_models.append(trained_entry)
+            num_steps = m_cfg["model"].get("num_steps") if m_type == "snn" else None
+            trained_entry = {
+                "name": f"{m_cfg['name']}{'_T' + str(num_steps) if num_steps is not None else ''}",
+                "type": m_type,
+                "dataset": ds,
+                "config": m_cfg,
+                "model": model,
+                "test_dataset": test_dataset,
+                "test_acc": test_acc,
+                "test_loss": test_loss,
+                "subset_acc": subset_acc,
+                "subset_test_acc": subset_acc,
+                "subset_correct": subset_correct,
+                "subset_total": subset_total,
+                "tflite_bytes": tflite_bytes,
+                "model_size_bytes": model_size_bytes,
+                "total_params": total_params,
+                "sparsity_pct": sparsity_info["sparsity_pct"],
+                "zero_weights": sparsity_info["zero_weights"],
+                "structure": model.get_structure_summary(),
+            }
+            trained_models.append(trained_entry)
+        else:
+            print("[Evaluation] Übersprungen (--skip-evaluation).\n")
 
     print("\n=================================================================")
     print(f"=== BATCH-TRAINING ABGESCHLOSSEN: {len(trained_models)} Modell(e) bereit ===")
@@ -2787,6 +2791,7 @@ def train_and_export(
     num_clusters: int = None,
     fine_tune_epochs: int = None,
     device: str = "cpu",
+    skip_evaluation: bool = False,
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], bytes]:
     """
     Trainiert alle Modelle und exportiert das erste Modell nach output_dir.
@@ -2810,6 +2815,7 @@ def train_and_export(
         num_clusters=num_clusters,
         fine_tune_epochs=fine_tune_epochs,
         device=device,
+        skip_evaluation=skip_evaluation,
     )
     if trained_models:
         export_model_entry_to_main(trained_models[0], output_dir=output_dir)
@@ -2949,6 +2955,12 @@ if __name__ == "__main__":
         default=None,
         help="Gerät für das Training ('cpu', 'cuda' oder 'mps', Standard: 'cpu'). Auf DACHS GPU-Cluster wird 'cuda' verwendet.",
     )
+    parser.add_argument(
+        "--skip-evaluation",
+        action="store_true",
+        default=False,
+        help="Host-Evaluation und TFLite-Export nach dem Training überspringen (z. B. ohne Joulescope/ESP32 auf DACHS).",
+    )
 
     args = parser.parse_args()
 
@@ -2975,4 +2987,5 @@ if __name__ == "__main__":
         num_clusters=args.num_clusters,
         fine_tune_epochs=args.fine_tune_epochs,
         device=args.device,
+        skip_evaluation=args.skip_evaluation,
     )
