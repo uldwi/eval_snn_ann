@@ -21,8 +21,11 @@ Unterstützte Funktionen:
 
 import os
 import sys
+import copy
 import argparse
 import json
+import time
+import hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Union, Optional
 
@@ -39,6 +42,7 @@ import tflite
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.prune as torch_prune
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
@@ -61,10 +65,33 @@ except ImportError:
 
 # Standardkonfiguration
 DEFAULT_CONFIG = {
+    "optimization": {
+        "pruning": {
+            "enabled": False,
+            "method": "l1_unstructured",
+            "amount": 0.3,
+            "threshold": 0.01,
+            "layers": ["conv", "fc"],
+            "fine_tune_epochs": 0,
+            "fine_tune_lr": 0.0001,
+        },
+        "quantization": {
+            "enabled": False,
+            "type": "int8",
+            "mode": "symmetric",
+            "per_channel": True,
+            "layers": ["conv", "fc"],
+        },
+        "clustering": {
+            "enabled": False,
+            "num_clusters": 16,
+        },
+    },
     "training": {
         "epochs": 5,
         "batch_size": 64,
         "learning_rate": 0.001,
+        # Optimierer: "adam", "sgd", "adamw", "adagrad", "rmsprop" (pro Modell konfigurierbar)
         "optimizer": "adam",
         "early_stopping": False,
         "patience": 3,
@@ -72,10 +99,12 @@ DEFAULT_CONFIG = {
         "monitor": "test_acc",
         "restore_best_weights": True,
         "data_dir": "./data",
+        "save_dir": "./saved_models",
+        "auto_save": True,
         "random_seed": 42,
     },
     "evaluation": {
-        "num_test_samples": 50,
+        "num_test_samples": 500,
     },
     "esp32": {
         "trigger_pin": 4,
@@ -92,6 +121,7 @@ DEFAULT_CONFIG = {
         "hidden_layers": [64],
         "activation": "relu",
         "output_size": 10,
+        "dropout_rate": 0.0,
     },
 }
 
@@ -303,6 +333,7 @@ class ConfigurableANN(nn.Module):
         in_channels: int = 1,
         in_height: int = 28,
         in_width: int = 28,
+        dropout_rate: float = 0.0,
     ):
         super().__init__()
         self.input_size = int(input_size)
@@ -352,6 +383,12 @@ class ConfigurableANN(nn.Module):
         for i in range(len(all_fc_sizes) - 1):
             self.fc_layers.append(nn.Linear(all_fc_sizes[i], all_fc_sizes[i + 1]))
 
+        self.dropout_rate = float(dropout_rate) if dropout_rate is not None else 0.0
+        if self.dropout_rate > 0:
+            self.dropouts = nn.ModuleList([nn.Dropout(self.dropout_rate) for _ in range(len(self.hidden_layers))])
+        else:
+            self.dropouts = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.has_conv:
             if x.dim() == 2:
@@ -375,6 +412,8 @@ class ConfigurableANN(nn.Module):
                     pass
                 else:
                     raise ValueError(f"Nicht unterstützte Aktivierungsfunktion: {self.activation_name}")
+                if self.dropouts is not None:
+                    out = self.dropouts[i](out)
         return out
 
     def get_structure_summary(self) -> str:
@@ -457,12 +496,14 @@ class ConfigurableSpikingJellySNN(nn.Module):
         output_size: int = 10,
         neuron_type: str = "lif",
         encoding_type: str = "direct",
+        execution_mode: str = "dense",
         num_steps: int = 10,
         beta: float = 0.9,
         threshold: float = 1.0,
         in_channels: int = 1,
         in_height: int = 28,
         in_width: int = 28,
+        dropout_rate: float = 0.0,
     ):
         super().__init__()
         self.input_size = int(input_size)
@@ -478,8 +519,18 @@ class ConfigurableSpikingJellySNN(nn.Module):
         self.encoding_type = str(encoding_type).lower().strip() if encoding_type else "direct"
         if self.encoding_type not in ("direct", "ttfs", "latency", "time_to_first_spike", "poisson", "rate", "rate_poisson", "periodic", "rate_periodic", "phase"):
             self.encoding_type = "direct"
+        self.execution_mode = str(execution_mode).lower().strip() if execution_mode else "dense"
+        if self.execution_mode in ("event", "event_based", "event_driven"):
+            self.execution_mode = "event_based"
+        else:
+            self.execution_mode = "dense"
         self.num_steps = int(num_steps)
         self.threshold = float(threshold)
+        self.dropout_rate = float(dropout_rate) if dropout_rate is not None else 0.0
+        if self.dropout_rate > 0:
+            self.dropouts = nn.ModuleList([nn.Dropout(self.dropout_rate) for _ in range(len(self.hidden_layers))])
+        else:
+            self.dropouts = None
 
         if self.neuron_type == "if":
             self.beta = 1.0
@@ -575,14 +626,79 @@ class ConfigurableSpikingJellySNN(nn.Module):
             x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
             cur = x_seq
 
-        for fc, lif in zip(self.fcs, self.lif_layers):
+        for i, (fc, lif) in enumerate(zip(self.fcs, self.lif_layers)):
             cur = fc(cur)
             cur = lif(cur)
+            if self.dropouts is not None:
+                cur = self.dropouts[i](cur)
 
         out_spikes = cur.sum(dim=0)
         if HAS_SPIKINGJELLY:
             functional.reset_net(self)
         return out_spikes
+
+    def simulate_event_based(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Simuliert die SNN-Inferenz ereignisgesteuert (Event-by-Event) Zeitschritt für Zeitschritt
+        und ermittelt Spike-Events, synaptische Operationen (SynOps) und Sparsity.
+        """
+        self.eval()
+        with torch.no_grad():
+            batch_size = x.size(0)
+            if self.has_conv:
+                if x.dim() == 2:
+                    x_4d = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
+                elif x.dim() == 3:
+                    x_4d = x.unsqueeze(1)
+                else:
+                    x_4d = x
+                x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
+            else:
+                x_flat = x.view(batch_size, -1)
+                x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+
+            total_spikes = 0
+            total_synops = 0
+            total_possible_ops = 0
+
+            # Forward über Schritte
+            if self.has_conv:
+                cur = x_seq
+                for conv, lif, pool in zip(self.conv_layers_list, self.conv_lif_list, self.conv_pool_list):
+                    in_spikes_count = (cur != 0).sum().item()
+                    k_size = conv.kernel_size[0] * conv.kernel_size[1]
+                    out_ch = conv.out_channels
+                    total_synops += int(in_spikes_count * k_size * out_ch)
+                    total_possible_ops += int(cur.numel() * k_size * out_ch)
+                    cur = conv(cur)
+                    cur = lif(cur)
+                    total_spikes += int((cur != 0).sum().item())
+                    cur = pool(cur)
+                cur = self.flatten(cur)
+            else:
+                cur = x_seq
+
+            for fc, lif in zip(self.fcs, self.lif_layers):
+                in_spikes_count = (cur != 0).sum().item()
+                out_dim = fc.out_features
+                total_synops += int(in_spikes_count * out_dim)
+                total_possible_ops += int(cur.numel() * out_dim)
+                cur = fc(cur)
+                cur = lif(cur)
+                total_spikes += int((cur != 0).sum().item())
+
+            out_spikes = cur.sum(dim=0)
+            if HAS_SPIKINGJELLY:
+                functional.reset_net(self)
+
+            op_sparsity = 100.0 * (1.0 - (total_synops / max(1, total_possible_ops)))
+            stats = {
+                "total_spikes": total_spikes,
+                "synops": total_synops,
+                "possible_ops": total_possible_ops,
+                "synops_sparsity_pct": op_sparsity,
+            }
+            return out_spikes, stats
 
     def get_structure_summary(self) -> str:
         parts = []
@@ -608,16 +724,704 @@ class ConfigurableSpikingJellySNN(nn.Module):
 
 
 # -------------------------------------------------------------
-# Training
+# Optimierungs-Konfiguration & Hilfsfunktionen
 # -------------------------------------------------------------
-def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], Dataset, float, float]:
+def get_model_optimization_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Trainiert das konfigurierte PyTorch-Netzwerk (ANN oder SNN mit SpikingJelly) auf dem gewählten Datensatz.
+    Extrahiert und normalisiert die Optimierungskonfiguration für ein Modell.
+    Kombiniert globale 'optimization'-Einstellungen mit modellindividuellen Einstellungen.
+    """
+    model_cfg = config.get("model", {})
+    global_opt = config.get("optimization", {})
+    if not isinstance(global_opt, dict):
+        global_opt = {}
+
+    model_opt = model_cfg.get("optimization", config.get("optimization", {}))
+    if not isinstance(model_opt, dict):
+        model_opt = {}
+
+    merged = {
+        "pruning": copy.deepcopy(global_opt.get("pruning", {})),
+        "quantization": copy.deepcopy(global_opt.get("quantization", {})),
+        "clustering": copy.deepcopy(global_opt.get("clustering", {})),
+    }
+
+    # Modell-spezifische Übersteuerungen
+    if "pruning" in model_opt:
+        if isinstance(model_opt["pruning"], dict):
+            merged["pruning"].update(model_opt["pruning"])
+        elif isinstance(model_opt["pruning"], (float, int)):
+            merged["pruning"]["enabled"] = True
+            merged["pruning"]["amount"] = float(model_opt["pruning"])
+        elif isinstance(model_opt["pruning"], bool):
+            merged["pruning"]["enabled"] = model_opt["pruning"]
+
+    if "quantization" in model_opt:
+        if isinstance(model_opt["quantization"], dict):
+            merged["quantization"].update(model_opt["quantization"])
+        elif isinstance(model_opt["quantization"], str):
+            merged["quantization"]["enabled"] = True
+            merged["quantization"]["type"] = model_opt["quantization"]
+        elif isinstance(model_opt["quantization"], bool):
+            merged["quantization"]["enabled"] = model_opt["quantization"]
+
+    if "clustering" in model_opt:
+        if isinstance(model_opt["clustering"], dict):
+            merged["clustering"].update(model_opt["clustering"])
+        elif isinstance(model_opt["clustering"], int):
+            merged["clustering"]["enabled"] = True
+            merged["clustering"]["num_clusters"] = model_opt["clustering"]
+        elif isinstance(model_opt["clustering"], bool):
+            merged["clustering"]["enabled"] = model_opt["clustering"]
+
+    return merged
+
+
+# -------------------------------------------------------------
+# Modell-Signatur & Instanziierung
+# -------------------------------------------------------------
+def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) -> Tuple[Dict[str, Any], str]:
+    """
+    Erstellt eine kanonische Signatur und einen SHA256-Hash aller Architektur-,
+    Datensatz-, Trainings- und Optimierungs-Hyperparameter eines Modells zur Erkennung von Änderungen.
+    """
+    model_cfg = config.get("model", {})
+    train_cfg = config.get("training", {})
+    model_type = str(model_cfg.get("type", config.get("type", "ann"))).lower()
+
+    dataset_name = model_cfg.get("dataset", config.get("dataset", train_cfg.get("dataset", "mnist")))
+    if isinstance(dataset_name, dict):
+        dataset_name = dataset_name.get("name", "mnist")
+    dataset_name = normalize_dataset_name(dataset_name)
+
+    conv_layers = model_cfg.get("conv_layers", [])
+    canonical_conv = []
+    for cl in conv_layers:
+        if isinstance(cl, dict):
+            canonical_conv.append({k: cl[k] for k in sorted(cl.keys())})
+        else:
+            canonical_conv.append(cl)
+
+    hidden_layers = [int(h) for h in model_cfg.get("hidden_layers", [64])]
+
+    es_cfg = train_cfg.get("early_stopping", False)
+    if isinstance(es_cfg, dict):
+        es_info = {
+            "enabled": bool(es_cfg.get("enabled", True)),
+            "patience": int(es_cfg.get("patience", train_cfg.get("patience", 3))),
+            "min_delta": float(es_cfg.get("min_delta", train_cfg.get("min_delta", 0.0))),
+            "monitor": str(es_cfg.get("monitor", train_cfg.get("monitor", "test_acc"))).lower(),
+            "restore_best_weights": bool(es_cfg.get("restore_best_weights", train_cfg.get("restore_best_weights", True))),
+        }
+    else:
+        es_info = {
+            "enabled": bool(es_cfg),
+            "patience": int(train_cfg.get("patience", 3)),
+            "min_delta": float(train_cfg.get("min_delta", 0.0)),
+            "monitor": str(train_cfg.get("monitor", "test_acc")).lower(),
+            "restore_best_weights": bool(train_cfg.get("restore_best_weights", True)),
+        }
+
+    opt_cfg = get_model_optimization_config(config)
+    prune_cfg = opt_cfg.get("pruning", {})
+    quant_cfg = opt_cfg.get("quantization", {})
+    clust_cfg = opt_cfg.get("clustering", {})
+
+    canonical_opt = {
+        "pruning": {
+            "enabled": bool(prune_cfg.get("enabled", False)),
+            "method": str(prune_cfg.get("method", "l1_unstructured")).lower(),
+            "amount": float(prune_cfg.get("amount", prune_cfg.get("sparsity", 0.0))),
+            "threshold": float(prune_cfg.get("threshold", 0.0)),
+            "layers": [str(l).lower() for l in prune_cfg.get("layers", ["conv", "fc"])],
+            "fine_tune_epochs": int(prune_cfg.get("fine_tune_epochs", 0)),
+            "fine_tune_lr": float(prune_cfg.get("fine_tune_lr", 0.0001)),
+        },
+        "quantization": {
+            "enabled": bool(quant_cfg.get("enabled", False)),
+            "type": str(quant_cfg.get("type", "int8")).lower(),
+            "mode": str(quant_cfg.get("mode", "symmetric")).lower(),
+            "per_channel": bool(quant_cfg.get("per_channel", True)),
+            "layers": [str(l).lower() for l in quant_cfg.get("layers", ["conv", "fc"])],
+        },
+        "clustering": {
+            "enabled": bool(clust_cfg.get("enabled", False)),
+            "num_clusters": int(clust_cfg.get("num_clusters", 16)),
+        },
+    }
+
+    signature = {
+        "name": str(config.get("name", model_cfg.get("name", "model"))),
+        "type": model_type,
+        "dataset": dataset_name,
+        "conv_layers": canonical_conv,
+        "hidden_layers": hidden_layers,
+        "optimization": canonical_opt,
+        "training": {
+            "epochs": int(train_cfg.get("epochs", 3)),
+            "batch_size": int(train_cfg.get("batch_size", 64)),
+            "learning_rate": float(train_cfg.get("learning_rate", 0.001)),
+            "optimizer": str(train_cfg.get("optimizer", "adam")).lower(),
+            "early_stopping": es_info,
+            "random_seed": train_cfg.get("random_seed", 42),
+        },
+    }
+
+    if dataset_info is not None:
+        signature["dataset_dims"] = {
+            "in_channels": int(dataset_info.in_channels),
+            "in_height": int(dataset_info.in_height),
+            "in_width": int(dataset_info.in_width),
+            "input_size": int(dataset_info.input_size),
+            "num_classes": int(dataset_info.num_classes),
+        }
+
+    if model_type == "snn":
+        neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
+        exec_mode = str(model_cfg.get("execution_mode", model_cfg.get("execution", "dense"))).lower()
+        if exec_mode in ("event", "event_based", "event_driven"):
+            exec_mode = "event_based"
+        else:
+            exec_mode = "dense"
+        signature["snn_params"] = {
+            "neuron_type": neuron_type,
+            "encoding_type": str(model_cfg.get("encoding_type", model_cfg.get("encoding", "direct"))).lower(),
+            "execution_mode": exec_mode,
+            "num_steps": int(model_cfg.get("num_steps", model_cfg.get("steps", 10))),
+            "beta": float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0,
+            "threshold": float(model_cfg.get("threshold", 1.0)),
+        }
+    else:
+        signature["ann_params"] = {
+            "activation": str(model_cfg.get("activation", "relu")).lower(),
+        }
+
+    signature["dropout_rate"] = float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.0)))
+
+    sig_json = json.dumps(signature, sort_keys=True)
+    sig_hash = hashlib.sha256(sig_json.encode("utf-8")).hexdigest()
+    return signature, sig_hash
+
+
+def transfer_ann_to_snn(
+    ann_model: ConfigurableANN,
+    snn_model: ConfigurableSpikingJellySNN,
+) -> bool:
+    """
+    Übertragt die Gewichte eines ANN auf ein SNN mit identischer Architektur.
+    Die Conv- und FC-Gewichte sowie Bias-Werte werden kopiert.
+    """
+    try:
+        # Conv Layers: ANN conv_modules[i][0] -> SNN conv_layers_list[i]
+        if ann_model.has_conv and snn_model.has_conv:
+            for i in range(len(ann_model.conv_modules)):
+                ann_conv = ann_model.conv_modules[i][0]
+                snn_conv = snn_model.conv_layers_list[i]
+                if ann_conv.weight.shape == snn_conv.weight.shape:
+                    snn_conv.weight.data.copy_(ann_conv.weight.data)
+                    if ann_conv.bias is not None and snn_conv.bias is not None:
+                        snn_conv.bias.data.copy_(ann_conv.bias.data)
+                else:
+                    print(f"[Transfer] Warnung: Conv-Layer {i} Form unvereinbar: ANN {ann_conv.weight.shape} vs SNN {snn_conv.weight.shape}")
+                    return False
+
+        # FC Layers: ANN fc_layers[i] -> SNN fcs[i]
+        for i in range(len(ann_model.fc_layers)):
+            ann_fc = ann_model.fc_layers[i]
+            snn_fc = snn_model.fcs[i]
+            if ann_fc.weight.shape == snn_fc.weight.shape:
+                snn_fc.weight.data.copy_(ann_fc.weight.data)
+                if ann_fc.bias is not None and snn_fc.bias is not None:
+                    snn_fc.bias.data.copy_(ann_fc.bias.data)
+            else:
+                print(f"[Transfer] Warnung: FC-Layer {i} Form unvereinbar: ANN {ann_fc.weight.shape} vs SNN {snn_fc.weight.shape}")
+                return False
+
+        print("[Transfer] Alle Gewichte erfolgreich von ANN auf SNN übertragen.")
+        return True
+    except Exception as e:
+        print(f"[Transfer] Fehler: {e}")
+        return False
+
+
+def build_model_from_config(
+    config: Dict[str, Any],
+    dataset_info: DatasetInfo,
+    device: str = "cpu",
+) -> Union[ConfigurableANN, ConfigurableSpikingJellySNN]:
+    """
+    Erzeugt ein ConfigurableANN- oder ConfigurableSpikingJellySNN-Modell anhand der Konfiguration.
+    """
+    model_cfg = config.get("model", {})
+    model_type = str(model_cfg.get("type", config.get("type", "ann"))).lower()
+
+    in_channels = int(dataset_info.in_channels)
+    in_height = int(dataset_info.in_height)
+    in_width = int(dataset_info.in_width)
+    input_size = int(dataset_info.input_size)
+    output_size = int(dataset_info.num_classes)
+
+    conv_layers = model_cfg.get("conv_layers", [])
+    hidden_layers = model_cfg.get("hidden_layers", [64])
+
+    if model_type == "snn":
+        neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
+        encoding_type = str(model_cfg.get("encoding_type", model_cfg.get("encoding", "direct"))).lower()
+        execution_mode = str(model_cfg.get("execution_mode", model_cfg.get("execution", "dense"))).lower()
+        num_steps = int(model_cfg.get("num_steps", model_cfg.get("steps", 10)))
+        beta = float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0
+        threshold = float(model_cfg.get("threshold", 1.0))
+        dropout_rate = float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.0)))
+        model = ConfigurableSpikingJellySNN(
+            input_size=input_size,
+            conv_layers=conv_layers,
+            hidden_layers=hidden_layers,
+            output_size=output_size,
+            neuron_type=neuron_type,
+            encoding_type=encoding_type,
+            execution_mode=execution_mode,
+            num_steps=num_steps,
+            beta=beta,
+            threshold=threshold,
+            in_channels=in_channels,
+            in_height=in_height,
+            in_width=in_width,
+            dropout_rate=dropout_rate,
+        ).to(device)
+    else:
+        activation = model_cfg.get("activation", "relu")
+        dropout_rate = float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.0)))
+        model = ConfigurableANN(
+            input_size=input_size,
+            conv_layers=conv_layers,
+            hidden_layers=hidden_layers,
+            activation=activation,
+            output_size=output_size,
+            in_channels=in_channels,
+            in_height=in_height,
+            in_width=in_width,
+            dropout_rate=dropout_rate,
+        ).to(device)
+
+    return model
+
+
+# -------------------------------------------------------------
+# Post-Training Optimierung (Pruning, Quantisierung, Clustering)
+# -------------------------------------------------------------
+def compute_model_sparsity(model: nn.Module) -> Dict[str, Any]:
+    """
+    Berechnet detaillierte Sparsity-Metriken (Nullstellen in Gewichten) für alle Schichten.
+    """
+    total_weights = 0
+    zero_weights = 0
+    layer_stats = []
+
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if hasattr(module, "weight") and module.weight is not None:
+                w = module.weight.data
+                cnt = w.numel()
+                zeros = int((w == 0).sum().item())
+                total_weights += cnt
+                zero_weights += zeros
+                layer_stats.append({
+                    "name": name or module.__class__.__name__,
+                    "shape": list(w.shape),
+                    "total": cnt,
+                    "zeros": zeros,
+                    "sparsity_pct": (zeros / cnt * 100.0) if cnt > 0 else 0.0,
+                })
+
+    sparsity_pct = (zero_weights / total_weights * 100.0) if total_weights > 0 else 0.0
+    return {
+        "total_weights": total_weights,
+        "zero_weights": zero_weights,
+        "non_zero_weights": total_weights - zero_weights,
+        "sparsity_pct": sparsity_pct,
+        "layer_stats": layer_stats,
+    }
+
+
+def evaluate_model(
+    model: nn.Module,
+    test_dataset: Dataset,
+    batch_size: int = 128,
+    device: str = "cpu",
+) -> Tuple[float, float]:
+    """
+    Evaluiert ein Modell auf dem gesamten Testdatensatz und gibt (test_acc, test_loss) zurück.
+    """
+    model.eval()
+    loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            if HAS_SPIKINGJELLY and getattr(model, "neuron_type", None) is not None:
+                functional.reset_net(model)
+            total_loss += criterion(output, target).item() * len(target)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += len(target)
+
+    avg_loss = total_loss / max(1, total)
+    acc = (100.0 * correct) / max(1, total)
+    return acc, avg_loss
+
+
+def apply_pruning(
+    model: nn.Module,
+    prune_cfg: Dict[str, Any],
+    train_dataset: Optional[Dataset] = None,
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    """
+    Wendet Post-Training Pruning (L1-/Magnitude-Unstructured, Structured, Random oder Threshold)
+    auf Schichten (Conv und/oder FC) eines Modells an.
+    """
+    enabled = bool(prune_cfg.get("enabled", True))
+    if not enabled:
+        return {"applied": False}
+
+    method = str(prune_cfg.get("method", "l1_unstructured")).lower().strip()
+    amount = float(prune_cfg.get("amount", prune_cfg.get("sparsity", 0.3)))
+    threshold = float(prune_cfg.get("threshold", 0.01))
+    layer_targets = prune_cfg.get("layers", ["conv", "fc"])
+    if isinstance(layer_targets, str):
+        layer_targets = [layer_targets.lower()]
+    else:
+        layer_targets = [str(l).lower() for l in layer_targets]
+
+    pruned_modules = []
+
+    for name, module in model.named_modules():
+        is_conv = isinstance(module, (nn.Conv2d, sj_layer.Conv2d if HAS_SPIKINGJELLY else nn.Conv2d))
+        is_linear = isinstance(module, (nn.Linear, sj_layer.Linear if HAS_SPIKINGJELLY else nn.Linear))
+
+        target_match = False
+        if ("all" in layer_targets) or ("conv" in layer_targets and is_conv) or ("fc" in layer_targets and is_linear) or ("linear" in layer_targets and is_linear):
+            target_match = True
+
+        if target_match and hasattr(module, "weight") and module.weight is not None:
+            mod_label = name or module.__class__.__name__
+            if method in ("l1_unstructured", "magnitude", "l1"):
+                torch_prune.l1_unstructured(module, name="weight", amount=amount)
+                torch_prune.remove(module, "weight")
+                pruned_modules.append(mod_label)
+            elif method in ("random", "random_unstructured"):
+                torch_prune.random_unstructured(module, name="weight", amount=amount)
+                torch_prune.remove(module, "weight")
+                pruned_modules.append(mod_label)
+            elif method in ("structured", "ln_structured"):
+                dim = 0 if is_linear or is_conv else 0
+                torch_prune.ln_structured(module, name="weight", amount=amount, n=1, dim=dim)
+                torch_prune.remove(module, "weight")
+                pruned_modules.append(mod_label)
+            elif method in ("threshold", "value_threshold"):
+                with torch.no_grad():
+                    mask = (module.weight.data.abs() >= threshold).float()
+                    module.weight.data.mul_(mask)
+                pruned_modules.append(mod_label)
+
+    fine_tune_epochs = int(prune_cfg.get("fine_tune_epochs", 0))
+    fine_tune_lr = float(prune_cfg.get("fine_tune_lr", 1e-4))
+
+    if fine_tune_epochs > 0 and train_dataset is not None:
+        zero_masks = {}
+        for _, module in model.named_modules():
+            if hasattr(module, "weight") and module.weight is not None:
+                zero_masks[module] = (module.weight.data != 0).float()
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=fine_tune_lr)
+        loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        model.train()
+        for ep in range(fine_tune_epochs):
+            for batch_x, batch_y in loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                optimizer.zero_grad()
+                out = model(batch_x)
+                if HAS_SPIKINGJELLY and getattr(model, "neuron_type", None) is not None:
+                    functional.reset_net(model)
+                loss = F.cross_entropy(out, batch_y)
+                loss.backward()
+                optimizer.step()
+                with torch.no_grad():
+                    for mod, mask in zero_masks.items():
+                        mod.weight.data.mul_(mask)
+
+    return {
+        "applied": True,
+        "method": method,
+        "amount": amount if method != "threshold" else threshold,
+        "pruned_modules": pruned_modules,
+        "fine_tune_epochs": fine_tune_epochs,
+    }
+
+
+def apply_quantization(
+    model: nn.Module,
+    quant_cfg: Dict[str, Any],
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    """
+    Wendet Post-Training Quantisierung (INT8, INT4, FP16) auf die Gewichte an.
+    """
+    enabled = bool(quant_cfg.get("enabled", True))
+    if not enabled:
+        return {"applied": False}
+
+    qtype = str(quant_cfg.get("type", "int8")).lower().strip()
+    mode = str(quant_cfg.get("mode", "symmetric")).lower().strip()
+    per_channel = bool(quant_cfg.get("per_channel", True))
+    layer_targets = quant_cfg.get("layers", ["conv", "fc"])
+    if isinstance(layer_targets, str):
+        layer_targets = [layer_targets.lower()]
+    else:
+        layer_targets = [str(l).lower() for l in layer_targets]
+
+    quantized_modules = []
+
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            is_conv = isinstance(module, (nn.Conv2d, sj_layer.Conv2d if HAS_SPIKINGJELLY else nn.Conv2d))
+            is_linear = isinstance(module, (nn.Linear, sj_layer.Linear if HAS_SPIKINGJELLY else nn.Linear))
+
+            target_match = False
+            if ("all" in layer_targets) or ("conv" in layer_targets and is_conv) or ("fc" in layer_targets and is_linear) or ("linear" in layer_targets and is_linear):
+                target_match = True
+
+            if target_match and hasattr(module, "weight") and module.weight is not None:
+                w = module.weight.data
+                mod_label = name or module.__class__.__name__
+
+                if qtype in ("int8", "qint8", "8bit", "dynamic"):
+                    q_min, q_max = -128, 127
+                    if per_channel and w.dim() >= 2:
+                        out_channels = w.shape[0]
+                        w_reshaped = w.view(out_channels, -1)
+                        if mode == "asymmetric":
+                            w_min = w_reshaped.min(dim=1, keepdim=True)[0]
+                            w_max = w_reshaped.max(dim=1, keepdim=True)[0]
+                            scale = torch.clamp((w_max - w_min) / 255.0, min=1e-8)
+                            zero_point = torch.round(-w_min / scale) - 128
+                            w_q = torch.clamp(torch.round(w_reshaped / scale) + zero_point, q_min, q_max)
+                            w_deq = (w_q - zero_point) * scale
+                        else:
+                            max_val = torch.clamp(w_reshaped.abs().max(dim=1, keepdim=True)[0], min=1e-8)
+                            scale = max_val / 127.0
+                            w_q = torch.clamp(torch.round(w_reshaped / scale), q_min, q_max)
+                            w_deq = w_q * scale
+                        module.weight.data.copy_(w_deq.view_as(w))
+                    else:
+                        if mode == "asymmetric":
+                            w_min = w.min()
+                            w_max = w.max()
+                            scale = torch.clamp((w_max - w_min) / 255.0, min=1e-8)
+                            zero_point = torch.round(-w_min / scale) - 128
+                            w_q = torch.clamp(torch.round(w / scale) + zero_point, q_min, q_max)
+                            w_deq = (w_q - zero_point) * scale
+                        else:
+                            max_val = torch.clamp(w.abs().max(), min=1e-8)
+                            scale = max_val / 127.0
+                            w_q = torch.clamp(torch.round(w / scale), q_min, q_max)
+                            w_deq = w_q * scale
+                        module.weight.data.copy_(w_deq)
+                    quantized_modules.append(mod_label)
+
+                elif qtype in ("int4", "qint4", "4bit"):
+                    q_min, q_max = -8, 7
+                    if per_channel and w.dim() >= 2:
+                        out_channels = w.shape[0]
+                        w_reshaped = w.view(out_channels, -1)
+                        max_val = torch.clamp(w_reshaped.abs().max(dim=1, keepdim=True)[0], min=1e-8)
+                        scale = max_val / 7.0
+                        w_q = torch.clamp(torch.round(w_reshaped / scale), q_min, q_max)
+                        w_deq = w_q * scale
+                        module.weight.data.copy_(w_deq.view_as(w))
+                    else:
+                        max_val = torch.clamp(w.abs().max(), min=1e-8)
+                        scale = max_val / 7.0
+                        w_q = torch.clamp(torch.round(w / scale), q_min, q_max)
+                        w_deq = w_q * scale
+                        module.weight.data.copy_(w_deq)
+                    quantized_modules.append(mod_label)
+
+                elif qtype in ("fp16", "float16", "half"):
+                    module.weight.data.copy_(w.half().float())
+                    quantized_modules.append(mod_label)
+
+    return {
+        "applied": True,
+        "type": qtype,
+        "mode": mode,
+        "per_channel": per_channel,
+        "quantized_modules": quantized_modules,
+    }
+
+
+def apply_weight_clustering(
+    model: nn.Module,
+    cluster_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Clustert Modellgewichte in k diskrete Centroids (Weight-Sharing / Codebook).
+    """
+    enabled = bool(cluster_cfg.get("enabled", True))
+    if not enabled:
+        return {"applied": False}
+
+    num_clusters = int(cluster_cfg.get("num_clusters", 16))
+    clustered_modules = []
+
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if hasattr(module, "weight") and module.weight is not None:
+                w = module.weight.data
+                w_np = w.cpu().numpy().flatten()
+                non_zeros = w_np[w_np != 0.0]
+                if len(non_zeros) > num_clusters:
+                    quantiles = np.linspace(0, 100, num_clusters)
+                    centroids = np.percentile(non_zeros, quantiles)
+                    diffs = np.abs(w_np[:, None] - centroids[None, :])
+                    nearest_idx = np.argmin(diffs, axis=1)
+                    clustered_np = centroids[nearest_idx]
+                    clustered_np[w_np == 0.0] = 0.0
+                    module.weight.data.copy_(torch.from_numpy(clustered_np.reshape(w.shape)).to(w.device, w.dtype))
+                    clustered_modules.append(name or module.__class__.__name__)
+
+    return {
+        "applied": True,
+        "num_clusters": num_clusters,
+        "clustered_modules": clustered_modules,
+    }
+
+
+def optimize_model(
+    model: Union[ConfigurableANN, ConfigurableSpikingJellySNN],
+    config: Dict[str, Any],
+    test_dataset: Optional[Dataset] = None,
+    train_dataset: Optional[Dataset] = None,
+    device: str = "cpu",
+) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], Dict[str, Any]]:
+    """
+    Führt konfigurierte Post-Training-Optimierungen (Pruning, Quantisierung, Weight Clustering)
+    auf einem trainierten ANN- oder SNN-Modell durch und misst die resultierende Sparsity & Genauigkeit.
+    """
+    opt_cfg = get_model_optimization_config(config)
+    prune_cfg = opt_cfg.get("pruning", {})
+    quant_cfg = opt_cfg.get("quantization", {})
+    clust_cfg = opt_cfg.get("clustering", {})
+
+    prune_enabled = bool(prune_cfg.get("enabled", False))
+    quant_enabled = bool(quant_cfg.get("enabled", False))
+    clust_enabled = bool(clust_cfg.get("enabled", False))
+
+    if not (prune_enabled or quant_enabled or clust_enabled):
+        return model, {"applied": False}
+
+    model_name = str(config.get("name", config.get("model", {}).get("name", "Modell")))
+    model_type = str(config.get("type", config.get("model", {}).get("type", "ann"))).upper()
+
+    pre_acc, pre_loss = (0.0, 0.0)
+    if test_dataset is not None:
+        pre_acc, pre_loss = evaluate_model(model, test_dataset, device=device)
+
+    pre_sparsity = compute_model_sparsity(model)
+
+    prune_res = {}
+    if prune_enabled:
+        prune_res = apply_pruning(model, prune_cfg, train_dataset=train_dataset, device=device)
+
+    clust_res = {}
+    if clust_enabled:
+        clust_res = apply_weight_clustering(model, clust_cfg)
+
+    quant_res = {}
+    if quant_enabled:
+        quant_res = apply_quantization(model, quant_cfg, device=device)
+
+    post_sparsity = compute_model_sparsity(model)
+
+    post_acc, post_loss = (pre_acc, pre_loss)
+    if test_dataset is not None:
+        post_acc, post_loss = evaluate_model(model, test_dataset, device=device)
+
+    acc_diff = post_acc - pre_acc
+
+    # Schätzung des Kompressionsfaktors
+    bits_per_param = 32.0
+    if quant_enabled:
+        qtype = str(quant_cfg.get("type", "int8")).lower()
+        if "int4" in qtype or "4bit" in qtype:
+            bits_per_param = 4.0
+        elif "int8" in qtype or "8bit" in qtype:
+            bits_per_param = 8.0
+        elif "fp16" in qtype or "half" in qtype:
+            bits_per_param = 16.0
+    elif clust_enabled:
+        bits_per_param = max(4.0, float(np.log2(max(2, int(clust_cfg.get("num_clusters", 16))))))
+
+    compression_ratio = 32.0 / bits_per_param
+
+    print("\n" + "=" * 65)
+    print(f">>> [Post-Training Optimierung] Modell: '{model_name}' ({model_type}) <<<")
+    print(f"  - Vor Optimierung:     Genauigkeit: {pre_acc:.2f}%, Verlust: {pre_loss:.4f}")
+    if prune_enabled:
+        print(f"  - Pruning:             {prune_res.get('method', 'l1')} (Ziel: {prune_res.get('amount')}) -> {len(prune_res.get('pruned_modules', []))} Schichten")
+    if clust_enabled:
+        print(f"  - Weight Clustering:   {clust_res.get('num_clusters')} Centroids -> {len(clust_res.get('clustered_modules', []))} Schichten")
+    if quant_enabled:
+        print(f"  - Quantisierung:       {quant_res.get('type', 'int8').upper()} ({quant_res.get('mode', 'symmetric')}) -> {len(quant_res.get('quantized_modules', []))} Schichten")
+    print(f"  - Nach Optimierung:    Genauigkeit: {post_acc:.2f}% (Delta: {acc_diff:+.2f}%), Verlust: {post_loss:.4f}")
+    print(f"  - Modell-Sparsity:     {post_sparsity['sparsity_pct']:.2f}% Nullen ({post_sparsity['zero_weights']:,} von {post_sparsity['total_weights']:,} Gewichten)")
+    print(f"  - Geschätzte Kompr.:   ca. {compression_ratio:.1f}x Speicherreduktion")
+    print("=" * 65 + "\n")
+
+    summary = {
+        "applied": True,
+        "pre_acc": pre_acc,
+        "pre_loss": pre_loss,
+        "post_acc": post_acc,
+        "post_loss": post_loss,
+        "acc_diff": acc_diff,
+        "pre_sparsity": pre_sparsity,
+        "post_sparsity": post_sparsity,
+        "compression_ratio": compression_ratio,
+        "pruning": prune_res,
+        "quantization": quant_res,
+        "clustering": clust_res,
+    }
+    return model, summary
+
+
+# -------------------------------------------------------------
+# Training & Caching
+# -------------------------------------------------------------
+def train_model(
+    config: Dict[str, Any],
+    device: str = "cpu",
+    force_retrain: bool = False,
+    save_dir: Optional[str] = None,
+) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], Dataset, float, float]:
+    """
+    Trainiert das konfigurierte PyTorch-Netzwerk (ANN oder SNN mit SpikingJelly) auf dem gewählten Datensatz
+    oder lädt ein bereits trainiertes Modell aus dem Cache, wenn die Konfiguration unverändert ist.
     Gibt (model, test_dataset, test_acc, avg_loss) zurück.
     """
     model_cfg = config.get("model", {})
     train_cfg = config.get("training", {})
     model_type = str(model_cfg.get("type", config.get("type", "ann"))).lower()
+    model_name = str(config.get("name", model_cfg.get("name", "Modell")))
+
+    resolved_save_dir = save_dir or train_cfg.get("save_dir", config.get("save_dir", "./saved_models"))
+    auto_save = bool(train_cfg.get("auto_save", config.get("auto_save", True)))
+    should_force = force_retrain or bool(train_cfg.get("force_retrain", False))
 
     epochs = train_cfg.get("epochs", 3)
     batch_size = train_cfg.get("batch_size", 64)
@@ -642,47 +1446,85 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         seed=random_seed if random_seed is not None else 42,
     )
 
+    signature, sig_hash = compute_model_signature(config, dataset_info)
+    model = build_model_from_config(config, dataset_info, device=device)
+
+    # Transfer Learning: ANN -> SNN (wenn SNN konfiguriert und ANN-Checkpoint existiert)
+    if model_type == "snn":
+        ann_model_name = model_cfg.get("ann_checkpoint", f"ANN_{dataset_name.capitalize()}_Conv32_64_128")
+        ann_checkpoint_path = os.path.join(resolved_save_dir, f"{ann_model_name}.pt")
+        if os.path.isfile(ann_checkpoint_path):
+            try:
+                ann_checkpoint = torch.load(ann_checkpoint_path, map_location=device, weights_only=False)
+                conv_layers = model_cfg.get("conv_layers", [])
+                hidden_layers = model_cfg.get("hidden_layers", [64])
+                ann_model = ConfigurableANN(
+                    input_size=input_size,
+                    conv_layers=conv_layers,
+                    hidden_layers=hidden_layers,
+                    activation="relu",
+                    output_size=output_size,
+                    in_channels=in_channels,
+                    in_height=in_height,
+                    in_width=in_width,
+                    dropout_rate=0.0,
+                ).to(device)
+                ann_model.load_state_dict(ann_checkpoint["state_dict"])
+                ann_model.eval()
+                if transfer_ann_to_snn(ann_model, model):
+                    print(f"[Transfer] SNN '{model_name}' initialisiert mit ANN-Gewichten von '{ann_model_name}'\n")
+                else:
+                    print("[Transfer] Transfer fehlgeschlagen - SNN wird zufällig initialisiert.\n")
+            except Exception as e:
+                print(f"[Transfer] Fehler beim Laden des ANN-Checkpoints: {e}\n")
+        else:
+            print(f"[Transfer] Kein ANN-Checkpoint '{ann_checkpoint_path}' gefunden - SNN wird zufällig initialisiert.\n")
+
     in_channels = int(dataset_info.in_channels)
     in_height = int(dataset_info.in_height)
     in_width = int(dataset_info.in_width)
     input_size = int(dataset_info.input_size)
     output_size = int(dataset_info.num_classes)
 
-    conv_layers = model_cfg.get("conv_layers", [])
-    hidden_layers = model_cfg.get("hidden_layers", [64])
+    safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in model_name)
+    checkpoint_path = os.path.join(resolved_save_dir, f"{safe_name}.pt")
+    meta_path = os.path.join(resolved_save_dir, f"{safe_name}.json")
 
-    if model_type == "snn":
-        neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
-        encoding_type = str(model_cfg.get("encoding_type", model_cfg.get("encoding", "direct"))).lower()
-        num_steps = int(model_cfg.get("num_steps", model_cfg.get("steps", 10)))
-        beta = float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0
-        threshold = float(model_cfg.get("threshold", 1.0))
-        model = ConfigurableSpikingJellySNN(
-            input_size=input_size,
-            conv_layers=conv_layers,
-            hidden_layers=hidden_layers,
-            output_size=output_size,
-            neuron_type=neuron_type,
-            encoding_type=encoding_type,
-            num_steps=num_steps,
-            beta=beta,
-            threshold=threshold,
-            in_channels=in_channels,
-            in_height=in_height,
-            in_width=in_width,
-        ).to(device)
-    else:
-        activation = model_cfg.get("activation", "relu")
-        model = ConfigurableANN(
-            input_size=input_size,
-            conv_layers=conv_layers,
-            hidden_layers=hidden_layers,
-            activation=activation,
-            output_size=output_size,
-            in_channels=in_channels,
-            in_height=in_height,
-            in_width=in_width,
-        ).to(device)
+    # ---------------------------------------------------------
+    # Cache-Prüfung: Bereits trainiertes Modell laden?
+    # ---------------------------------------------------------
+    if not should_force and auto_save and os.path.isfile(checkpoint_path):
+        try:
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+
+            cached_hash = checkpoint.get("config_hash")
+            if cached_hash == sig_hash and "state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["state_dict"])
+                test_acc = float(checkpoint.get("test_acc", 0.0))
+                test_loss = float(checkpoint.get("test_loss", 0.0))
+                best_epoch = checkpoint.get("best_epoch", "N/A")
+
+                print("\n" + "=" * 65)
+                print(f">>> [Cache] Verwende gespeichertes Modell: '{model_name}' ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
+                print(f"  - Checkpoint-Datei:    {checkpoint_path}")
+                print(f"  - Datensatz:           {dataset_info.name} ({dataset_info.domain})")
+                print(f"  - Netzwerk-Aufbau:     {model.get_structure_summary()}")
+                print(f"  - Konfigurations-Hash: {sig_hash[:12]} (unverändert)")
+                print(f"  - Gespeicherte Acc:    {test_acc:.2f}% (aus Epoche {best_epoch})")
+                print(f"  - Gespeicherter Loss:  {test_loss:.4f}")
+                print(f"  -> Kein erneutes Training nötig (Cache-Hit).\n")
+                return model, test_dataset, test_acc, test_loss
+            else:
+                old_h = str(cached_hash)[:12] if cached_hash else "None"
+                print(f"\n[Cache] Gespeichertes Modell '{model_name}' gefunden, aber Konfiguration/Hyperparameter geändert:")
+                print(f"        Alter Hash: {old_h} -> Neuer Hash: {sig_hash[:12]}")
+                print(f"        -> Modell wird neu trainiert.")
+        except Exception as e:
+            print(f"\n[Cache] Hinweis: Gespeichertes Modell '{checkpoint_path}' konnte nicht geladen werden ({e}).")
+            print(f"        -> Modell wird neu trainiert.")
 
     # Early Stopping Konfiguration
     es_cfg = train_cfg.get("early_stopping", False)
@@ -700,7 +1542,7 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         restore_best_weights = bool(train_cfg.get("restore_best_weights", True))
 
     print("\n" + "=" * 65)
-    print(f">>> PyTorch Modell-Konfiguration: {config.get('name', 'Modell')} ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
+    print(f">>> PyTorch Modell-Konfiguration: {model_name} ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
     print(f"  - Datensatz:           {dataset_info.name} ({dataset_info.domain})")
     print(f"  - Eingabedimensionen:  {in_channels}x{in_height}x{in_width} ({input_size} Werte) -> {output_size} Klassen")
     print(f"  - Netzwerk-Aufbau:     {model.get_structure_summary()}")
@@ -730,15 +1572,26 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
     criterion = nn.CrossEntropyLoss()
+    optimizer_name = optimizer_name.lower()
+    print(f"  - Optimierer:          {optimizer_name.upper()}")
     if optimizer_name == "sgd":
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    elif optimizer_name == "adagrad":
+        optimizer = torch.optim.Adagrad(model.parameters(), lr=lr)
+    elif optimizer_name == "rmsprop":
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, momentum=0.9)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+    
+    # Learning rate scheduler: Cosine annealing
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr*0.01)
 
     test_acc = 0.0
     avg_loss = 0.0
     best_state_dict = None
-    best_epoch = 0
+    best_epoch = 1
     patience_counter = 0
 
     if monitor == "test_loss":
@@ -811,6 +1664,8 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
 
         print(f"  Epoche {epoch:02d}/{epochs:02d} | Train-Verlust: {avg_loss:.4f} | Test-Verlust: {test_loss:.4f} | Test-Genauigkeit: {test_acc:.2f}%{best_tag}")
 
+        scheduler.step()
+
         if early_stopping_enabled and patience_counter >= patience:
             print(f"[Early Stopping] Vorzeitiger Abbruch in Epoche {epoch}/{epochs}: Keine Verbesserung der Metrik '{monitor}' seit {patience} Epochen (Bester Stand in Epoche {best_epoch}: Test-Acc: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
             break
@@ -821,7 +1676,61 @@ def train_model(config: Dict[str, Any], device: str = "cpu") -> Tuple[Union[Conf
         avg_loss = best_test_loss
         print(f"[PyTorch] Bestes Modell aus Epoche {best_epoch} für Export und Inferenz aktiviert (Test-Genauigkeit: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
 
-    print(f"[PyTorch] Training für '{config.get('name', 'Modell')}' abgeschlossen (Beste Test-Genauigkeit: {test_acc:.2f}%).\n")
+    print(f"[PyTorch] Training für '{model_name}' abgeschlossen (Beste Test-Genauigkeit: {test_acc:.2f}%).\n")
+
+    # ---------------------------------------------------------
+    # Post-Training Optimierung (Pruning, Quantisierung, Clustering)
+    # ---------------------------------------------------------
+    model, opt_info = optimize_model(
+        model=model,
+        config=config,
+        test_dataset=test_dataset,
+        train_dataset=train_dataset,
+        device=device,
+    )
+    if opt_info.get("applied", False):
+        test_acc = float(opt_info.get("post_acc", test_acc))
+        avg_loss = float(opt_info.get("post_loss", avg_loss))
+
+    # ---------------------------------------------------------
+    # Automatisches Speichern des trainierten Modells (Checkpoint & Metadaten)
+    # ---------------------------------------------------------
+    if auto_save and resolved_save_dir:
+        try:
+            os.makedirs(resolved_save_dir, exist_ok=True)
+            checkpoint_data = {
+                "model_name": model_name,
+                "model_type": model_type,
+                "dataset": dataset_name,
+                "config_signature": signature,
+                "config_hash": sig_hash,
+                "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+                "test_acc": float(test_acc),
+                "test_loss": float(avg_loss),
+                "best_epoch": best_epoch,
+                "optimization": opt_info if opt_info.get("applied", False) else None,
+                "timestamp": time.time(),
+            }
+            torch.save(checkpoint_data, checkpoint_path)
+
+            meta_data = {
+                "model_name": model_name,
+                "model_type": model_type,
+                "dataset": dataset_name,
+                "test_acc": float(test_acc),
+                "test_loss": float(avg_loss),
+                "best_epoch": best_epoch,
+                "config_hash": sig_hash,
+                "config_signature": signature,
+                "optimization": opt_info if opt_info.get("applied", False) else None,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta_data, f, indent=2, ensure_ascii=False)
+            print(f"[PyTorch] Modell '{model_name}' erfolgreich in '{checkpoint_path}' gespeichert.\n")
+        except Exception as e:
+            print(f"[PyTorch] Warnung: Modell konnte nicht gespeichert werden: {e}", file=sys.stderr)
+
     return model, test_dataset, test_acc, avg_loss
 
 
@@ -1214,7 +2123,9 @@ def export_c_files(
 
     input_size = int(model_cfg.get("input_size", 784))
     output_size = int(model_cfg.get("output_size", 10))
-    num_test_samples = int(eval_cfg.get("num_test_samples", 50))
+    num_test_samples = int(eval_cfg.get("num_test_samples", 500))
+    if test_dataset is not None and hasattr(test_dataset, "__len__"):
+        num_test_samples = min(num_test_samples, len(test_dataset))
 
     # 1. model_data.h
     header_path = out_path / "model_data.h"
@@ -1231,6 +2142,8 @@ def export_c_files(
         f.write("#define ENCODING_TTFS      1\n")
         f.write("#define ENCODING_POISSON   2\n")
         f.write("#define ENCODING_PERIODIC  3\n\n")
+        f.write("#define EXECUTION_MODE_DENSE       0\n")
+        f.write("#define EXECUTION_MODE_EVENT_BASED 1\n\n")
         f.write("#define SNN_MAX_FC_LAYERS   8\n")
         f.write("#define SNN_MAX_CONV_LAYERS 4\n\n")
         f.write("typedef struct {\n")
@@ -1258,6 +2171,7 @@ def export_c_files(
         f.write("    int output_size;\n")
         f.write("    int neuron_type;\n")
         f.write("    int encoding_type;\n")
+        f.write("    int execution_mode;\n")
         f.write("} snn_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
@@ -1376,6 +2290,7 @@ def export_c_files(
 
             n_type_code = 1 if getattr(model, "neuron_type", "lif") == "if" else 0
             enc_code = get_encoding_code(getattr(model, "encoding_type", "direct"))
+            exec_mode_code = 1 if getattr(model, "execution_mode", "dense") in ("event_based", "event_driven", "event") else 0
             fc_layer_sizes = [model.flat_size] + model.hidden_layers + [output_size]
             fc_sizes_str = ", ".join(str(s) for s in fc_layer_sizes)
 
@@ -1396,6 +2311,7 @@ def export_c_files(
             f.write(f"    .output_size = {output_size},\n")
             f.write(f"    .neuron_type = {n_type_code},\n")
             f.write(f"    .encoding_type = {enc_code},\n")
+            f.write(f"    .execution_mode = {exec_mode_code},\n")
             f.write("};\n")
 
     dataset_name = config.get("dataset", config.get("training", {}).get("dataset", "mnist"))
@@ -1448,6 +2364,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
 
     global_training = dict(config.get("training", {}))
     global_evaluation = dict(config.get("evaluation", {}))
+    global_optimization = dict(config.get("optimization", {})) if isinstance(config.get("optimization"), dict) else {}
     global_esp32 = dict(config.get("esp32", {}))
     global_joulescope = dict(config.get("joulescope", {}))
 
@@ -1562,6 +2479,13 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
             if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
                 model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
 
+            model_optimization = copy.deepcopy(global_optimization)
+            if isinstance(m.get("optimization"), dict):
+                model_optimization.update(m["optimization"])
+            for k in ("pruning", "quantization", "clustering"):
+                if k in m:
+                    model_optimization[k] = m[k]
+
             resolved_models.append({
                 "name": name,
                 "type": m_type,
@@ -1569,6 +2493,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "model": model_dict,
                 "training": model_training,
                 "evaluation": model_evaluation,
+                "optimization": model_optimization,
                 "esp32": global_esp32,
                 "joulescope": global_joulescope,
             })
@@ -1654,13 +2579,22 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
     if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
         model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
 
+    model_optimization = copy.deepcopy(global_optimization)
+    if isinstance(single_m.get("optimization"), dict):
+        model_optimization.update(single_m["optimization"])
+    for k in ("pruning", "quantization", "clustering"):
+        if k in single_m:
+            model_optimization[k] = single_m[k]
+
+    num_steps = model_dict.get("num_steps") if m_type == "snn" else None
     resolved_models.append({
-        "name": name,
+        "name": f"{name}{'_T' + str(num_steps) if num_steps is not None else ''}",
         "type": m_type,
         "dataset": single_ds,
         "model": model_dict,
         "training": model_training,
         "evaluation": model_evaluation,
+        "optimization": model_optimization,
         "esp32": global_esp32,
         "joulescope": global_joulescope,
     })
@@ -1678,10 +2612,18 @@ def train_all_models(
     min_delta: float = None,
     monitor: str = None,
     num_test_samples: int = None,
+    force_retrain: bool = False,
+    save_dir: str = None,
+    prune_amount: float = None,
+    prune_method: str = None,
+    quantize_type: str = None,
+    num_clusters: int = None,
+    fine_tune_epochs: int = None,
     device: str = "cpu",
 ) -> List[Dict[str, Any]]:
     """
-    Trainiert ALLE in der Konfiguration definierten Modelle nacheinander (Batch-Training Phase 1).
+    Trainiert ALLE in der Konfiguration definierten Modelle nacheinander (Batch-Training Phase 1)
+    oder lädt unveränderte Modelle aus dem Checkpoint-Cache und führt ggf. Post-Training Optimierungen durch.
     """
     if isinstance(config_or_path, dict):
         config = config_or_path
@@ -1695,7 +2637,7 @@ def train_all_models(
     model_configs = get_model_configs(config, dataset_filter=target_dataset)
     total_models = len(model_configs)
     print(f"\n=================================================================")
-    print(f"=== BATCH-TRAINING: {total_models} Modell(e) werden trainiert ===")
+    print(f"=== BATCH-TRAINING: {total_models} Modell(e) konfiguriert ===")
     print(f"=================================================================")
 
     trained_models = []
@@ -1726,16 +2668,54 @@ def train_all_models(
             m_cfg["training"]["monitor"] = monitor
         if num_test_samples is not None:
             m_cfg["evaluation"]["num_test_samples"] = num_test_samples
+        if force_retrain:
+            m_cfg["training"]["force_retrain"] = True
+        if save_dir is not None:
+            m_cfg["training"]["save_dir"] = save_dir
+
+        if "optimization" not in m_cfg:
+            m_cfg["optimization"] = {}
+        if prune_amount is not None:
+            if "pruning" not in m_cfg["optimization"]:
+                m_cfg["optimization"]["pruning"] = {}
+            m_cfg["optimization"]["pruning"]["enabled"] = True
+            m_cfg["optimization"]["pruning"]["amount"] = float(prune_amount)
+        if prune_method is not None:
+            if "pruning" not in m_cfg["optimization"]:
+                m_cfg["optimization"]["pruning"] = {}
+            m_cfg["optimization"]["pruning"]["method"] = str(prune_method)
+        if quantize_type is not None:
+            if "quantization" not in m_cfg["optimization"]:
+                m_cfg["optimization"]["quantization"] = {}
+            m_cfg["optimization"]["quantization"]["enabled"] = True
+            m_cfg["optimization"]["quantization"]["type"] = str(quantize_type)
+        if num_clusters is not None:
+            if "clustering" not in m_cfg["optimization"]:
+                m_cfg["optimization"]["clustering"] = {}
+            m_cfg["optimization"]["clustering"]["enabled"] = True
+            m_cfg["optimization"]["clustering"]["num_clusters"] = int(num_clusters)
+        if fine_tune_epochs is not None:
+            if "pruning" not in m_cfg["optimization"]:
+                m_cfg["optimization"]["pruning"] = {}
+            m_cfg["optimization"]["pruning"]["fine_tune_epochs"] = int(fine_tune_epochs)
+
+        m_force = m_cfg["training"].get("force_retrain", force_retrain)
+        m_save_dir = m_cfg["training"].get("save_dir", save_dir)
 
         m_type = m_cfg.get("type", "ann").lower()
         ep = m_cfg["training"].get("epochs", "?")
         bs = m_cfg["training"].get("batch_size", "?")
         lr = m_cfg["training"].get("learning_rate", "?")
         ds = m_cfg.get("dataset", m_cfg["model"].get("dataset", "mnist"))
-        print(f"\n--- [{idx}/{total_models}] Trainiere Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Datensatz: {ds}, Epochen: {ep}, Batch: {bs}, LR: {lr}] ---")
-        model, test_dataset, test_acc, test_loss = train_model(m_cfg, device=device)
+        print(f"\n--- [{idx}/{total_models}] Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Datensatz: {ds}, Epochen: {ep}, Batch: {bs}, LR: {lr}] ---")
+        model, test_dataset, test_acc, test_loss = train_model(
+            m_cfg,
+            device=device,
+            force_retrain=m_force,
+            save_dir=m_save_dir,
+        )
 
-        samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 50))
+        samples_cnt = int(m_cfg.get("evaluation", {}).get("num_test_samples", 500))
         subset_acc, subset_correct, subset_total = evaluate_subset(
             model=model,
             test_dataset=test_dataset,
@@ -1746,12 +2726,14 @@ def train_all_models(
 
         tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" else b""
 
-        # Parameteranzahl & Modellgröße
+        # Parameteranzahl, Sparsity & Modellgröße
         total_params = sum(p.numel() for p in model.parameters())
+        sparsity_info = compute_model_sparsity(model)
         model_size_bytes = (total_params * 4) if m_type == "snn" else len(tflite_bytes)
 
+        num_steps = m_cfg["model"].get("num_steps") if m_type == "snn" else None
         trained_entry = {
-            "name": m_cfg["name"],
+            "name": f"{m_cfg['name']}{'_T' + str(num_steps) if num_steps is not None else ''}",
             "type": m_type,
             "dataset": ds,
             "config": m_cfg,
@@ -1766,6 +2748,8 @@ def train_all_models(
             "tflite_bytes": tflite_bytes,
             "model_size_bytes": model_size_bytes,
             "total_params": total_params,
+            "sparsity_pct": sparsity_info["sparsity_pct"],
+            "zero_weights": sparsity_info["zero_weights"],
             "structure": model.get_structure_summary(),
         }
         trained_models.append(trained_entry)
@@ -1795,6 +2779,13 @@ def train_and_export(
     min_delta: float = None,
     monitor: str = None,
     num_test_samples: int = None,
+    force_retrain: bool = False,
+    save_dir: str = None,
+    prune_amount: float = None,
+    prune_method: str = None,
+    quantize_type: str = None,
+    num_clusters: int = None,
+    fine_tune_epochs: int = None,
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], bytes]:
     """
     Trainiert alle Modelle und exportiert das erste Modell nach output_dir.
@@ -1810,6 +2801,13 @@ def train_and_export(
         min_delta=min_delta,
         monitor=monitor,
         num_test_samples=num_test_samples,
+        force_retrain=force_retrain,
+        save_dir=save_dir,
+        prune_amount=prune_amount,
+        prune_method=prune_method,
+        quantize_type=quantize_type,
+        num_clusters=num_clusters,
+        fine_tune_epochs=fine_tune_epochs,
     )
     if trained_models:
         export_model_entry_to_main(trained_models[0], output_dir=output_dir)
@@ -1818,7 +2816,7 @@ def train_and_export(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Neuronale Netze (ANN & SNN) Training, Datensatzauswahl & TFLite/C-Export")
+    parser = argparse.ArgumentParser(description="Neuronale Netze (ANN & SNN) Training, Datensatzauswahl, Post-Training-Optimierung & TFLite/C-Export")
     parser.add_argument(
         "-c", "--config",
         type=str,
@@ -1893,6 +2891,56 @@ if __name__ == "__main__":
         dest="test_samples",
         help="Überschreibt die Anzahl der zu exportierenden Test-Samples",
     )
+    parser.add_argument(
+        "--force-train", "--force-retrain",
+        dest="force_retrain",
+        action="store_true",
+        default=False,
+        help="Erzwingt ein erneutes Training aller Modelle, auch wenn gespeicherte Checkpoints unverändert vorliegen",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Verzeichnis zum automatischen Speichern und Laden trainierter Modell-Checkpoints (Standard: './saved_models')",
+    )
+
+    # Post-Training Optimierungs-Optionen
+    parser.add_argument(
+        "--prune", "--prune-amount",
+        type=float,
+        default=None,
+        dest="prune_amount",
+        help="Aktiviert Post-Training Pruning und setzt den Zielanteil entfernter Gewichte (z. B. 0.3 für 30%% Sparsity)",
+    )
+    parser.add_argument(
+        "--prune-method",
+        type=str,
+        default=None,
+        choices=["l1_unstructured", "random_unstructured", "structured", "threshold"],
+        help="Pruning-Methode: 'l1_unstructured' (Standard), 'random_unstructured', 'structured' oder 'threshold'",
+    )
+    parser.add_argument(
+        "--quantize", "--quantize-type",
+        type=str,
+        default=None,
+        dest="quantize_type",
+        choices=["int8", "int4", "fp16", "dynamic"],
+        help="Aktiviert Post-Training Quantisierung der Gewichte ('int8', 'int4', 'fp16', 'dynamic')",
+    )
+    parser.add_argument(
+        "--clustering", "--num-clusters",
+        type=int,
+        default=None,
+        dest="num_clusters",
+        help="Aktiviert Weight-Clustering mit k Centroids (z. B. 16 für 4-Bit Codebook)",
+    )
+    parser.add_argument(
+        "--fine-tune-epochs",
+        type=int,
+        default=None,
+        help="Anzahl an Fine-Tuning Epochen nach dem Pruning zur Genauigkeitswiederherstellung",
+    )
 
     args = parser.parse_args()
 
@@ -1911,4 +2959,11 @@ if __name__ == "__main__":
         min_delta=args.min_delta,
         monitor=args.monitor,
         num_test_samples=args.test_samples,
+        force_retrain=args.force_retrain,
+        save_dir=args.save_dir,
+        prune_amount=args.prune_amount,
+        prune_method=args.prune_method,
+        quantize_type=args.quantize_type,
+        num_clusters=args.num_clusters,
+        fine_tune_epochs=args.fine_tune_epochs,
     )

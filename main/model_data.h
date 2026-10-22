@@ -18,6 +18,9 @@ extern "C" {
 #define ENCODING_POISSON   2
 #define ENCODING_PERIODIC  3
 
+#define EXECUTION_MODE_DENSE       0
+#define EXECUTION_MODE_EVENT_BASED 1
+
 #define SNN_MAX_FC_LAYERS   8
 #define SNN_MAX_CONV_LAYERS 4
 
@@ -47,6 +50,7 @@ typedef struct {
     int output_size;
     int neuron_type;
     int encoding_type;
+    int execution_mode;
 } snn_config_t;
 
 extern const int g_model_type;

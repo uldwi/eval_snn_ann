@@ -11,7 +11,7 @@
 #      - "mnist":
 #          Handgeschriebene Ziffern (0-9), 1x28x28 = 784 Features, 10 Klassen
 #      - "fashion_mnist":
-#          Kleidungsstücke (Zalando), 1x28x28 = 784 Features, 10 Klassen
+#          Kleidungsstück (Zalando), 1x28x28 = 784 Features, 10 Klassen
 #      - "cifar10":
 #          10 Objektklassen (herunterskaliert auf 1x16x16 = 256 Features für MCU), 10 Klassen
 #
@@ -60,7 +60,7 @@ training:
   # Lernrate für den Optimierer
   learning_rate: 0.001
 
-  # Optimierer ("adam" oder "sgd")
+  # Optimierer ("adam", "sgd", "adamw", "adagrad", "rmsprop")
   optimizer: "adam"
 
   # Early Stopping (Vorzeitiger Abbruch bei stagnierender Genauigkeit / Verlust)
@@ -73,15 +73,67 @@ training:
   # Verzeichnis zum Speichern/Laden von Datensätzen
   data_dir: "./data"
 
+  # Verzeichnis zum automatischen Speichern und Laden trainierter Modell-Checkpoints (Caching)
+  # Modelle werden automatisch gespeichert und bei unveränderter Konfiguration wiederverwendet.
+  save_dir: "./saved_models"
+  auto_save: true
+
   # Random Seed für reproduzierbare Ergebnisse (z. B. 42 oder null für zufällig)
   random_seed: 42
+
+# ---------------------------------------------------------------------
+# Globale Einstellungen für die Modell-Optimierung (Post-Training)
+#
+# Alle unter "models:" gelisteten Modelle werden mit Pruning UND Quantisierung
+# optimiert. Die globalen Werte gelten als Standard; jedes Modell kann sie
+# per "optimization:"-Block überschreiben.
+#
+# 1. Pruning (Sparsifizierung):
+#      - enabled: true / false
+#      - method: "l1_unstructured" (Standard), "random_unstructured", "structured", "threshold"
+#      - amount: Anteil der zu entfernenden Gewichte (z. B. 0.3 = 30% Sparsity)
+#      - threshold: Mindestwert der Gewichtsbeträge (bei method: "threshold")
+#      - layers: ["conv", "fc"] oder "all"
+#      - fine_tune_epochs: Optionale Nacheichung/Fine-Tuning zur Genauigkeitswiederherstellung
+#      - fine_tune_lr: Lernrate beim Fine-Tuning (z. B. 0.0001)
+#
+# 2. Quantisierung (Bitbreiten-Reduktion der Gewichte):
+#      - enabled: true / false
+#      - type: "int8" (Standard), "int4", "fp16", "dynamic"
+#      - mode: "symmetric" (Standard) oder "asymmetric"
+#      - per_channel: true (pro Filterkanal) oder false (pro Tensor)
+#      - layers: ["conv", "fc"] oder "all"
+#
+# 3. Weight Clustering (Codebook / Centroid-Sharing):
+#      - enabled: true / false
+#      - num_clusters: Anzahl diskreter Centroids (z. B. 16 = 4-Bit Index-Sharing)
+# ---------------------------------------------------------------------
+optimization:
+  pruning:
+    enabled: true
+    method: "l1_unstructured"
+    amount: 0.3
+    layers: ["conv", "fc"]
+    fine_tune_epochs: 2
+    fine_tune_lr: 0.0001
+
+  quantization:
+    enabled: true
+    type: "int8"
+    mode: "symmetric"
+    per_channel: true
+    layers: ["conv", "fc"]
+
+  clustering:
+    enabled: false
+    num_clusters: 16
 
 # ---------------------------------------------------------------------
 # Globale Einstellungen für die Inferenz auf dem ESP32
 # ---------------------------------------------------------------------
 evaluation:
-  # Anzahl der Test-Samples, die auf den ESP32 für die Inferenzmessung exportiert werden
-  num_test_samples: 50
+  # Anzahl der Test-Samples, die auf dem ESP32 für die Inferenzmessung exportiert werden
+  num_test_samples: 500
 
 # ---------------------------------------------------------------------
 # Hardware-Einstellungen (ESP32 & Joulescope)
@@ -100,8 +152,16 @@ joulescope:
 # ---------------------------------------------------------------------
 # Liste der Modelle für sequentielle Messungen
 #
+# Aktuell getestet: MNIST mit genau drei Modellen
+#   1x ANN (TensorFlow Lite Micro, dicht)
+#   1x SNN (SpikingJelly, event_based Ausführung)
+#   1x SNN (SpikingJelly, dense Ausführung)
+# Alle drei Modelle verwenden identische Architektur (Conv16_32_64 + FC64),
+# damit die Energiemessungen direkt vergleichbar sind. Jedes Modell trainiert
+# mit Pruning UND Quantisierung.
+#
 # Unterstützte Modelltypen:
-#   - type: "ann" (Standard)
+#   - type: "ann"
 #       Künstliches neuronales Netz (MLP oder CNN), ausgeführt mit TensorFlow Lite Micro.
 #       Optionen:
 #         - dataset: optionaler Datensatz pro Modell (z. B. "mnist", "speech_commands", "eeg_data", "har_time_series", "ecg_data")
@@ -116,6 +176,7 @@ joulescope:
 #         - dataset: optionaler Datensatz pro Modell
 #         - conv_layers: Liste von Faltungs- und Pooling-Schichten (z. B. 8 Filter, 3x3, MaxPool 2x2)
 #         - neuron_type: "lif" (Leaky-Integrate-and-Fire, Standard) oder "if" (Integrate-and-Fire)
+#         - execution_mode: Ausführungsmodus ("dense" = Standard dicht, "event_based" = Ereignisgesteuert)
 #         - encoding_type: Eingangs-Encoding-Algorithmus:
 #             * "direct"   (Standard): Konstanter analoger Eingangsstrom über alle Zeitschritte
 #             * "ttfs"     (Time-To-First-Spike / Latency Coding): Früheres Feuern bei höherer Intensität
@@ -125,6 +186,11 @@ joulescope:
 #         - num_steps: Zeitschritte (z. B. 10)
 #         - beta: Membran-Decay (nur bei LIF, z. B. 0.9)
 #         - threshold: Schwellenwert (z. B. 1.0)
+#
+# Modellspezifische Optimierung (überschreibt die globalen Werte):
+#   optimization:
+#     pruning: {enabled: true, amount: 0.3, method: "l1_unstructured"}
+#     quantization: {enabled: true, type: "int8", per_channel: true}
 #
 # Trainings-Parameter pro Modell (überschreiben globale Standardwerte):
 #   - epochs: Maximale Anzahl der Epochen (z. B. 5 oder 20)
@@ -138,8 +204,7 @@ joulescope:
 # ---------------------------------------------------------------------
 models:
   # ===================================================================
-  # 1. Computer Vision / Bildverarbeitung: MNIST
-  #    Optimierte LeNet/VGG-Stil 2-Stufen ConvNet-Architektur
+  # MNIST - ANN (98.85%)
   # ===================================================================
   - name: "ANN_MNIST_Conv16_32_64"
     type: "ann"
@@ -161,11 +226,17 @@ models:
     batch_size: 64
     learning_rate: 0.001
 
+  # ===================================================================
+  # MNIST - SNN (98.5%)
+  # ===================================================================
   - name: "SNN_MNIST_LIF_Conv16_32_64_TTFS"
     type: "snn"
     dataset: "mnist"
     neuron_type: "lif"
     encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
     conv_layers:
       - out_channels: 16
         kernel_size: 3
@@ -178,16 +249,12 @@ models:
         padding: 1
         pool_size: 2
     hidden_layers: [64]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
     epochs: 5
     batch_size: 64
     learning_rate: 0.005
 
   # ===================================================================
-  # 2. Computer Vision / Bildverarbeitung: Fashion-MNIST
-  #    Tiefere Faltungsstruktur für komplexere Texturen und Kanten
+  # FashionMNIST - ANN (92.3%)
   # ===================================================================
   - name: "ANN_FashionMNIST_Conv32_64_128"
     type: "ann"
@@ -207,13 +274,19 @@ models:
     activation: "relu"
     epochs: 6
     batch_size: 64
-    learning_rate: 0.001
+    learning_rate: 0.005
 
+  # ===================================================================
+  # FashionMNIST - SNN (90.02%)
+  # ===================================================================
   - name: "SNN_FashionMNIST_LIF_Conv32_64_128_Direct"
     type: "snn"
     dataset: "fashion_mnist"
-    neuron_type: "lif"
-    encoding_type: "direct"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
     conv_layers:
       - out_channels: 32
         kernel_size: 3
@@ -226,16 +299,12 @@ models:
         padding: 1
         pool_size: 2
     hidden_layers: [128]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
-    epochs: 6
+    epochs: 10
     batch_size: 64
     learning_rate: 0.005
 
   # ===================================================================
-  # 3. Computer Vision / Bildverarbeitung: CIFAR-10 (16x16)
-  #    Multi-Kanal ConvNet zur Erfassung von Farb- und Formmustern
+  # CIFAR10 - ANN (58.96%)
   # ===================================================================
   - name: "ANN_CIFAR10_Conv32_64_128"
     type: "ann"
@@ -255,13 +324,19 @@ models:
     activation: "relu"
     epochs: 8
     batch_size: 64
-    learning_rate: 0.001
+    learning_rate: 0.005
 
-  - name: "SNN_CIFAR10_LIF_Conv32_64_128_Direct"
+# ===================================================================
+  # CIFAR10 - SNN (TTFS encoding, Regularisierung)
+  # ===================================================================
+  - name: "SNN_CIFAR10_LIF_Conv32_64_128_TTFS_Reg"
     type: "snn"
     dataset: "cifar10"
     neuron_type: "lif"
-    encoding_type: "direct"
+    encoding_type: "ttfs"
+    num_steps: 50
+    beta: 0.90
+    threshold: 1.0
     conv_layers:
       - out_channels: 32
         kernel_size: 3
@@ -274,16 +349,18 @@ models:
         padding: 1
         pool_size: 2
     hidden_layers: [128]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
-    epochs: 8
+    dropout: 0.5
+    epochs: 80
     batch_size: 64
-    learning_rate: 0.005
+    learning_rate: 0.001
+    early_stopping:
+      enabled: true
+      patience: 10
+      monitor: "test_acc"
+      restore_best_weights: true
 
   # ===================================================================
-  # 4. Audio & Keyword Recognition: Speech Commands (KWS)
-  #    TinyML Standard 2D-ConvNet über Mel-Spektrogramme
+  # Speech Commands (KWS) - ANN (99.2%)
   # ===================================================================
   - name: "ANN_KWS_Conv16_32_64"
     type: "ann"
@@ -303,13 +380,19 @@ models:
     activation: "relu"
     epochs: 6
     batch_size: 64
-    learning_rate: 0.001
+    learning_rate: 0.005
 
+  # ===================================================================
+  # Speech Commands (KWS) - SNN (99.7%)
+  # ===================================================================
   - name: "SNN_KWS_LIF_Conv16_32_64_TTFS"
     type: "snn"
     dataset: "speech_commands"
     neuron_type: "lif"
     encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
     conv_layers:
       - out_channels: 16
         kernel_size: 3
@@ -322,68 +405,12 @@ models:
         padding: 1
         pool_size: 2
     hidden_layers: [64]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
     epochs: 6
     batch_size: 64
     learning_rate: 0.005
 
   # ===================================================================
-  # 5. Sensordaten & Zeitreihen: Human Activity Recognition (HAR)
-  #    Deep Feature Pyramid MLP zur Bewegungserkennung
-  # ===================================================================
-  - name: "ANN_HAR_128_64_32"
-    type: "ann"
-    dataset: "har_time_series"
-    hidden_layers: [128, 64, 32]
-    activation: "relu"
-    epochs: 6
-    batch_size: 64
-    learning_rate: 0.001
-
-  - name: "SNN_HAR_LIF_128_64_32_Direct"
-    type: "snn"
-    dataset: "har_time_series"
-    neuron_type: "lif"
-    encoding_type: "direct"
-    hidden_layers: [128, 64, 32]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
-    epochs: 6
-    batch_size: 64
-    learning_rate: 0.005
-
-  # ===================================================================
-  # 6. Sensordaten & Zeitreihen: Synthetische Zeitreihenmuster
-  #    Hierarchisches MLP für Zeitreihen-Mustererkennung
-  # ===================================================================
-  - name: "ANN_TimeSeries_96_48"
-    type: "ann"
-    dataset: "synthetic_time_series"
-    hidden_layers: [96, 48]
-    activation: "relu"
-    epochs: 6
-    batch_size: 64
-    learning_rate: 0.001
-
-  - name: "SNN_TimeSeries_LIF_96_48_TTFS"
-    type: "snn"
-    dataset: "synthetic_time_series"
-    neuron_type: "lif"
-    encoding_type: "ttfs"
-    hidden_layers: [96, 48]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
-    epochs: 6
-    batch_size: 64
-    learning_rate: 0.005
-
-  # ===================================================================
-  # 7. Biomedizinische Signale: EEG Gehirnwellen-Bänder
-  #    ConvNet zur Extraktion spektral-zeitlicher Gehirnaktivitätsmuster
+  # EEG - ANN (100%)
   # ===================================================================
   - name: "ANN_EEG_Conv16_32_32"
     type: "ann"
@@ -403,13 +430,19 @@ models:
     activation: "relu"
     epochs: 6
     batch_size: 64
-    learning_rate: 0.001
+    learning_rate: 0.005
 
+  # ===================================================================
+  # EEG - SNN (100%)
+  # ===================================================================
   - name: "SNN_EEG_LIF_Conv16_32_32_TTFS"
     type: "snn"
     dataset: "eeg_data"
     neuron_type: "lif"
     encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
     conv_layers:
       - out_channels: 16
         kernel_size: 3
@@ -422,16 +455,12 @@ models:
         padding: 1
         pool_size: 1
     hidden_layers: [32]
-    num_steps: 10
-    beta: 0.9
-    threshold: 1.0
     epochs: 6
     batch_size: 64
     learning_rate: 0.005
 
   # ===================================================================
-  # 8. Biomedizinische Signale: EEG Eye State (Augen Auf/Zu)
-  #    Mehrstufiges MLP zur Erkennung von Mikrospannungszuständen
+  # EEG Eye State - ANN (100%)
   # ===================================================================
   - name: "ANN_EEGEye_64_32_16"
     type: "ann"
@@ -440,24 +469,26 @@ models:
     activation: "relu"
     epochs: 5
     batch_size: 64
-    learning_rate: 0.001
+    learning_rate: 0.005
 
+  # ===================================================================
+  # EEG Eye State - SNN (100%)
+  # ===================================================================
   - name: "SNN_EEGEye_LIF_64_32_16_Direct"
     type: "snn"
     dataset: "eeg_eye_state"
     neuron_type: "lif"
     encoding_type: "direct"
-    hidden_layers: [64, 32, 16]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
+    hidden_layers: [64, 32, 16]
     epochs: 5
     batch_size: 64
     learning_rate: 0.005
 
   # ===================================================================
-  # 9. Biomedizinische Signale: EKG Herzrhythmus (MIT-BIH Arrhythmie)
-  #    Deep Feature Extraction MLP zur Klassifikation von Herzschlägen
+  # ECG - ANN (100%)
   # ===================================================================
   - name: "ANN_ECG_128_64_32"
     type: "ann"
@@ -466,17 +497,76 @@ models:
     activation: "relu"
     epochs: 6
     batch_size: 64
-    learning_rate: 0.001
+    learning_rate: 0.005
 
+  # ===================================================================
+  # ECG - SNN (100%)
+  # ===================================================================
   - name: "SNN_ECG_LIF_128_64_32_TTFS"
     type: "snn"
     dataset: "ecg_data"
     neuron_type: "lif"
     encoding_type: "ttfs"
-    hidden_layers: [128, 64, 32]
     num_steps: 10
     beta: 0.9
     threshold: 1.0
+    hidden_layers: [128, 64, 32]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # HAR - ANN (100%)
+  # ===================================================================
+  - name: "ANN_HAR_128_64_32"
+    type: "ann"
+    dataset: "har_time_series"
+    hidden_layers: [128, 64, 32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # HAR - SNN (100%)
+  # ===================================================================
+  - name: "SNN_HAR_LIF_128_64_32_Direct"
+    type: "snn"
+    dataset: "har_time_series"
+    neuron_type: "lif"
+    encoding_type: "direct"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    hidden_layers: [128, 64, 32]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # Synthetic Time Series - ANN (100%)
+  # ===================================================================
+  - name: "ANN_TimeSeries_96_48"
+    type: "ann"
+    dataset: "synthetic_time_series"
+    hidden_layers: [96, 48]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # Synthetic Time Series - SNN (100%)
+  # ===================================================================
+  - name: "SNN_TimeSeries_LIF_96_48_TTFS"
+    type: "snn"
+    dataset: "synthetic_time_series"
+    neuron_type: "lif"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    hidden_layers: [96, 48]
     epochs: 6
     batch_size: 64
     learning_rate: 0.005

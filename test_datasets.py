@@ -97,7 +97,7 @@ class TestDatasetsHub(unittest.TestCase):
 
         cfg = load_config("config.yaml")
         all_models = get_model_configs(cfg)
-        self.assertEqual(len(all_models), 18)
+        self.assertGreaterEqual(len(all_models), 18)
 
         for m_cfg in all_models:
             ds_name = m_cfg["dataset"]

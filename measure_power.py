@@ -211,10 +211,12 @@ def display_results(
     }
 
 
-def capture_esp32_serial_metrics(port: str = None, timeout: float = 6.0, baudrate: int = 115200) -> dict:
+def capture_esp32_serial_metrics(port: str = None, timeout: float = 30.0, baudrate: int = 115200) -> dict:
     """
     Versucht, über die serielle Schnittstelle die Genauigkeit und Inferenz-Metriken
     direkt aus den Log-Ausgaben des ESP32 zu lesen.
+    Standard-Timeout 30.0 s: Die ESP32-Laufzeit (50 Inferenzen à ~195 ms) benötigt
+    ca. 10 s, daher muss das Timeout größer sein.
     """
     try:
         import serial
@@ -259,6 +261,10 @@ def capture_esp32_serial_metrics(port: str = None, timeout: float = 6.0, baudrat
                                 metrics["esp32_total"] = int(v)
                             elif k == "TIME_US":
                                 metrics["esp32_time_us"] = int(v)
+                            elif k == "SPIKES":
+                                metrics["esp32_spikes"] = int(v)
+                            elif k == "SYNOPS":
+                                metrics["esp32_synops"] = int(v)
                     if "esp32_acc" in metrics:
                         break
     except Exception:
@@ -310,8 +316,20 @@ def print_comparison_summary(all_results: list):
 
         m = res.get("metrics")
         if m:
-            t_inf = f"{m['time_per_inf_ms']:.2f} ms" if m.get("time_per_inf_ms") is not None else f"{m['duration_s']*1000:.1f} ms"
-            e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else f"{m['energy_uj']:.1f} µJ"
+            num_inf = res.get("num_test_samples", m.get("num_inferences"))
+            esp32_time_us = m.get("esp32_time_us")
+            if esp32_time_us is not None and num_inf:
+                t_inf_val = esp32_time_us / 1000.0 / num_inf
+                t_inf = f"{t_inf_val:.2f} ms"
+                avg_power_mw = m.get("avg_power_mw")
+                if avg_power_mw is not None:
+                    e_inf_val = avg_power_mw * t_inf_val
+                    e_inf = f"{e_inf_val:.2f} µJ"
+                else:
+                    e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else f"{m['energy_uj']:.1f} µJ"
+            else:
+                t_inf = f"{m['time_per_inf_ms']:.2f} ms" if m.get("time_per_inf_ms") is not None else f"{m['duration_s']*1000:.1f} ms"
+                e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else f"{m['energy_uj']:.1f} µJ"
             p_avg = f"{m['avg_power_mw']:.2f} mW" if m.get("avg_power_mw") is not None else "N/A"
         else:
             t_inf, e_inf, p_avg = "Keine Daten", "Keine Daten", "Keine Daten"
@@ -577,6 +595,56 @@ def main():
         default=None,
         help="Anzahl der MNIST Testbilder fuer die Inferenz auf dem ESP32 (ueberschreibt Konfigurationsdatei)",
     )
+    parser.add_argument(
+        "--force-train", "--force-retrain",
+        dest="force_train",
+        action="store_true",
+        default=False,
+        help="Erzwingt ein erneutes Training aller Modelle, auch wenn gespeicherte Checkpoints unverändert vorliegen",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Verzeichnis zum automatischen Speichern und Laden trainierter Modell-Checkpoints (Standard: './saved_models')",
+    )
+
+    # Post-Training Optimierungs-Optionen
+    parser.add_argument(
+        "--prune", "--prune-amount",
+        type=float,
+        default=None,
+        dest="prune_amount",
+        help="Aktiviert Post-Training Pruning und setzt den Zielanteil entfernter Gewichte (z. B. 0.3 für 30%% Sparsity)",
+    )
+    parser.add_argument(
+        "--prune-method",
+        type=str,
+        default=None,
+        choices=["l1_unstructured", "random_unstructured", "structured", "threshold"],
+        help="Pruning-Methode: 'l1_unstructured' (Standard), 'random_unstructured', 'structured' oder 'threshold'",
+    )
+    parser.add_argument(
+        "--quantize", "--quantize-type",
+        type=str,
+        default=None,
+        dest="quantize_type",
+        choices=["int8", "int4", "fp16", "dynamic"],
+        help="Aktiviert Post-Training Quantisierung der Gewichte ('int8', 'int4', 'fp16', 'dynamic')",
+    )
+    parser.add_argument(
+        "--clustering", "--num-clusters",
+        type=int,
+        default=None,
+        dest="num_clusters",
+        help="Aktiviert Weight-Clustering mit k Centroids (z. B. 16 für 4-Bit Codebook)",
+    )
+    parser.add_argument(
+        "--fine-tune-epochs",
+        type=int,
+        default=None,
+        help="Anzahl an Fine-Tuning Epochen nach dem Pruning zur Genauigkeitswiederherstellung",
+    )
 
     # Mess- und Trigger-Optionen
     parser.add_argument(
@@ -652,7 +720,7 @@ def main():
     num_test_samples = (
         args.test_samples
         if args.test_samples is not None
-        else config.get("evaluation", {}).get("num_test_samples", 50)
+        else config.get("evaluation", {}).get("num_test_samples", 500)
     )
     trigger_pin = (
         args.pin
@@ -680,6 +748,13 @@ def main():
             min_delta=args.min_delta,
             monitor=args.monitor,
             num_test_samples=args.test_samples,
+            force_retrain=args.force_train,
+            save_dir=args.save_dir,
+            prune_amount=args.prune_amount,
+            prune_method=args.prune_method,
+            quantize_type=args.quantize_type,
+            num_clusters=args.num_clusters,
+            fine_tune_epochs=args.fine_tune_epochs,
         )
     else:
         model_configs = get_model_configs(config, dataset_filter=args.dataset)
@@ -734,17 +809,11 @@ def main():
                 export_model_entry_to_main(model_entry, output_dir="main")
 
             # 2. ESP32 bei Bedarf bauen und flashen
-            serial_metrics = {}
             if args.flash and args.duration is None:
                 flash_ok = flash_esp32(port=args.port, build=not args.skip_build)
                 if not flash_ok:
                     print(f"[ESP-IDF] Warnung: Flashen für Modell '{model_name}' war nicht erfolgreich.", file=sys.stderr)
                 else:
-                    # Lese serielle Logs (falls USB noch verbunden ist)
-                    serial_metrics = capture_esp32_serial_metrics(port=args.port, timeout=4.5)
-                    if serial_metrics and "esp32_acc" in serial_metrics:
-                        print(f"[ESP32] Ermittelte Test-Genauigkeit (über UART): {serial_metrics['esp32_acc']:.2f}% ({serial_metrics.get('esp32_correct')}/{serial_metrics.get('esp32_total')} korrekt)")
-
                     if args.wait_unplug:
                         print("\n" + "=" * 65)
                         print(f">>> ESP32 erfolgreich für Modell '{model_name}' geflasht! <<<")
@@ -773,6 +842,23 @@ def main():
             except Exception as e:
                 print(f"\n[Messung fehlgeschlagen] Unerwarteter Fehler bei Modell '{model_name}': {e}", file=sys.stderr)
 
+            # 4. Serielle Logs NACH der Messung lesen (USB muss wieder angeschlossen sein)
+            serial_metrics = {}
+            if args.flash and args.duration is None:
+                if args.wait_unplug:
+                    print("\n" + "=" * 65)
+                    print(f"Bitte schließen Sie das USB-Kabel wieder an den ESP32 an, um")
+                    print(f"die Serielle Logs auszulesen.")
+                    print("=" * 65)
+                    try:
+                        input("Drücken Sie [Enter], sobald das USB-Kabel wieder angeschlossen ist...")
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nMessung durch Benutzer abgebrochen.")
+                        break
+                serial_metrics = capture_esp32_serial_metrics(port=args.port, timeout=30.0)
+                if serial_metrics and "esp32_acc" in serial_metrics:
+                    print(f"[ESP32] Ermittelte Test-Genauigkeit (über UART): {serial_metrics['esp32_acc']:.2f}% ({serial_metrics.get('esp32_correct')}/{serial_metrics.get('esp32_total')} korrekt)")
+
             esp32_acc = model_entry.get("subset_acc", model_entry.get("subset_test_acc"))
             esp32_corr = model_entry.get("subset_correct")
             esp32_tot = model_entry.get("subset_total", model_samples)
@@ -780,6 +866,10 @@ def main():
                 esp32_acc = serial_metrics["esp32_acc"]
                 esp32_corr = serial_metrics.get("esp32_correct", esp32_corr)
                 esp32_tot = serial_metrics.get("esp32_total", esp32_tot)
+
+            # ESP32-Serien-Metriken in die Joulescope-Metriken übernehmen
+            if serial_metrics:
+                metrics.update({k: v for k, v in serial_metrics.items() if k.startswith("esp32_")})
 
             if esp32_acc is not None:
                 print(f"[ESP32 Test-Accuracy] Modell '{model_name}': {esp32_acc:.2f}% ({esp32_corr}/{esp32_tot} Samples korrekt klassifiziert)")
