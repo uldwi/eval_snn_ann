@@ -30,7 +30,4 @@ python3 $HOME/code/eval_snn_ann/train_mnist.py \
     --skip-evaluation \
     --force-train
 
-# Exporte (model_data.h/cc) landen ebenfalls im Home-Verzeichnis
-mkdir -p $HOME/code/eval_snn_ann/main
-
 time deactivate
