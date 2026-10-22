@@ -2786,6 +2786,7 @@ def train_and_export(
     quantize_type: str = None,
     num_clusters: int = None,
     fine_tune_epochs: int = None,
+    device: str = "cpu",
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], bytes]:
     """
     Trainiert alle Modelle und exportiert das erste Modell nach output_dir.
@@ -2808,6 +2809,7 @@ def train_and_export(
         quantize_type=quantize_type,
         num_clusters=num_clusters,
         fine_tune_epochs=fine_tune_epochs,
+        device=device,
     )
     if trained_models:
         export_model_entry_to_main(trained_models[0], output_dir=output_dir)
@@ -2941,6 +2943,12 @@ if __name__ == "__main__":
         default=None,
         help="Anzahl an Fine-Tuning Epochen nach dem Pruning zur Genauigkeitswiederherstellung",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Gerät für das Training ('cpu', 'cuda' oder 'mps', Standard: 'cpu'). Auf DACHS GPU-Cluster wird 'cuda' verwendet.",
+    )
 
     args = parser.parse_args()
 
@@ -2966,4 +2974,5 @@ if __name__ == "__main__":
         quantize_type=args.quantize_type,
         num_clusters=args.num_clusters,
         fine_tune_epochs=args.fine_tune_epochs,
+        device=args.device,
     )
