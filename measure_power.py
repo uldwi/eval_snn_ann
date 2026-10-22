@@ -377,6 +377,7 @@ def measure_triggered(
     collected_voltage = []
     last_processed_id = None
     measuring = False
+    last_gpi_value = 0  # Vorheriger Triggersignal-Zustand (LOW=0, HIGH=1), für Edge-Detektion über Chunks hinweg
     t_wait_start = time.time()
     t_measure_start = None
 
@@ -386,7 +387,7 @@ def measure_triggered(
             if not measuring:
                 if timeout > 0 and (now - t_wait_start) > timeout:
                     raise TimeoutError(
-                        f"Zeitueberschreitung: Kein Start-Triggersignal (HIGH) an {channel_label} innerhalb von {timeout:.1f} s empfangen."
+                        f"Zeitueberschreitung: Kein Rising Edge (LOW→HIGH) an {channel_label} innerhalb von {timeout:.1f} s empfangen."
                     )
             else:
                 if max_duration > 0 and (now - t_measure_start) > max_duration:
@@ -423,23 +424,34 @@ def measure_triggered(
             last_processed_id = s2
 
             if not measuring:
-                # Suche nach steigender Flanke (HIGH)
-                high_indices = np.where(gpi_chunk == 1)[0]
-                if len(high_indices) == 0:
+                # Edge-Detektion: Suchen den ersten Übergang LOW(0) -> HIGH(1).
+                # Beruecksichtigt den vorherigen Zustand (last_gpi_value), damit ein Edge,
+                # der genau an der Chunk-Grenze liegt, nicht verloren geht.
+                rising_edge_idx = None
+                prev = last_gpi_value
+                for i in range(len(gpi_chunk)):
+                    if prev == 0 and gpi_chunk[i] == 1:
+                        rising_edge_idx = i
+                        break
+                    prev = gpi_chunk[i]
+
+                if rising_edge_idx is None:
+                    # Kein Rising Edge in diesem Chunk -> aktuellen Zustand merken und weiter warten
+                    last_gpi_value = gpi_chunk[-1] if len(gpi_chunk) > 0 else last_gpi_value
                     continue
 
-                first_high = high_indices[0]
+                first_high = rising_edge_idx
                 measuring = True
                 t_measure_start = time.time()
-                print(f"\n[Trigger] >>> Start-Signal erkannt ({channel_label} = HIGH)! Messung laeuft... <<<")
+                print(f"\n[Trigger] >>> Rising Edge erkannt ({channel_label} LOW->HIGH)! Messung gestartet. <<<")
 
-                # Prüfen, ob Signal bereits im selben Chunk wieder auf LOW gefallen ist
-                low_indices = np.where(gpi_chunk[first_high:] == 0)[0]
+                # Erfasse ab dem Rising Edge bis zum Ende des Chunks (oder bis zum LOW im selben Chunk)
+                low_indices = np.where(gpi_chunk[first_high + 1:] == 0)[0]
                 if len(low_indices) == 0:
                     collected_current.append(cur_chunk[first_high:])
                     collected_voltage.append(vol_chunk[first_high:])
                 else:
-                    first_low = first_high + low_indices[0]
+                    first_low = first_high + 1 + low_indices[0]
                     collected_current.append(cur_chunk[first_high:first_low])
                     collected_voltage.append(vol_chunk[first_high:first_low])
                     print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
