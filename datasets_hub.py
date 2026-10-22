@@ -619,6 +619,15 @@ def get_dataset(
 
     os.makedirs(data_dir, exist_ok=True)
 
+    # Falls Daten lokal bereits vorhanden, Download überspringen (z. B. ohne Internetzugang auf HPC)
+    if download:
+        if key == "mnist":
+            download = not os.path.isfile(os.path.join(data_dir, "MNIST", "raw", "train-images-idx3-ubyte"))
+        elif key == "fashion_mnist":
+            download = not os.path.isfile(os.path.join(data_dir, "FashionMNIST", "raw", "train-images-idx3-ubyte"))
+        elif key == "cifar10":
+            download = not os.path.isdir(os.path.join(data_dir, "cifar-10-batches-py")) and not os.path.isdir(os.path.join(data_dir, "cifar10"))
+
     # 1. Vision: MNIST
     if key == "mnist":
         transform = transforms.Compose([
