@@ -353,13 +353,13 @@ def measure_triggered(
     gpi_field = "gpi1" if pin.lower() in ("in1", "gpi1", "1") else "gpi0"
     channel_label = "IN1 (ESP32-C6 Pin 4)" if gpi_field == "gpi1" else "IN0"
 
-    # Berechne maximal zulässige Messdauer während HIGH aktiv ist (z. B. 600 s oder dynamisch nach Anzahl Samples)
+    # Berechne maximal zulässige Messdauer während HIGH aktiv ist (dynamisch nach Anzahl Samples)
     if max_duration is None:
-        max_duration = max(600.0, (num_inferences or 50) * 15.0)
+        max_duration = max(60.0, (num_inferences or 50) * 2.0)
 
-    # Puffergröße sicherstellen (mindestens max_duration + Puffer)
+    # Puffergröße begrenzen, um übermäßigen Speicherverbrauch zu vermeiden
     try:
-        device.parameter_set("buffer_duration", min(600, int(max_duration) + 60))
+        device.parameter_set("buffer_duration", min(30, int(max_duration) + 10))
     except Exception:
         pass
 
@@ -448,24 +448,24 @@ def measure_triggered(
                 # Erfasse ab dem Rising Edge bis zum Ende des Chunks (oder bis zum LOW im selben Chunk)
                 low_indices = np.where(gpi_chunk[first_high + 1:] == 0)[0]
                 if len(low_indices) == 0:
-                    collected_current.append(cur_chunk[first_high:])
-                    collected_voltage.append(vol_chunk[first_high:])
+                    collected_current.append(cur_chunk[first_high:].astype(np.float32))
+                    collected_voltage.append(vol_chunk[first_high:].astype(np.float32))
                 else:
                     first_low = first_high + 1 + low_indices[0]
-                    collected_current.append(cur_chunk[first_high:first_low])
-                    collected_voltage.append(vol_chunk[first_high:first_low])
+                    collected_current.append(cur_chunk[first_high:first_low].astype(np.float32))
+                    collected_voltage.append(vol_chunk[first_high:first_low].astype(np.float32))
                     print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
                     break
             else:
                 # Messung laeuft: Suche nach fallender Flanke (LOW)
                 low_indices = np.where(gpi_chunk == 0)[0]
                 if len(low_indices) == 0:
-                    collected_current.append(cur_chunk)
-                    collected_voltage.append(vol_chunk)
+                    collected_current.append(cur_chunk.astype(np.float32))
+                    collected_voltage.append(vol_chunk.astype(np.float32))
                 else:
                     first_low = low_indices[0]
-                    collected_current.append(cur_chunk[:first_low])
-                    collected_voltage.append(vol_chunk[:first_low])
+                    collected_current.append(cur_chunk[:first_low].astype(np.float32))
+                    collected_voltage.append(vol_chunk[:first_low].astype(np.float32))
                     print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
                     break
 
@@ -821,10 +821,12 @@ def main():
                 export_model_entry_to_main(model_entry, output_dir="main")
 
             # 2. ESP32 bei Bedarf bauen und flashen
+            flash_failed = False
             if args.flash and args.duration is None:
                 flash_ok = flash_esp32(port=args.port, build=not args.skip_build)
                 if not flash_ok:
-                    print(f"[ESP-IDF] Warnung: Flashen für Modell '{model_name}' war nicht erfolgreich.", file=sys.stderr)
+                    print(f"[ESP-IDF] Warnung: Flashen für Modell '{model_name}' war nicht erfolgreich. Messung wird übersprungen.", file=sys.stderr)
+                    flash_failed = True
                 else:
                     if args.wait_unplug:
                         print("\n" + "=" * 65)
@@ -838,6 +840,9 @@ def main():
                         except (KeyboardInterrupt, EOFError):
                             print("\nMessung durch Benutzer abgebrochen.")
                             break
+
+            if flash_failed:
+                continue
 
             # 3. Joulescope-Messung durchführen
             metrics = {}
