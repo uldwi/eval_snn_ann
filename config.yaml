@@ -146,8 +146,11 @@ joulescope:
   # Joulescope digitaler Eingangskanal ("in1" oder "in2")
   trigger_pin: "in1"
 
-  # Timeout in Sekunden beim Warten auf das Triggersignal
-  timeout: 60.0
+  # Timeout in Sekunden beim Warten auf das Triggersignal (Warten auf Start)
+  timeout: 6000.0
+
+  # Maximale Messdauer in Sekunden waehrend der Inferenz (Warten auf Inferenzende)
+  max_duration: 6000.0
 
 # ---------------------------------------------------------------------
 # Liste der Modelle für sequentielle Messungen
@@ -332,9 +335,9 @@ models:
   - name: "SNN_CIFAR10_LIF_Conv32_64_128_TTFS_Reg"
     type: "snn"
     dataset: "cifar10"
-    neuron_type: "lif"
+    neuron_type: "if"
     encoding_type: "ttfs"
-    num_steps: 50
+    num_steps: 20
     beta: 0.90
     threshold: 1.0
     conv_layers:
@@ -388,7 +391,7 @@ models:
   - name: "SNN_KWS_LIF_Conv16_32_64_TTFS"
     type: "snn"
     dataset: "speech_commands"
-    neuron_type: "lif"
+    neuron_type: "if"
     encoding_type: "ttfs"
     num_steps: 10
     beta: 0.9
@@ -438,7 +441,7 @@ models:
   - name: "SNN_EEG_LIF_Conv16_32_32_TTFS"
     type: "snn"
     dataset: "eeg_data"
-    neuron_type: "lif"
+    neuron_type: "if"
     encoding_type: "ttfs"
     num_steps: 10
     beta: 0.9
@@ -477,8 +480,8 @@ models:
   - name: "SNN_EEGEye_LIF_64_32_16_Direct"
     type: "snn"
     dataset: "eeg_eye_state"
-    neuron_type: "lif"
-    encoding_type: "direct"
+    neuron_type: "if"
+    encoding_type: "ttfs"
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -505,7 +508,7 @@ models:
   - name: "SNN_ECG_LIF_128_64_32_TTFS"
     type: "snn"
     dataset: "ecg_data"
-    neuron_type: "lif"
+    neuron_type: "if"
     encoding_type: "ttfs"
     num_steps: 10
     beta: 0.9
@@ -533,8 +536,8 @@ models:
   - name: "SNN_HAR_LIF_128_64_32_Direct"
     type: "snn"
     dataset: "har_time_series"
-    neuron_type: "lif"
-    encoding_type: "direct"
+    neuron_type: "if"
+    encoding_type: "ttfs"
     num_steps: 10
     beta: 0.9
     threshold: 1.0
@@ -561,7 +564,7 @@ models:
   - name: "SNN_TimeSeries_LIF_96_48_TTFS"
     type: "snn"
     dataset: "synthetic_time_series"
-    neuron_type: "lif"
+    neuron_type: "if"
     encoding_type: "ttfs"
     num_steps: 10
     beta: 0.9

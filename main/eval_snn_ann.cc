@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
@@ -13,10 +14,12 @@
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 
+#ifndef HOST_TEST
 // TensorFlow Lite Micro (für ANN)
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+#endif
 
 #include "model_data.h"
 #include "mnist_test_data.h"
@@ -26,7 +29,7 @@
 static const char *TAG = "EVAL_SNN_ANN";
 
 // Tensor Arena für TensorFlow Lite Micro (nur bei ANN)
-constexpr size_t kTensorArenaSize = 128 * 1024;
+constexpr size_t kTensorArenaSize = 192 * 1024;
 static uint8_t *tensor_arena = nullptr;
 
 static int argmax_float(const float *arr, int len) {
@@ -81,7 +84,7 @@ static int argmax_float(const float *arr, int len) {
 #define SNN_SEL_CONV_ACC32 0
 #endif
 #ifndef SNN_SEL_LAZY_DECAY
-#define SNN_SEL_LAZY_DECAY 1
+#define SNN_SEL_LAZY_DECAY 0
 #endif
 #ifndef SNN_SEL_DENSE_REF
 #define SNN_SEL_DENSE_REF 0
@@ -155,10 +158,10 @@ static uint16_t *s_snn_fc_events[SNN_MAX_FC_LAYERS] = {nullptr};
 // fuer NHWC sowie fuer Bias- und Skalierungszugriffe.
 typedef struct {
     uint32_t *off;      // Gruppenanfang, Laenge groups + 1
-    uint16_t *delta;    // NCHW-Offset
     uint8_t  *oc;       // Output-Channel des Eintrags
     float    *wf;       // FP32-Gewichte
     int8_t   *wq;       // INT8-Gewichte (pro Output-Channel skaliert)
+    bool      is_dense; // Direkt aus Flash
 } sparse_tbl_t;
 
 static sparse_tbl_t s_tbl[SNN_MAX_CONV_LAYERS];
@@ -210,7 +213,7 @@ static int s_lazy_active = SNN_CFG_LAZY;
 // s_last_t wird auch von der beta==1-Variante gebraucht: dort markiert es
 // die im Scatter beruehrten Neuronen (fuer die Channels mit Bias < 0).
 static bool need_stamp_tbl(void) {
-    return (SNN_CFG_LAZY != 0) || (g_snn_config.beta == 1.0f);
+    return (SNN_CFG_LAZY != 0);
 }
 #if SNN_SEL_RUNTIME
 #define LAZY_ON  (s_lazy_active)
@@ -312,8 +315,11 @@ static bool build_sparse_tables(void) {
         const int row_len = groups;
 
         sparse_tbl_t &tb = s_tbl[l];
-        uint32_t *off = (uint32_t*)heap_caps_calloc(groups + 1, sizeof(uint32_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        if (!off) return false;
+        tb.off = nullptr;
+        tb.oc = nullptr;
+        tb.wf = nullptr;
+        tb.wq = nullptr;
+        tb.is_dense = false;
 
         // Erstlauf: jede Output-Zeile quantisieren, damit durch Quantisierung
         // exakt genullte Gewichte ebenfalls aus der Sparse-Liste fallen.
@@ -322,7 +328,11 @@ static bool build_sparse_tables(void) {
         if (need_q) {
             wsc = (float*)heap_caps_calloc((size_t)g.out_c, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
             allq = (int8_t*)heap_caps_calloc((size_t)g.out_c * row_len, sizeof(int8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-            if (!wsc || !allq) return false;
+            if (!wsc || !allq) {
+                if (wsc) free(wsc);
+                if (allq) free(allq);
+                return false;
+            }
             for (int oc = 0; oc < g.out_c; ++oc) {
                 (void)quantize_row(w + (size_t)oc * g.w_oc_stride, row_len,
                                    allq + (size_t)oc * row_len, &wsc[oc]);
@@ -331,43 +341,74 @@ static bool build_sparse_tables(void) {
 
         uint32_t total = 0;
         for (int gi = 0; gi < groups; ++gi) {
-            off[gi] = total;
             for (int oc = 0; oc < g.out_c; ++oc) {
                 const bool keep = need_q ? (allq[(size_t)oc * row_len + gi] != 0)
                                          : (w[(size_t)oc * g.w_oc_stride + gi] != 0.0f);
                 if (keep) ++total;
             }
         }
-        off[groups] = total;
 
-        const uint32_t alloc_n = (total > 0) ? total : 1;
-        uint8_t *occ = (uint8_t*)heap_caps_calloc(alloc_n, sizeof(uint8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        uint16_t *delta = (uint16_t*)heap_caps_calloc(alloc_n, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        float *nzw = need_f ? (float*)heap_caps_calloc(alloc_n, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) : nullptr;
-        int8_t *nzwq = need_q ? (int8_t*)heap_caps_calloc(alloc_n, sizeof(int8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) : nullptr;
-        if (!occ || !delta || (need_f && !nzw) || (need_q && !nzwq)) return false;
+        // Wenn unquantisiert und vollbesetzt: Direkt aus Flash lesen, spart Allokationen im RAM.
+        if (need_f && total == (uint32_t)(groups * g.out_c)) {
+            tb.is_dense = true;
+        } else {
+            uint32_t *off = (uint32_t*)heap_caps_calloc(groups + 1, sizeof(uint32_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+            if (!off) {
+                if (allq) free(allq);
+                if (wsc) free(wsc);
+                return false;
+            }
 
-        uint32_t n = 0;
-        for (int gi = 0; gi < groups; ++gi) {
-            for (int oc = 0; oc < g.out_c; ++oc) {
-                const float val = w[(size_t)oc * g.w_oc_stride + gi];
-                const bool keep = need_q ? (allq[(size_t)oc * row_len + gi] != 0) : (val != 0.0f);
-                if (keep) {
-                    occ[n] = (uint8_t)oc;
-                    delta[n] = (uint16_t)(oc * g.oc_plane);
-                    if (need_f) nzw[n] = val;
-                    if (need_q) nzwq[n] = allq[(size_t)oc * row_len + gi];
-                    ++n;
+            uint32_t cur = 0;
+            for (int gi = 0; gi < groups; ++gi) {
+                off[gi] = cur;
+                for (int oc = 0; oc < g.out_c; ++oc) {
+                    const bool keep = need_q ? (allq[(size_t)oc * row_len + gi] != 0)
+                                             : (w[(size_t)oc * g.w_oc_stride + gi] != 0.0f);
+                    if (keep) ++cur;
                 }
             }
+            off[groups] = cur;
+
+            const uint32_t alloc_n = (total > 0) ? total : 1;
+            uint8_t *occ = (uint8_t*)heap_caps_calloc(alloc_n, sizeof(uint8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+            float *nzw = need_f ? (float*)heap_caps_calloc(alloc_n, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) : nullptr;
+            int8_t *nzwq = need_q ? (int8_t*)heap_caps_calloc(alloc_n, sizeof(int8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL) : nullptr;
+            if (!occ || (need_f && !nzw) || (need_q && !nzwq)) {
+                if (off) free(off);
+                if (occ) free(occ);
+                if (nzw) free(nzw);
+                if (nzwq) free(nzwq);
+                if (allq) free(allq);
+                if (wsc) free(wsc);
+                return false;
+            }
+
+            uint32_t n = 0;
+            for (int gi = 0; gi < groups; ++gi) {
+                for (int oc = 0; oc < g.out_c; ++oc) {
+                    const float val = w[(size_t)oc * g.w_oc_stride + gi];
+                    const bool keep = need_q ? (allq[(size_t)oc * row_len + gi] != 0) : (val != 0.0f);
+                    if (keep) {
+                        occ[n] = (uint8_t)oc;
+                        if (need_f) nzw[n] = val;
+                        if (need_q) nzwq[n] = allq[(size_t)oc * row_len + gi];
+                        ++n;
+                    }
+                }
+            }
+
+            tb.off = off;
+            tb.oc = occ;
+            tb.wf = nzw;
+            tb.wq = nzwq;
         }
 
+        if (allq) {
+            free(allq);
+            allq = nullptr;
+        }
 
-        tb.off = off;
-        tb.delta = delta;
-        tb.oc = occ;
-        tb.wf = nzw;
-        tb.wq = nzwq;
         s_wsc_conv[l] = wsc;
         if (wsc) {
             float *wsc_in = (float*)heap_caps_calloc((size_t)g.out_c, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
@@ -476,6 +517,14 @@ static bool init_snn_buffers(void) {
     const snn_config_t &cfg = g_snn_config;
     init_geometry();
 
+    ESP_LOGI(TAG, "SNN-Init: input=%d, conv_layers=%d, flat=%d, fc=%d->%d->%d, steps=%d",
+             cfg.input_size, cfg.num_conv_layers, cfg.flat_size,
+             cfg.fc_layer_sizes[0], cfg.fc_layer_sizes[1], cfg.fc_layer_sizes[2],
+             cfg.num_steps);
+    ESP_LOGI(TAG, "SNN-Init: freier Heap vor Allokation: %u Bytes (min: %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+
 #if SNN_SEL_RUNTIME
     s_conv_variant = s_opt_nhwc | (s_opt_convq << 1) | (s_opt_acc32 << 2) | (s_opt_fcq << 3);
     s_lazy_active = s_opt_lazy;
@@ -490,52 +539,100 @@ static bool init_snn_buffers(void) {
         return false;
     }
     s_snn_in_events = (uint16_t*)heap_caps_calloc(in_size, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    if (!s_snn_in_events) return false;
+    if (!s_snn_in_events) { ESP_LOGE(TAG, "FAIL: s_snn_in_events (%d B)", in_size * 2); return false; }
 
+    int max_neurons_even = 0, max_neurons_odd = 0;
     int max_pool = 0;
     for (int l = 0; l < cfg.num_conv_layers; ++l) {
         const snn_geom_t &g = s_geom[l];
+        ESP_LOGI(TAG, "Conv%d: %dx%dx%d->%dx%dx%d, neurons=%d, pool=%d",
+                 l, g.in_c, g.in_h, g.in_w, g.out_c, g.out_h, g.out_w, g.n_neurons, g.n_pool);
         if (g.n_neurons > 65535 || g.n_pool > 65535) {
             ESP_LOGE(TAG, "Conv-Layer %d ueberschreitet das 16-Bit-Eventformat!", l);
             return false;
         }
         s_snn_conv_mem[l] = (float*)heap_caps_calloc(g.n_neurons, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        s_snn_conv_events[l] = (uint16_t*)heap_caps_calloc(g.n_neurons, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        if (!s_snn_conv_mem[l] || !s_snn_conv_events[l]) return false;
+        if (!s_snn_conv_mem[l]) { ESP_LOGE(TAG, "FAIL: conv_mem[%d] (%d B)", l, g.n_neurons * 4); return false; }
 
         if (need_stamp_tbl()) {
             s_last_t[l] = (uint8_t*)heap_caps_calloc(g.n_neurons, sizeof(uint8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-            if (!s_last_t[l]) return false;
+            if (!s_last_t[l]) { ESP_LOGE(TAG, "FAIL: last_t[%d] (%d B)", l, g.n_neurons); return false; }
         }
         if (ALLOC_ACC32) {
             s_conv_acc[l] = (int32_t*)heap_caps_calloc(g.n_neurons, sizeof(int32_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-            if (!s_conv_acc[l]) return false;
+            if (!s_conv_acc[l]) { ESP_LOGE(TAG, "FAIL: conv_acc[%d] (%d B)", l, g.n_neurons * 4); return false; }
         }
 
-        if (g.has_pool) {
-            s_snn_conv_pool_events[l] = (uint16_t*)heap_caps_calloc(g.n_pool, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-            if (!s_snn_conv_pool_events[l]) return false;
-            if (g.n_pool > max_pool) max_pool = g.n_pool;
+        if (l % 2 == 0) {
+            if (g.n_neurons > max_neurons_even) max_neurons_even = g.n_neurons;
+        } else {
+            if (g.n_neurons > max_neurons_odd) max_neurons_odd = g.n_neurons;
+        }
+
+        if (g.has_pool && g.n_pool > max_pool) {
+            max_pool = g.n_pool;
         }
         const int in_size = g.in_c * g.in_h * g.in_w;
         if (in_size > s_max_in_ev) s_max_in_ev = in_size;
     }
-    if (s_max_in_ev > 0) {
+
+    if (max_neurons_even > 0) {
+        uint16_t *buf_even = (uint16_t*)heap_caps_calloc(max_neurons_even, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (!buf_even) { ESP_LOGE(TAG, "FAIL: conv_events even (%d B)", max_neurons_even * 2); return false; }
+        for (int l = 0; l < cfg.num_conv_layers; l += 2) {
+            s_snn_conv_events[l] = buf_even;
+        }
+    }
+    if (max_neurons_odd > 0) {
+        uint16_t *buf_odd = (uint16_t*)heap_caps_calloc(max_neurons_odd, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (!buf_odd) { ESP_LOGE(TAG, "FAIL: conv_events odd (%d B)", max_neurons_odd * 2); return false; }
+        for (int l = 1; l < cfg.num_conv_layers; l += 2) {
+            s_snn_conv_events[l] = buf_odd;
+        }
+    }
+
+    uint16_t *pool_buf_0 = nullptr;
+    uint16_t *pool_buf_1 = nullptr;
+    if (max_pool > 0) {
+        pool_buf_0 = (uint16_t*)heap_caps_calloc(max_pool, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        pool_buf_1 = (uint16_t*)heap_caps_calloc(max_pool, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        if (!pool_buf_0 || !pool_buf_1) { ESP_LOGE(TAG, "FAIL: pool_buf (%d B)", max_pool * 2); return false; }
+        for (int l = 0; l < cfg.num_conv_layers; ++l) {
+            if (s_geom[l].has_pool) {
+                s_snn_conv_pool_events[l] = (l % 2 == 0) ? pool_buf_0 : pool_buf_1;
+            }
+        }
+    }
+
+    const bool need_outst = (SNN_CFG_NHWC == 0) && (g_snn_config.beta == 1.0f);
+#if SNN_SEL_RUNTIME
+    const bool alloc_outst = true;
+#else
+    /* OUTST needs BETA1=true, which requires LAZY_ON && !NHWC && beta==1.
+     * Without lazy decay, BETA1 is always false, so OUTST buffers are wasted. */
+    const bool alloc_outst = need_outst && LAZY_ON;
+#endif
+    if (alloc_outst && s_max_in_ev > 0) {
         s_ev_bucket = (uint16_t*)heap_caps_calloc((size_t)s_max_in_ev, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
         s_ev_row    = (uint16_t*)heap_caps_calloc((size_t)s_max_in_ev, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
         s_ev_ofs    = (uint16_t*)heap_caps_calloc((size_t)s_max_in_ev, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
         s_ev_start  = (uint32_t*)heap_caps_calloc(68, sizeof(uint32_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        if (!s_ev_bucket || !s_ev_row || !s_ev_ofs || !s_ev_start) return false;
+        if (!s_ev_bucket || !s_ev_row || !s_ev_ofs || !s_ev_start) { ESP_LOGE(TAG, "FAIL: ev_bucket/row/ofs (%d B)", s_max_in_ev * 2); return false; }
     }
     if (max_pool > 0) {
         const size_t visited_size = (max_pool > 2048) ? (size_t)max_pool : 2048;
         s_snn_pool_visited = (uint8_t*)heap_caps_calloc(visited_size, sizeof(uint8_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        if (!s_snn_pool_visited) return false;
+        if (!s_snn_pool_visited) { ESP_LOGE(TAG, "FAIL: pool_visited (%d B)", (int)visited_size); return false; }
     }
 
     if (cfg.num_conv_layers > 0 && cfg.flat_size > 0 && cfg.flat_size <= 65535) {
-        s_snn_flat_events = (uint16_t*)heap_caps_calloc(cfg.flat_size, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-        if (!s_snn_flat_events) return false;
+        if (max_pool > 0 && cfg.flat_size <= max_pool) {
+            const int last_pool_buf_idx = (cfg.num_conv_layers - 1) % 2;
+            s_snn_flat_events = (last_pool_buf_idx == 0) ? pool_buf_1 : pool_buf_0;
+        } else {
+            s_snn_flat_events = (uint16_t*)heap_caps_calloc(cfg.flat_size, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+            if (!s_snn_flat_events) { ESP_LOGE(TAG, "FAIL: flat_events (%d B)", cfg.flat_size * 2); return false; }
+        }
     }
 
     const int num_fc = cfg.hidden_layers_count + 1;
@@ -755,9 +852,6 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
 
             for (int tap = 0; tap < k2; ++tap) {
                 const uint32_t gi = (uint32_t)(ic * k2 + tap);
-                const uint32_t s = off[gi];
-                const uint32_t e2 = off[gi + 1];
-                if (s == e2) continue;
 
                 // Gueltige Zielindizes der Events dieses Kanals einsammeln
                 int nv = 0;
@@ -767,27 +861,45 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
                 }
                 if (nv == 0) continue;
 
-                for (uint32_t n = s; n < e2; ++n) {
-                    const uint32_t obase = (uint32_t)occ[n] * (uint32_t)plane;
-                    if (QUANT) {
-                        const float wsc_oc = wsc[occ[n]];
-                        const int32_t q = nq[n];
+                if (tb.is_dense) {
+                    for (int oc = 0; oc < out_c; ++oc) {
+                        const uint32_t obase = (uint32_t)oc * (uint32_t)plane;
+                        const float w_val = g_snn_conv_weights[l][(size_t)oc * g.w_oc_stride + gi];
+                        if (w_val == 0.0f) continue;
                         for (int j = 0; j < nv; ++j) {
                             const uint32_t idx = obase + s_ev_ofs[j];
                             if (MARK) last[idx] = stamp;
-                            if (ACC32) acc[idx] += q;
-                            else mem[idx] += (float)q * wsc_oc;
-                        }
-                    } else {
-                        const float w = nw[n];
-                        for (int j = 0; j < nv; ++j) {
-                            const uint32_t idx = obase + s_ev_ofs[j];
-                            if (MARK) last[idx] = stamp;
-                            mem[idx] += w;
+                            mem[idx] += w_val;
                         }
                     }
+                    local_synops += (uint32_t)out_c * (uint32_t)nv;
+                } else {
+                    const uint32_t s = off[gi];
+                    const uint32_t e2 = off[gi + 1];
+                    if (s == e2) continue;
+
+                    for (uint32_t n = s; n < e2; ++n) {
+                        const uint32_t obase = (uint32_t)occ[n] * (uint32_t)plane;
+                        if (QUANT) {
+                            const float wsc_oc = wsc[occ[n]];
+                            const int32_t q = nq[n];
+                            for (int j = 0; j < nv; ++j) {
+                                const uint32_t idx = obase + s_ev_ofs[j];
+                                if (MARK) last[idx] = stamp;
+                                if (ACC32) acc[idx] += q;
+                                else mem[idx] += (float)q * wsc_oc;
+                            }
+                        } else {
+                            const float w = nw[n];
+                            for (int j = 0; j < nv; ++j) {
+                                const uint32_t idx = obase + s_ev_ofs[j];
+                                if (MARK) last[idx] = stamp;
+                                mem[idx] += w;
+                            }
+                        }
+                    }
+                    local_synops += (e2 - s) * (uint32_t)nv;
                 }
-                local_synops += (e2 - s) * (uint32_t)nv;
             }
         }
         if (synops) *synops += local_synops;
@@ -796,7 +908,6 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
 #endif
     } else if (n_ev > 0) {
         const uint32_t *off = tb.off;
-        const uint16_t *delta = tb.delta;
         const uint8_t *occ = tb.oc;
         const float *nw = tb.wf;
         const int8_t *nq = tb.wq;
@@ -839,34 +950,55 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
                 if (base == 0xFFFFu) continue;
 
                 const uint32_t gi = gbase + tap;
-                const uint32_t s = off[gi];
-                const uint32_t e2 = off[gi + 1];
-                for (uint32_t n = s; n < e2; ++n) {
-                                const uint32_t idx = base + (NHWC ? (uint32_t)occ[n] : (uint32_t)delta[n]);
-                    if (MARK) last[idx] = stamp;
-                    if (BETA1) {
-                        // Der Bias steckt bereits in mem (als mu), es gibt
-                        // nichts nachzufuehren.
-                        if (QUANT) {
-                            const int32_t prod = (int32_t)nq[n] * (int32_t)iscale;
-                            if (ACC32) {
-                                acc[idx] += prod;
-                            } else {
-                                mem[idx] += (float)prod * wsc[occ[n]];
-                            }
-                        } else {
-                            mem[idx] += unit_scale ? nw[n] : nw[n] * scale_src[flat];
+                if (tb.is_dense) {
+                    for (int oc = 0; oc < out_c; ++oc) {
+                        const float w_val = g_snn_conv_weights[l][(size_t)oc * g.w_oc_stride + gi];
+                        if (w_val == 0.0f) continue;
+                        const uint32_t idx = base + (NHWC ? (uint32_t)oc : (uint32_t)oc * (uint32_t)plane);
+                        if (MARK) last[idx] = stamp;
+                        if (BETA1) {
+                            mem[idx] += unit_scale ? w_val : w_val * scale_src[flat];
+                            continue;
                         }
-                        continue;
+                        if (TRACK) {
+                            const int dt = stamp - (int)last[idx];
+                            if (dt) {
+                                mem[idx] = mem[idx] * pb[dt] + b[oc] * bs[dt];
+                                last[idx] = stamp;
+                            }
+                        }
+                        mem[idx] += unit_scale ? w_val : w_val * scale_src[flat];
                     }
-                    const int oc = (QUANT || LAZY) ? occ[n] : 0;
-                    if (TRACK) {
-                        // dt == 0 ist der Normalfall: dasselbe Neuron wird
-                        // im Zeitschritt von mehreren Kernelpositionen
-                        // erreicht, der Decay darf nur einmal greifen.
-                        const int dt = stamp - (int)last[idx];
-                        if (dt) {
-                            mem[idx] = mem[idx] * pb[dt] + b[oc] * bs[dt];
+                    local_synops += (uint32_t)out_c;
+                } else {
+                    const uint32_t s = off[gi];
+                    const uint32_t e2 = off[gi + 1];
+                    for (uint32_t n = s; n < e2; ++n) {
+                        const uint32_t idx = base + (NHWC ? (uint32_t)occ[n] : (uint32_t)occ[n] * (uint32_t)plane);
+                        if (MARK) last[idx] = stamp;
+                        if (BETA1) {
+                            // Der Bias steckt bereits in mem (als mu), es gibt
+                            // nichts nachzufuehren.
+                            if (QUANT) {
+                                const int32_t prod = (int32_t)nq[n] * (int32_t)iscale;
+                                if (ACC32) {
+                                    acc[idx] += prod;
+                                } else {
+                                    mem[idx] += (float)prod * wsc[occ[n]];
+                                }
+                            } else {
+                                mem[idx] += unit_scale ? nw[n] : nw[n] * scale_src[flat];
+                            }
+                            continue;
+                        }
+                        const int oc = (QUANT || LAZY) ? occ[n] : 0;
+                        if (TRACK) {
+                            // dt == 0 ist der Normalfall: dasselbe Neuron wird
+                            // im Zeitschritt von mehreren Kernelpositionen
+                            // erreicht, der Decay darf nur einmal greifen.
+                            const int dt = stamp - (int)last[idx];
+                            if (dt) {
+                                mem[idx] = mem[idx] * pb[dt] + b[oc] * bs[dt];
                                 last[idx] = stamp;
                             }
                         }
@@ -880,8 +1012,9 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
                         } else {
                             mem[idx] += unit_scale ? nw[n] : nw[n] * scale_src[flat];
                         }
+                    }
+                    local_synops += e2 - s;
                 }
-                local_synops += e2 - s;
             }
         }
         if (synops) *synops += local_synops;
@@ -1547,6 +1680,7 @@ extern "C" int snn_dense_ref_predict(const float *img, uint32_t *spk) {
 }
 #endif
 
+#ifndef HOST_TEST
 extern "C" void app_main(void)
 {
 #ifndef DATASET_NAME
@@ -1699,6 +1833,8 @@ extern "C" void app_main(void)
             if (predicted == mnist_test_labels[i]) {
                 correct_count++;
             }
+            // Yield CPU to prevent watchdog timeout on long inferences
+            vTaskDelay(0);
         }
 
         int64_t end_time = esp_timer_get_time();
@@ -1765,3 +1901,4 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
+#endif

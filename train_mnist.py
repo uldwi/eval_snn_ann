@@ -112,6 +112,7 @@ DEFAULT_CONFIG = {
     "joulescope": {
         "trigger_pin": "in1",
         "timeout": 60.0,
+        "max_duration": None,
     },
     "model": {
         "name": "ANN_64",

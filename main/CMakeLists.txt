@@ -46,9 +46,9 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
 # aus. Die uebrigen Schalter bleiben fuer den Vergleich erhalten.
 set(SNN_SEL_LAYOUT_NHWC 0 CACHE STRING "NHWC-Layout")
 set(SNN_SEL_INT8        0 CACHE STRING "INT8-Conv-Gewichte")
-set(SNN_SEL_INT8_FC     1 CACHE STRING "INT8-FC-Gewichte")
+set(SNN_SEL_INT8_FC     0 CACHE STRING "INT8-FC-Gewichte")
 set(SNN_SEL_CONV_ACC32  0 CACHE STRING "INT32-Akkumulator je Conv-Neuron")
-set(SNN_SEL_LAZY_DECAY  1 CACHE STRING "Lazy Decay")
+set(SNN_SEL_LAZY_DECAY  0 CACHE STRING "Lazy Decay")
 set(SNN_SEL_DENSE_REF   0 CACHE STRING "Samples im Selbsttest dichter Referenzpfad")
 set(SNN_PROFILE         0 CACHE STRING "Zeitaufschluesselung")
 

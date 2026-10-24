@@ -14,10 +14,16 @@ Installation:    pip install -r requirements.txt
 """
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
 import time
+
+# Logging für Joulescope/jsdrv komplett deaktivieren (OFF), um Mutex-Deadlocks im C-Backend (posix.c) zu verhindern
+logging.getLogger("jsdrv").setLevel(logging.CRITICAL)
+logging.getLogger("pyjoulescope_driver").setLevel(logging.CRITICAL)
+logging.getLogger("joulescope").setLevel(logging.CRITICAL)
 
 # Fallback für virtuelle Umgebungen
 try:
@@ -34,6 +40,15 @@ except ImportError:
         print("Fehler: Das 'joulescope'- oder 'numpy'-Paket wurde nicht gefunden.", file=sys.stderr)
         print("Bitte installieren mit: pip install -r requirements.txt", file=sys.stderr)
         sys.exit(1)
+
+# Treiber-Level des Joulescope C-Backends vollständig stummschalten (OFF)
+try:
+    from joulescope.v1.driver import DriverWrapper
+    _wrapper = DriverWrapper()
+    if hasattr(_wrapper, "driver") and _wrapper.driver is not None:
+        _wrapper.driver.log_level = "OFF"
+except Exception:
+    pass
 
 from train_mnist import (
     load_config,
@@ -95,6 +110,164 @@ def flash_esp32(port: str = None, project_dir: str = None, build: bool = True) -
     return True
 
 
+class StreamingMetricsAccumulator:
+    """
+    Sammelt elektrische Messwerte (Strom, Spannung, Leistung) im Streaming-Verfahren (Online-Berechnung),
+    ohne Rohdatenarrays unbegrenzt im Arbeitsspeicher abzulegen (O(1) RAM-Verbrauch).
+    Verhindert Systemüberlastung und OOM-Abstürze bei langen Inferenzreihen.
+    """
+    def __init__(self, sampling_freq: float, num_inferences: int = None, title: str = "MESSERGEBNISSE"):
+        self.sampling_freq = float(sampling_freq)
+        self.num_inferences = num_inferences
+        self.title = title
+        self.num_samples = 0
+        self.sum_voltage = 0.0
+        self.min_voltage = float("inf")
+        self.max_voltage = float("-inf")
+        self.sum_current = 0.0
+        self.min_current = float("inf")
+        self.max_current = float("-inf")
+        self.sum_power = 0.0
+        self.min_power = float("inf")
+        self.max_power = float("-inf")
+
+    def update(self, current_chunk: np.ndarray, voltage_chunk: np.ndarray):
+        if len(current_chunk) == 0:
+            return
+        n = len(current_chunk)
+        self.num_samples += n
+
+        cur = current_chunk.astype(np.float64, copy=False)
+        vol = voltage_chunk.astype(np.float64, copy=False)
+        pwr = cur * vol
+
+        self.sum_voltage += float(np.sum(vol))
+        self.sum_current += float(np.sum(cur))
+        self.sum_power += float(np.sum(pwr))
+
+        c_min = float(np.min(cur))
+        c_max = float(np.max(cur))
+        v_min = float(np.min(vol))
+        v_max = float(np.max(vol))
+        p_min = float(np.min(pwr))
+        p_max = float(np.max(pwr))
+
+        if c_min < self.min_current:
+            self.min_current = c_min
+        if c_max > self.max_current:
+            self.max_current = c_max
+        if v_min < self.min_voltage:
+            self.min_voltage = v_min
+        if v_max > self.max_voltage:
+            self.max_voltage = v_max
+        if p_min < self.min_power:
+            self.min_power = p_min
+        if p_max > self.max_power:
+            self.max_power = p_max
+
+    def compute_and_display(self) -> dict:
+        if self.num_samples == 0:
+            print("Keine Messwerte erfasst.", file=sys.stderr)
+            return {}
+
+        dt = 1.0 / self.sampling_freq
+        duration = self.num_samples * dt
+
+        # Energie in Joule (Ws), mJ, uJ und mWh
+        energy_j = self.sum_power * dt
+        energy_mj = energy_j * 1000.0
+        energy_uj = energy_j * 1e6
+        energy_mwh = (energy_j / 3600.0) * 1000.0
+
+        # Ladung in Coulomb (As), mAh und uAh
+        charge_c = self.sum_current * dt
+        charge_mah = (charge_c / 3600.0) * 1000.0
+        charge_uah = charge_mah * 1000.0
+
+        avg_voltage = self.sum_voltage / self.num_samples
+        min_voltage = self.min_voltage
+        max_voltage = self.max_voltage
+
+        avg_current = self.sum_current / self.num_samples
+        min_current = self.min_current
+        max_current = self.max_current
+
+        avg_power = self.sum_power / self.num_samples
+        min_power = self.min_power
+        max_power = self.max_power
+
+        print("\n" + "=" * 65)
+        print(f"             {self.title}")
+        print("=" * 65)
+        if duration < 1.0:
+            print(f"Dauer der Inferenzphase: {duration * 1000:.2f} ms ({duration:.6f} s)")
+        else:
+            print(f"Dauer der Inferenzphase: {duration:.4f} s")
+        print(f"Abtastrate:              {self.sampling_freq / 1e6:.2f} MSPS ({self.num_samples:,} Samples)")
+        print("-" * 65)
+        print(f"Spannung (Durchschnitt): {avg_voltage:.4f} V   [min: {min_voltage:.4f} V, max: {max_voltage:.4f} V]")
+        print(f"Strom    (Durchschnitt): {avg_current * 1000:.3f} mA ({avg_current:.6f} A)")
+        print(f"         [min: {min_current * 1000:.3f} mA, max: {max_current * 1000:.3f} mA]")
+        print(f"Leistung (Durchschnitt): {avg_power * 1000:.3f} mW ({avg_power:.6f} W)")
+        print(f"         [min: {min_power * 1000:.3f} mW, max: {max_power * 1000:.3f} mW]")
+        print("-" * 65)
+        print(f"Elektrische Ladung:      {charge_mah:.4f} mAh ({charge_uah:.2f} µAh / {charge_c:.6f} C)")
+        print(f"Energieverbrauch gesamt: {energy_j:.6f} J ({energy_mj:.3f} mJ / {energy_mwh:.6f} mWh)")
+
+        energy_per_inf_mj = None
+        energy_per_inf_uj = None
+        time_per_inf_ms = None
+        inferences_per_sec = None
+        charge_per_inf_uah = None
+
+        # Zusätzliche Metriken pro Inferenz, falls bekannt
+        if self.num_inferences and self.num_inferences > 0:
+            energy_per_inf_mj = energy_mj / self.num_inferences
+            energy_per_inf_uj = energy_uj / self.num_inferences
+            time_per_inf_ms = (duration * 1000.0) / self.num_inferences
+            inferences_per_sec = self.num_inferences / duration if duration > 0 else 0.0
+            charge_per_inf_uah = charge_uah / self.num_inferences
+
+            print("-" * 65)
+            print("          INFERENZ-METRIKEN (TensorFlow Lite Micro)")
+            print("-" * 65)
+            print(f"Anzahl Inferenzen:       {self.num_inferences}")
+            print(f"Zeit pro Inferenz:       {time_per_inf_ms:.3f} ms ({inferences_per_sec:.1f} Inferenzen/s)")
+            print(f"Energie pro Inferenz:    {energy_per_inf_mj:.4f} mJ ({energy_per_inf_uj:.2f} µJ)")
+            print(f"Ladung pro Inferenz:     {charge_per_inf_uah:.4f} µAh")
+        print("=" * 65 + "\n")
+
+        return {
+            "duration_s": duration,
+            "num_samples": self.num_samples,
+            "sampling_freq": self.sampling_freq,
+            "avg_voltage_v": avg_voltage,
+            "min_voltage_v": min_voltage,
+            "max_voltage_v": max_voltage,
+            "avg_current_a": avg_current,
+            "avg_current_ma": avg_current * 1000.0,
+            "min_current_ma": min_current * 1000.0,
+            "max_current_ma": max_current * 1000.0,
+            "avg_power_w": avg_power,
+            "avg_power_mw": avg_power * 1000.0,
+            "min_power_mw": min_power * 1000.0,
+            "max_power_mw": max_power * 1000.0,
+            "energy_j": energy_j,
+            "energy_mj": energy_mj,
+            "energy_uj": energy_uj,
+            "energy_mwh": energy_mwh,
+            "charge_c": charge_c,
+            "charge_mah": charge_mah,
+            "charge_uah": charge_uah,
+            "num_inferences": self.num_inferences,
+            "energy_per_inf_mj": energy_per_inf_mj,
+            "energy_per_inf_uj": energy_per_inf_uj,
+            "time_per_inf_ms": time_per_inf_ms,
+            "inferences_per_sec": inferences_per_sec,
+            "charge_per_inf_uah": charge_per_inf_uah,
+        }
+
+
 def display_results(
     current: np.ndarray,
     voltage: np.ndarray,
@@ -106,109 +279,13 @@ def display_results(
     Berechnet alle elektrischen Messgrößen, gibt sie formatiert auf stdout aus
     und gibt ein Dictionary mit allen berechneten Metriken zurück.
     """
-    if len(current) == 0:
-        print("Keine Messwerte erfasst.", file=sys.stderr)
-        return {}
-
-    num_samples = len(current)
-    dt = 1.0 / sampling_freq
-    duration = num_samples * dt
-
-    power = current * voltage
-
-    # Energie in Joule (Ws), mJ, uJ und mWh
-    energy_j = float(np.sum(power) * dt)
-    energy_mj = energy_j * 1000.0
-    energy_uj = energy_j * 1e6
-    energy_mwh = (energy_j / 3600.0) * 1000.0
-
-    # Ladung in Coulomb (As), mAh und uAh
-    charge_c = float(np.sum(current) * dt)
-    charge_mah = (charge_c / 3600.0) * 1000.0
-    charge_uah = charge_mah * 1000.0
-
-    avg_voltage = float(np.mean(voltage))
-    min_voltage = float(np.min(voltage))
-    max_voltage = float(np.max(voltage))
-
-    avg_current = float(np.mean(current))
-    min_current = float(np.min(current))
-    max_current = float(np.max(current))
-
-    avg_power = float(np.mean(power))
-    min_power = float(np.min(power))
-    max_power = float(np.max(power))
-
-    print("\n" + "=" * 65)
-    print(f"             {title}")
-    print("=" * 65)
-    if duration < 1.0:
-        print(f"Dauer der Inferenzphase: {duration * 1000:.2f} ms ({duration:.6f} s)")
-    else:
-        print(f"Dauer der Inferenzphase: {duration:.4f} s")
-    print(f"Abtastrate:              {sampling_freq / 1e6:.2f} MSPS ({num_samples:,} Samples)")
-    print("-" * 65)
-    print(f"Spannung (Durchschnitt): {avg_voltage:.4f} V   [min: {min_voltage:.4f} V, max: {max_voltage:.4f} V]")
-    print(f"Strom    (Durchschnitt): {avg_current * 1000:.3f} mA ({avg_current:.6f} A)")
-    print(f"         [min: {min_current * 1000:.3f} mA, max: {max_current * 1000:.3f} mA]")
-    print(f"Leistung (Durchschnitt): {avg_power * 1000:.3f} mW ({avg_power:.6f} W)")
-    print(f"         [min: {min_power * 1000:.3f} mW, max: {max_power * 1000:.3f} mW]")
-    print("-" * 65)
-    print(f"Elektrische Ladung:      {charge_mah:.4f} mAh ({charge_uah:.2f} µAh / {charge_c:.6f} C)")
-    print(f"Energieverbrauch gesamt: {energy_j:.6f} J ({energy_mj:.3f} mJ / {energy_mwh:.6f} mWh)")
-
-    energy_per_inf_mj = None
-    energy_per_inf_uj = None
-    time_per_inf_ms = None
-    inferences_per_sec = None
-    charge_per_inf_uah = None
-
-    # Zusätzliche Metriken pro Inferenz, falls bekannt
-    if num_inferences and num_inferences > 0:
-        energy_per_inf_mj = energy_mj / num_inferences
-        energy_per_inf_uj = energy_uj / num_inferences
-        time_per_inf_ms = (duration * 1000.0) / num_inferences
-        inferences_per_sec = num_inferences / duration if duration > 0 else 0.0
-        charge_per_inf_uah = charge_uah / num_inferences
-
-        print("-" * 65)
-        print("          INFERENZ-METRIKEN (TensorFlow Lite Micro)")
-        print("-" * 65)
-        print(f"Anzahl Inferenzen:       {num_inferences}")
-        print(f"Zeit pro Inferenz:       {time_per_inf_ms:.3f} ms ({inferences_per_sec:.1f} Inferenzen/s)")
-        print(f"Energie pro Inferenz:    {energy_per_inf_mj:.4f} mJ ({energy_per_inf_uj:.2f} µJ)")
-        print(f"Ladung pro Inferenz:     {charge_per_inf_uah:.4f} µAh")
-    print("=" * 65 + "\n")
-
-    return {
-        "duration_s": duration,
-        "num_samples": num_samples,
-        "sampling_freq": sampling_freq,
-        "avg_voltage_v": avg_voltage,
-        "min_voltage_v": min_voltage,
-        "max_voltage_v": max_voltage,
-        "avg_current_a": avg_current,
-        "avg_current_ma": avg_current * 1000.0,
-        "min_current_ma": min_current * 1000.0,
-        "max_current_ma": max_current * 1000.0,
-        "avg_power_w": avg_power,
-        "avg_power_mw": avg_power * 1000.0,
-        "min_power_mw": min_power * 1000.0,
-        "max_power_mw": max_power * 1000.0,
-        "energy_j": energy_j,
-        "energy_mj": energy_mj,
-        "energy_uj": energy_uj,
-        "energy_mwh": energy_mwh,
-        "charge_c": charge_c,
-        "charge_mah": charge_mah,
-        "charge_uah": charge_uah,
-        "num_inferences": num_inferences,
-        "energy_per_inf_mj": energy_per_inf_mj,
-        "energy_per_inf_uj": energy_per_inf_uj,
-        "time_per_inf_ms": time_per_inf_ms,
-        "inferences_per_sec": inferences_per_sec,
-        "charge_per_inf_uah": charge_per_inf_uah,
-    }
+    accumulator = StreamingMetricsAccumulator(
+        sampling_freq=sampling_freq,
+        num_inferences=num_inferences,
+        title=title,
+    )
+    accumulator.update(current, voltage)
+    return accumulator.compute_and_display()
 
 
 def capture_esp32_serial_metrics(port: str = None, timeout: float = 30.0, baudrate: int = 115200) -> dict:
@@ -357,9 +434,9 @@ def measure_triggered(
     if max_duration is None:
         max_duration = max(60.0, (num_inferences or 50) * 2.0)
 
-    # Puffergröße begrenzen, um übermäßigen Speicherverbrauch zu vermeiden
+    # Puffergröße im Joulescope-Treiber auf 10s begrenzen, um RAM-Verbrauch minimal zu halten
     try:
-        device.parameter_set("buffer_duration", min(30, int(max_duration) + 10))
+        device.parameter_set("buffer_duration", 10)
     except Exception:
         pass
 
@@ -373,13 +450,17 @@ def measure_triggered(
 
     device.start()
 
-    collected_current = []
-    collected_voltage = []
+    accumulator = StreamingMetricsAccumulator(
+        sampling_freq=sampling_freq,
+        num_inferences=num_inferences,
+        title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
+    )
     last_processed_id = None
     measuring = False
     last_gpi_value = 0  # Vorheriger Triggersignal-Zustand (LOW=0, HIGH=1), für Edge-Detektion über Chunks hinweg
     t_wait_start = time.time()
     t_measure_start = None
+    t_last_progress = 0.0
 
     try:
         while True:
@@ -390,7 +471,12 @@ def measure_triggered(
                         f"Zeitueberschreitung: Kein Rising Edge (LOW→HIGH) an {channel_label} innerhalb von {timeout:.1f} s empfangen."
                     )
             else:
-                if max_duration > 0 and (now - t_measure_start) > max_duration:
+                elapsed = now - t_measure_start
+                if elapsed - t_last_progress >= 5.0:
+                    t_last_progress = elapsed
+                    print(f"  [Messung aktiv] {elapsed:.1f} s vergangen ({accumulator.num_samples:,} Samples erfasst)...", flush=True)
+
+                if max_duration > 0 and elapsed > max_duration:
                     raise TimeoutError(
                         f"Zeitueberschreitung: Messung an {channel_label} dauerte laenger als {max_duration:.1f} s ohne Rueckkehr auf LOW."
                     )
@@ -443,49 +529,38 @@ def measure_triggered(
                 first_high = rising_edge_idx
                 measuring = True
                 t_measure_start = time.time()
+                t_last_progress = 0.0
                 print(f"\n[Trigger] >>> Rising Edge erkannt ({channel_label} LOW->HIGH)! Messung gestartet. <<<")
 
                 # Erfasse ab dem Rising Edge bis zum Ende des Chunks (oder bis zum LOW im selben Chunk)
                 low_indices = np.where(gpi_chunk[first_high + 1:] == 0)[0]
                 if len(low_indices) == 0:
-                    collected_current.append(cur_chunk[first_high:].astype(np.float32))
-                    collected_voltage.append(vol_chunk[first_high:].astype(np.float32))
+                    accumulator.update(cur_chunk[first_high:], vol_chunk[first_high:])
                 else:
                     first_low = first_high + 1 + low_indices[0]
-                    collected_current.append(cur_chunk[first_high:first_low].astype(np.float32))
-                    collected_voltage.append(vol_chunk[first_high:first_low].astype(np.float32))
+                    accumulator.update(cur_chunk[first_high:first_low], vol_chunk[first_high:first_low])
                     print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
                     break
             else:
                 # Messung laeuft: Suche nach fallender Flanke (LOW)
                 low_indices = np.where(gpi_chunk == 0)[0]
                 if len(low_indices) == 0:
-                    collected_current.append(cur_chunk.astype(np.float32))
-                    collected_voltage.append(vol_chunk.astype(np.float32))
+                    accumulator.update(cur_chunk, vol_chunk)
                 else:
                     first_low = low_indices[0]
-                    collected_current.append(cur_chunk[:first_low].astype(np.float32))
-                    collected_voltage.append(vol_chunk[:first_low].astype(np.float32))
+                    accumulator.update(cur_chunk[:first_low], vol_chunk[:first_low])
                     print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
                     break
 
     finally:
-        device.stop()
+        try:
+            device.stop()
+        except Exception:
+            pass
+        # Kurze Pause, damit die Joulescope-Treiberthreads und USB-Puffer sauber stoppen können
+        time.sleep(0.05)
 
-    if not collected_current:
-        print("Keine Messwerte während der HIGH-Phase erfasst.", file=sys.stderr)
-        return {}
-
-    current = np.concatenate(collected_current)
-    voltage = np.concatenate(collected_voltage)
-
-    return display_results(
-        current,
-        voltage,
-        sampling_freq,
-        num_inferences=num_inferences,
-        title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
-    )
+    return accumulator.compute_and_display()
 
 
 def measure_duration(device, duration: float = 10.0, num_inferences: int = None) -> dict:
@@ -672,6 +747,12 @@ def main():
         help="Timeout in Sekunden beim Warten auf das Startsignal (0 für unendlich, ueberschreibt Konfiguration)",
     )
     parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=None,
+        help="Maximale Messdauer in Sekunden waehrend der Inferenz (0 für unendlich, ueberschreibt Konfiguration)",
+    )
+    parser.add_argument(
         "-d", "--duration",
         type=float,
         default=None,
@@ -744,6 +825,11 @@ def main():
         if args.timeout is not None
         else config.get("joulescope", {}).get("timeout", 60.0)
     )
+    max_duration = (
+        args.max_duration
+        if args.max_duration is not None
+        else config.get("joulescope", {}).get("max_duration", None)
+    )
 
     # -------------------------------------------------------------
     # PHASE 1: Training aller Modelle
@@ -801,6 +887,11 @@ def main():
         sys.exit(1)
 
     device = devices[0]
+    if hasattr(device, "_driver") and hasattr(device._driver, "log_level"):
+        try:
+            device._driver.log_level = "OFF"
+        except Exception:
+            pass
     print(f"Verbunden mit Joulescope: {device.device_serial_number or device}\n")
 
     all_results = []
@@ -850,7 +941,7 @@ def main():
                 if args.duration is not None and args.duration > 0:
                     metrics = measure_duration(device, duration=args.duration, num_inferences=model_samples)
                 else:
-                    metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples)
+                    metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples, max_duration=max_duration)
             except TimeoutError as te:
                 print(f"\n[Messung fehlgeschlagen] {te}", file=sys.stderr)
             except KeyboardInterrupt:
