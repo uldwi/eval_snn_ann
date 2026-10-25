@@ -1800,6 +1800,16 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Warte 3 Sekunden vor Start des Inferenz-Messzyklus...");
         vTaskDelay(pdMS_TO_TICKS(3000));
 
+        // GPIO-Handshake: Langeres LOW-HIGH-LOW-Signal, damit der Joulescope sich synchronisieren kann
+        // 300ms HIGH ist unter dem Handshake-Limit von 500ms in measure_power.py,
+        // sodass es als Handshake erkannt und ignoriert wird.
+        gpio_set_level(TRIGGER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        gpio_set_level(TRIGGER_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI(TAG, "Handshake-Signal gesendet, warte 3 Sekunden vor Inferenz...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+
         // Start der Messung: Trigger-Pin auf HIGH
         ESP_LOGI(TAG, ">>> START: Setze GPIO %d auf HIGH (Inferenz laeuft) <<<", TRIGGER_GPIO);
         gpio_set_level(TRIGGER_GPIO, 1);

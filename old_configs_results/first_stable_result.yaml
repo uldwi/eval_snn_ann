@@ -1,0 +1,602 @@
+# =====================================================================
+# Konfigurationsdatei für Neuronale Netze (ANN & SNN) & Energiemessung
+# =====================================================================
+
+#  ========================================================================================================================================
+#  GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)
+#  ========================================================================================================================================
+#  Modell-Name          | Typ   | Netzwerk-Architektur                   | Host Acc (10k) | ESP32 Acc (Test)   | Größe     | Zeit/Inf   | Energie/Inf  | Mittl. Leist.
+#  |       |                                        | (%)            | (% [korrekt])      | (Bytes)   | (ms)       | (µJ)         | (mW)
+#  ----------------------------------------------------------------------------------------------------------------------------------------
+#  ANN_MNIST_Conv16_32_ | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 98.85 %        | 99.20 % (496/500)  | 425,244   | 858.09 ms  | 96747.57 µJ  | 112.75 mW
+#  SNN_MNIST_LIF_Conv16 | SNN   | SpikingJelly SNN-LIF [Conv(1->16,3x3,p | 98.62 %        | 98.60 % (493/500)  | 423,464   | 388.76 ms  | 43964.68 µJ  | 113.09 mW
+#  ANN_FashionMNIST_Con | ANN   | ANN [Conv(1->32,3x3,p2) -> Conv(32->64 | 91.68 %        | 91.60 % (458/500)  | 1,688,348 | 3098.95 ms | 371121.09 µJ | 119.76 mW
+#  SNN_FashionMNIST_LIF | SNN   | SpikingJelly SNN-IF [Conv(1->32,3x3,p2 | 89.11 %        | 90.00 % (450/500)  | 1,686,568 | 742.30 ms  | 83595.00 µJ  | 112.62 mW
+#  ANN_CIFAR10_Conv32_6 | ANN   | ANN [Conv(1->32,3x3,p2) -> Conv(32->64 | 50.18 %        | 53.20 % (266/500)  | 607,004   | 900.66 ms  | 108113.83 µJ | 120.04 mW
+#  SNN_CIFAR10_LIF_Conv | SNN   | SpikingJelly SNN-IF [Conv(1->32,3x3,p2 | 51.06 %        | 51.20 % (256/500)  | 605,224   | 590.27 ms  | 66654.41 µJ  | 112.92 mW
+#  ANN_KWS_Conv16_32_64 | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 99.60 %        | 99.40 % (497/500)  | 154,904   | 267.34 ms  | 30237.63 µJ  | 113.10 mW
+#  SNN_KWS_LIF_Conv16_3 | SNN   | SpikingJelly SNN-IF [Conv(1->16,3x3,p2 | 98.90 %        | 98.80 % (494/500)  | 153,128   | 270.47 ms  | 30867.70 µJ  | 114.13 mW
+#  ANN_EEG_Conv16_32_32 | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 100.00 %       | 100.00 % (500/500) | 152,584   | 138.11 ms  | 15741.01 µJ  | 113.97 mW
+#  SNN_EEG_LIF_Conv16_3 | SNN   | SpikingJelly SNN-IF [Conv(1->16,3x3,p2 | 100.00 %       | 100.00 % (500/500) | 150,928   | 160.63 ms  | 18858.12 µJ  | 117.40 mW
+#  ANN_EEGEye_64_32_16  | ANN   | ANN [64 -> 64 -> 32 -> 16 -> 2] mit RE | 100.00 %       | 100.00 % (500/500) | 28,356    | 4.69 ms    | 526.46 µJ    | 112.25 mW
+#  SNN_EEGEye_LIF_64_32 | SNN   | SpikingJelly SNN-IF [64 -> 64 -> 32 -> | 100.00 %       | 100.00 % (500/500) | 27,208    | 4.53 ms    | 502.63 µJ    | 110.91 mW
+#  ANN_ECG_128_64_32    | ANN   | ANN [128 -> 128 -> 64 -> 32 -> 5] mit  | 100.00 %       | 100.00 % (500/500) | 109,204   | 20.36 ms   | 2435.48 µJ   | 119.60 mW
+#  SNN_ECG_LIF_128_64_3 | SNN   | SpikingJelly SNN-IF [128 -> 128 -> 64  | 100.00 %       | 100.00 % (500/500) | 108,052   | 26.26 ms   | 3326.16 µJ   | 126.66 mW
+#  ANN_HAR_128_64_32    | ANN   | ANN [120 -> 128 -> 64 -> 32 -> 6] mit  | 100.00 %       | 100.00 % (500/500) | 105,240   | 18.93 ms   | 2265.86 µJ   | 119.69 mW
+#  SNN_HAR_LIF_128_64_3 | SNN   | SpikingJelly SNN-IF [120 -> 128 -> 64  | 83.11 %        | 82.80 % (414/500)  | 104,088   | 25.40 ms   | 3210.70 µJ   | 126.39 mW
+#  ANN_TimeSeries_96_48 | ANN   | ANN [128 -> 96 -> 48 -> 4] mit RELU    | 100.00 %       | 100.00 % (500/500) | 69,876    | 13.18 ms   | 1572.75 µJ   | 119.37 mW
+#  SNN_TimeSeries_LIF_9 | SNN   | SpikingJelly SNN-IF [128 -> 96 -> 48 - | 100.00 %       | 100.00 % (500/500) | 68,944    | 20.32 ms   | 2580.89 µJ   | 127.00 mW
+#  ========================================================================================================================================
+
+
+# ---------------------------------------------------------------------
+# Datensatz-Auswahl (Domänenübergreifend)
+#
+# Verfügbare Datensätze aus unterschiedlichen Bereichen:
+#
+# 1. Computer Vision / Bildverarbeitung:
+#      - "mnist":
+#          Handgeschriebene Ziffern (0-9), 1x28x28 = 784 Features, 10 Klassen
+#      - "fashion_mnist":
+#          Kleidungsstück (Zalando), 1x28x28 = 784 Features, 10 Klassen
+#      - "cifar10":
+#          10 Objektklassen (herunterskaliert auf 1x16x16 = 256 Features für MCU), 10 Klassen
+#
+# 2. Audio & Keyword Recognition (Sprachbefehlserkennung / KWS):
+#      - "speech_commands" (oder Alias "kws"):
+#          10 Schlüsselwörter ("yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go")
+#          Akkustisches Zeit-Frequenz-Spektrogramm: 1x16x16 = 256 Features, 10 Klassen
+#
+# 3. Sensordaten & Zeitreihen (Human Activity Recognition / Inertialsensoren):
+#      - "har_time_series" (oder Alias "uci_har"):
+#          6-Kanal IMU (3x Beschleunigung, 3x Gyroskop, je 20 Zeitschritte = 120 Features)
+#          6 Klassen: Gehen, Treppe auf, Treppe ab, Sitzen, Stehen, Liegen
+#      - "synthetic_time_series":
+#          Musterklassifikation von 1D-Zeitreihen (Sinus, Impuls, Trend, Chirp), 1x128 Features, 4 Klassen
+#
+# 4. Biomedizinische Signale / Gehirnwellen (EEG):
+#      - "eeg_data" (oder Alias "eeg_bands"):
+#          8-Kanal Elektroenzephalogramm (Delta, Theta, Alpha, Beta Bänder), 8x16 = 128 Features
+#          4 Klassen: Tiefschlaf (Delta), Schlaefrig (Theta), Entspannt (Alpha), Konzentriert (Beta)
+#      - "eeg_eye_state":
+#          Zustandserkennung Augen geöffnet vs. geschlossen, 1x64 Features, 2 Klassen
+#
+# 5. Biomedizinische Signale / Kardiologie (EKG / ECG):
+#      - "ecg_data" (oder Alias "ecg_heartbeat"):
+#          EKG-Herzschlag-Klassifikation nach MIT-BIH Arrhythmie Standard, 1x128 Features
+#          5 Klassen: Normal (N), Supraventrikulaer (S), Ventrikulaer (V), Fusion (F), Schrittmacher (Q)
+#
+# Hinweis: Der Datensatz kann global hier oder individuell pro Modell unter "models:" definiert werden.
+# ---------------------------------------------------------------------
+dataset:
+  name: "mnist"
+
+# ---------------------------------------------------------------------
+# Globale Standardeinstellungen für das Training
+# ---------------------------------------------------------------------
+training:
+  # Standard-Datensatz für alle Modelle (sofern nicht im Modell überschrieben)
+  dataset: "mnist"
+
+  # Maximale Anzahl der Trainingsepochen (Standardwert)
+  epochs: 5
+
+  # Batch-Größe für das Training
+  batch_size: 64
+
+  # Lernrate für den Optimierer
+  learning_rate: 0.001
+
+  # Optimierer ("adam", "sgd", "adamw", "adagrad", "rmsprop")
+  optimizer: "adam"
+
+  # Early Stopping (Vorzeitiger Abbruch bei stagnierender Genauigkeit / Verlust)
+  early_stopping: false    # true oder false
+  patience: 3             # Anzahl an Epochen ohne Verbesserung vor vorzeitigem Abbruch
+  min_delta: 0.001        # Mindestverbesserung der Metrik (z. B. 0.001 = 0.1% Genauigkeit)
+  monitor: "test_acc"     # Zu überwachende Metrik: "test_acc" (Standard) oder "test_loss"
+  restore_best_weights: true # Stellt automatisch das beste Modell für Inferenz & Export wieder her
+
+  # Verzeichnis zum Speichern/Laden von Datensätzen
+  data_dir: "./data"
+
+  # Verzeichnis zum automatischen Speichern und Laden trainierter Modell-Checkpoints (Caching)
+  # Modelle werden automatisch gespeichert und bei unveränderter Konfiguration wiederverwendet.
+  save_dir: "./saved_models"
+  auto_save: true
+
+  # Random Seed für reproduzierbare Ergebnisse (z. B. 42 oder null für zufällig)
+  random_seed: 42
+
+# ---------------------------------------------------------------------
+# Globale Einstellungen für die Modell-Optimierung (Post-Training)
+#
+# Alle unter "models:" gelisteten Modelle werden mit Pruning UND Quantisierung
+# optimiert. Die globalen Werte gelten als Standard; jedes Modell kann sie
+# per "optimization:"-Block überschreiben.
+#
+# 1. Pruning (Sparsifizierung):
+#      - enabled: true / false
+#      - method: "l1_unstructured" (Standard), "random_unstructured", "structured", "threshold"
+#      - amount: Anteil der zu entfernenden Gewichte (z. B. 0.3 = 30% Sparsity)
+#      - threshold: Mindestwert der Gewichtsbeträge (bei method: "threshold")
+#      - layers: ["conv", "fc"] oder "all"
+#      - fine_tune_epochs: Optionale Nacheichung/Fine-Tuning zur Genauigkeitswiederherstellung
+#      - fine_tune_lr: Lernrate beim Fine-Tuning (z. B. 0.0001)
+#
+# 2. Quantisierung (Bitbreiten-Reduktion der Gewichte):
+#      - enabled: true / false
+#      - type: "int8" (Standard), "int4", "fp16", "dynamic"
+#      - mode: "symmetric" (Standard) oder "asymmetric"
+#      - per_channel: true (pro Filterkanal) oder false (pro Tensor)
+#      - layers: ["conv", "fc"] oder "all"
+#
+# 3. Weight Clustering (Codebook / Centroid-Sharing):
+#      - enabled: true / false
+#      - num_clusters: Anzahl diskreter Centroids (z. B. 16 = 4-Bit Index-Sharing)
+# ---------------------------------------------------------------------
+optimization:
+  pruning:
+    enabled: true
+    method: "l1_unstructured"
+    amount: 0.3
+    layers: ["conv", "fc"]
+    fine_tune_epochs: 2
+    fine_tune_lr: 0.0001
+
+  quantization:
+    enabled: true
+    type: "int8"
+    mode: "symmetric"
+    per_channel: true
+    layers: ["conv", "fc"]
+
+  clustering:
+    enabled: false
+    num_clusters: 16
+
+# ---------------------------------------------------------------------
+# Globale Einstellungen für die Inferenz auf dem ESP32
+# ---------------------------------------------------------------------
+evaluation:
+  # Anzahl der Test-Samples, die auf dem ESP32 für die Inferenzmessung exportiert werden
+  num_test_samples: 500
+
+# ---------------------------------------------------------------------
+# Hardware-Einstellungen (ESP32 & Joulescope)
+# ---------------------------------------------------------------------
+esp32:
+  # GPIO-Pin für das Triggersignal am ESP32 (wird mit Joulescope IN1 verbunden)
+  trigger_pin: 4
+
+joulescope:
+  # Joulescope digitaler Eingangskanal ("in1" oder "in2")
+  trigger_pin: "in1"
+
+  # Timeout in Sekunden beim Warten auf das Triggersignal (Warten auf Start)
+  timeout: 6000.0
+
+  # Maximale Messdauer in Sekunden waehrend der Inferenz (Warten auf Inferenzende)
+  max_duration: 6000.0
+
+# ---------------------------------------------------------------------
+# Liste der Modelle für sequentielle Messungen
+#
+# Aktuell getestet: MNIST mit genau drei Modellen
+#   1x ANN (TensorFlow Lite Micro, dicht)
+#   1x SNN (SpikingJelly, event_based Ausführung)
+#   1x SNN (SpikingJelly, dense Ausführung)
+# Alle drei Modelle verwenden identische Architektur (Conv16_32_64 + FC64),
+# damit die Energiemessungen direkt vergleichbar sind. Jedes Modell trainiert
+# mit Pruning UND Quantisierung.
+#
+# Unterstützte Modelltypen:
+#   - type: "ann"
+#       Künstliches neuronales Netz (MLP oder CNN), ausgeführt mit TensorFlow Lite Micro.
+#       Optionen:
+#         - dataset: optionaler Datensatz pro Modell (z. B. "mnist", "speech_commands", "eeg_data", "har_time_series", "ecg_data")
+#         - conv_layers: Liste von Faltungs- und Pooling-Schichten, z. B.:
+#             - out_channels: 8, kernel_size: 3, stride: 1, padding: 1, pool_size: 2
+#         - hidden_layers: Vollständig verbundene Schichten (z. B. [64])
+#         - activation: "relu", "none"
+#
+#   - type: "snn"
+#       Spiking Neural Network (Fully-Connected oder Convolutional CSNN) trainiert mit SpikingJelly.
+#       Optionen:
+#         - dataset: optionaler Datensatz pro Modell
+#         - conv_layers: Liste von Faltungs- und Pooling-Schichten (z. B. 8 Filter, 3x3, MaxPool 2x2)
+#         - neuron_type: "lif" (Leaky-Integrate-and-Fire, Standard) oder "if" (Integrate-and-Fire)
+#         - execution_mode: Ausführungsmodus ("dense" = Standard dicht, "event_based" = Ereignisgesteuert)
+#         - encoding_type: Eingangs-Encoding-Algorithmus:
+#             * "direct"   (Standard): Konstanter analoger Eingangsstrom über alle Zeitschritte
+#             * "ttfs"     (Time-To-First-Spike / Latency Coding): Früheres Feuern bei höherer Intensität
+#             * "periodic" (Deterministisches Rate-Coding): Gleichmäßige Spike-Verteilung
+#             * "poisson"  (Stochastisches Poisson-Rate-Coding): Zufällige Spikes gemäß Pixel-Intensität
+#         - hidden_layers: z. B. [64] oder [128, 64]
+#         - num_steps: Zeitschritte (z. B. 10)
+#         - beta: Membran-Decay (nur bei LIF, z. B. 0.9)
+#         - threshold: Schwellenwert (z. B. 1.0)
+#
+# Modellspezifische Optimierung (überschreibt die globalen Werte):
+#   optimization:
+#     pruning: {enabled: true, amount: 0.3, method: "l1_unstructured"}
+#     quantization: {enabled: true, type: "int8", per_channel: true}
+#
+# Trainings-Parameter pro Modell (überschreiben globale Standardwerte):
+#   - epochs: Maximale Anzahl der Epochen (z. B. 5 oder 20)
+#   - batch_size: Batch-Größe (z. B. 64 oder 128)
+#   - learning_rate: Lernrate (z. B. 0.001 oder 0.005)
+#   - optimizer: "adam" oder "sgd"
+#   - early_stopping: true / false (Vorzeitiges Beenden bei Stagnation)
+#   - patience: Anzahl Epochen ohne Verbesserung vor Abbruch (z. B. 3)
+#   - min_delta: Mindestverbesserung (z. B. 0.001)
+#   - monitor: "test_acc" oder "test_loss"
+# ---------------------------------------------------------------------
+models:
+  # ===================================================================
+  # MNIST - ANN (98.85%)
+  # ===================================================================
+  - name: "ANN_MNIST_Conv16_32_64"
+    type: "ann"
+    dataset: "mnist"
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    activation: "relu"
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.001
+
+  # ===================================================================
+  # MNIST - SNN (98.5%)
+  # ===================================================================
+  - name: "SNN_MNIST_LIF_Conv16_32_64_TTFS"
+    type: "snn"
+    dataset: "mnist"
+    neuron_type: "lif"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # FashionMNIST - ANN (92.3%)
+  # ===================================================================
+  - name: "ANN_FashionMNIST_Conv32_64_128"
+    type: "ann"
+    dataset: "fashion_mnist"
+    conv_layers:
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # FashionMNIST - SNN (90.02%)
+  # ===================================================================
+  - name: "SNN_FashionMNIST_LIF_Conv32_64_128_Direct"
+    type: "snn"
+    dataset: "fashion_mnist"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    conv_layers:
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
+    epochs: 10
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # CIFAR10 - ANN (58.96%)
+  # ===================================================================
+  - name: "ANN_CIFAR10_Conv32_64_128"
+    type: "ann"
+    dataset: "cifar10"
+    conv_layers:
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
+    activation: "relu"
+    epochs: 8
+    batch_size: 64
+    learning_rate: 0.005
+
+# ===================================================================
+  # CIFAR10 - SNN (TTFS encoding, Regularisierung)
+  # ===================================================================
+  - name: "SNN_CIFAR10_LIF_Conv32_64_128_TTFS_Reg"
+    type: "snn"
+    dataset: "cifar10"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 20
+    beta: 0.90
+    threshold: 1.0
+    conv_layers:
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [128]
+    dropout: 0.5
+    epochs: 80
+    batch_size: 64
+    learning_rate: 0.001
+    early_stopping:
+      enabled: true
+      patience: 10
+      monitor: "test_acc"
+      restore_best_weights: true
+
+  # ===================================================================
+  # Speech Commands (KWS) - ANN (99.2%)
+  # ===================================================================
+  - name: "ANN_KWS_Conv16_32_64"
+    type: "ann"
+    dataset: "speech_commands"
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # Speech Commands (KWS) - SNN (99.7%)
+  # ===================================================================
+  - name: "SNN_KWS_LIF_Conv16_32_64_TTFS"
+    type: "snn"
+    dataset: "speech_commands"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+    hidden_layers: [64]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # EEG - ANN (100%)
+  # ===================================================================
+  - name: "ANN_EEG_Conv16_32_32"
+    type: "ann"
+    dataset: "eeg_data"
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 1
+    hidden_layers: [32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # EEG - SNN (100%)
+  # ===================================================================
+  - name: "SNN_EEG_LIF_Conv16_32_32_TTFS"
+    type: "snn"
+    dataset: "eeg_data"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    conv_layers:
+      - out_channels: 16
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 2
+      - out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        pool_size: 1
+    hidden_layers: [32]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # EEG Eye State - ANN (100%)
+  # ===================================================================
+  - name: "ANN_EEGEye_64_32_16"
+    type: "ann"
+    dataset: "eeg_eye_state"
+    hidden_layers: [64, 32, 16]
+    activation: "relu"
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # EEG Eye State - SNN (100%)
+  # ===================================================================
+  - name: "SNN_EEGEye_LIF_64_32_16_Direct"
+    type: "snn"
+    dataset: "eeg_eye_state"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    hidden_layers: [64, 32, 16]
+    epochs: 5
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # ECG - ANN (100%)
+  # ===================================================================
+  - name: "ANN_ECG_128_64_32"
+    type: "ann"
+    dataset: "ecg_data"
+    hidden_layers: [128, 64, 32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # ECG - SNN (100%)
+  # ===================================================================
+  - name: "SNN_ECG_LIF_128_64_32_TTFS"
+    type: "snn"
+    dataset: "ecg_data"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    hidden_layers: [128, 64, 32]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # HAR - ANN (100%)
+  # ===================================================================
+  - name: "ANN_HAR_128_64_32"
+    type: "ann"
+    dataset: "har_time_series"
+    hidden_layers: [128, 64, 32]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # HAR - SNN (100%)
+  # ===================================================================
+  - name: "SNN_HAR_LIF_128_64_32_Direct"
+    type: "snn"
+    dataset: "har_time_series"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    hidden_layers: [128, 64, 32]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # Synthetic Time Series - ANN (100%)
+  # ===================================================================
+  - name: "ANN_TimeSeries_96_48"
+    type: "ann"
+    dataset: "synthetic_time_series"
+    hidden_layers: [96, 48]
+    activation: "relu"
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005
+
+  # ===================================================================
+  # Synthetic Time Series - SNN (100%)
+  # ===================================================================
+  - name: "SNN_TimeSeries_LIF_96_48_TTFS"
+    type: "snn"
+    dataset: "synthetic_time_series"
+    neuron_type: "if"
+    encoding_type: "ttfs"
+    num_steps: 10
+    beta: 0.9
+    threshold: 1.0
+    hidden_layers: [96, 48]
+    epochs: 6
+    batch_size: 64
+    learning_rate: 0.005

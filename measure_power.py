@@ -288,12 +288,12 @@ def display_results(
     return accumulator.compute_and_display()
 
 
-def capture_esp32_serial_metrics(port: str = None, timeout: float = 30.0, baudrate: int = 115200) -> dict:
+def capture_esp32_serial_metrics(port: str = None, timeout: float = 60.0, baudrate: int = 115200) -> dict:
     """
     Versucht, über die serielle Schnittstelle die Genauigkeit und Inferenz-Metriken
     direkt aus den Log-Ausgaben des ESP32 zu lesen.
-    Standard-Timeout 30.0 s: Die ESP32-Laufzeit (50 Inferenzen à ~195 ms) benötigt
-    ca. 10 s, daher muss das Timeout größer sein.
+    Timeout 60.0 s: Bei 500 Samples und langen Inferenzzeiten (SNN: ~1.3s/Inferenz)
+    kann der METRICS-String erst nach mehreren Minuten erscheinen.
     """
     try:
         import serial
@@ -395,12 +395,22 @@ def print_comparison_summary(all_results: list):
         if m:
             num_inf = res.get("num_test_samples", m.get("num_inferences"))
             esp32_time_us = m.get("esp32_time_us")
+            energy_per_inf_uj = m.get("energy_per_inf_uj")
+
+            # Prüfe, ob der GPIO-Trigger verpasst wurde: Energie nahe 0 aber esp32_time_us vorhanden
+            gpio_missed = (energy_per_inf_uj is not None and energy_per_inf_uj < 0.1 and
+                          esp32_time_us is not None and esp32_time_us > 0 and num_inf)
+
             if esp32_time_us is not None and num_inf:
-                t_inf_val = esp32_time_us / 1000.0 / num_inf
+                t_inf_val = esp32_time_us / 1000.0 / num_inf  # ms pro Inferenz
                 t_inf = f"{t_inf_val:.2f} ms"
-                avg_power_mw = m.get("avg_power_mw")
+                # Wenn GPIO-Trigger verpasst, verwende die Durchschnittsleistung aus der gesamten Messdauer
+                if gpio_missed:
+                    avg_power_mw = m.get("avg_power_mw_total", m.get("avg_power_mw"))
+                else:
+                    avg_power_mw = m.get("avg_power_mw")
                 if avg_power_mw is not None:
-                    e_inf_val = avg_power_mw * t_inf_val
+                    e_inf_val = avg_power_mw * t_inf_val  # mW * ms = µJ
                     e_inf = f"{e_inf_val:.2f} µJ"
                 else:
                     e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else f"{m['energy_uj']:.1f} µJ"
@@ -426,9 +436,22 @@ def measure_triggered(
     """
     Misst den Energieverbrauch synchron zu einem digitalen Triggersignal an IN1 (oder IN0).
     Startet die Abtastung, wartet auf HIGH, erfasst Daten solange HIGH anliegt, und stoppt bei LOW.
+
+    Der ESP32 sendet vor jedem Inferenz-Zyklus ein Handshake-Signal (kurzes HIGH < 500 ms),
+    gefolgt vom eigentlichen Mess-Trigger (HIGH waehrend der gesamten Inferenz).
+    Handshake-Signale werden erkannt und ignoriert.
+
+    Wenn eine Messung zu kurz war (< 100 ms, d.h. der Trigger wurde teilweise verpasst),
+    wird der Accumulator zurueckgesetzt und auf den naechsten Zyklus gewartet.
+    Der ESP32 laeuft in einer Endlosschleife, also stehen mehrere Zyklen zur Verfuegung.
     """
     gpi_field = "gpi1" if pin.lower() in ("in1", "gpi1", "1") else "gpi0"
     channel_label = "IN1 (ESP32-C6 Pin 4)" if gpi_field == "gpi1" else "IN0"
+
+    # Handshake-Signale sind < 500 ms HIGH (ESP32 sendet 300 ms Handshake)
+    HANDSHAKE_MAX_MS = 500.0
+    # Eine gueltige Messung muss mindestens 100 ms dauern (Inferenz laeuft immer laenger)
+    MIN_VALID_MEASURE_MS = 100.0
 
     # Berechne maximal zulässige Messdauer während HIGH aktiv ist (dynamisch nach Anzahl Samples)
     if max_duration is None:
@@ -444,9 +467,11 @@ def measure_triggered(
     print(f"Abtastrate Joulescope:   {sampling_freq / 1e6:.2f} MSPS")
     print(f"Warte auf Startsignal an {channel_label} (Pegel = HIGH)...")
     if timeout > 0:
-        print(f"Trigger-Timeout:         {timeout:.1f} Sekunden (Warten auf Start)")
+        print(f"Trigger-Timeout:         {timeout:.1f} Sekunden (gesamt)")
     if max_duration > 0:
-        print(f"Max. Messdauer:          {max_duration:.1f} Sekunden (Warten auf Inferenzende)")
+        print(f"Max. Messdauer:          {max_duration:.1f} Sekunden (pro Zyklus)")
+    print(f"Handshake-Limit:         {HANDSHAKE_MAX_MS:.0f} ms (darauf folgt der eigentliche Trigger)")
+    print(f"Min. Messdauer:          {MIN_VALID_MEASURE_MS:.0f} ms (kuerzere Messungen werden wiederholt)")
 
     device.start()
 
@@ -455,12 +480,29 @@ def measure_triggered(
         num_inferences=num_inferences,
         title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
     )
+    # Zweiter Accumulator für die gesamte Messdauer (inklusive Wartezeit)
+    total_accumulator = StreamingMetricsAccumulator(
+        sampling_freq=sampling_freq,
+        num_inferences=num_inferences,
+        title="GESAMTE MESSDAUER",
+    )
     last_processed_id = None
     measuring = False
-    last_gpi_value = 0  # Vorheriger Triggersignal-Zustand (LOW=0, HIGH=1), für Edge-Detektion über Chunks hinweg
+    last_gpi_value = 0  # Vorheriger Triggersignal-Zustand (LOW=0, HIGH=1)
     t_wait_start = time.time()
     t_measure_start = None
     t_last_progress = 0.0
+    handshake_count = 0
+    retry_count = 0  # Zählt verpasste/ungueltige Messungen
+
+    def reset_accumulator():
+        """Accumulator zuruecksetzen fuer einen neuen Messversuch."""
+        nonlocal accumulator
+        accumulator = StreamingMetricsAccumulator(
+            sampling_freq=sampling_freq,
+            num_inferences=num_inferences,
+            title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
+        )
 
     try:
         while True:
@@ -468,7 +510,7 @@ def measure_triggered(
             if not measuring:
                 if timeout > 0 and (now - t_wait_start) > timeout:
                     raise TimeoutError(
-                        f"Zeitueberschreitung: Kein Rising Edge (LOW→HIGH) an {channel_label} innerhalb von {timeout:.1f} s empfangen."
+                        f"Zeitueberschreitung: Kein gueltiges Triggersignal an {channel_label} innerhalb von {timeout:.1f} s empfangen."
                     )
             else:
                 elapsed = now - t_measure_start
@@ -477,9 +519,14 @@ def measure_triggered(
                     print(f"  [Messung aktiv] {elapsed:.1f} s vergangen ({accumulator.num_samples:,} Samples erfasst)...", flush=True)
 
                 if max_duration > 0 and elapsed > max_duration:
-                    raise TimeoutError(
-                        f"Zeitueberschreitung: Messung an {channel_label} dauerte laenger als {max_duration:.1f} s ohne Rueckkehr auf LOW."
-                    )
+                    print(f"\n[Trigger] >>> Timeout: Messung dauerte laenger als {max_duration:.1f} s. <<<")
+                    # Messung als ungueltig markieren und auf naechsten Zyklus warten
+                    retry_count += 1
+                    print(f"[Trigger] Messung #{retry_count} war ungueltig (Timeout), warte auf naechsten Zyklus...")
+                    reset_accumulator()
+                    measuring = False
+                    last_gpi_value = 0
+                    t_measure_start = None
 
             time.sleep(0.01)  # 10 ms Polling-Intervall
             s1, s2 = device.stream_buffer.sample_id_range
@@ -509,10 +556,11 @@ def measure_triggered(
             gpi_chunk = data["signals"][gpi_field]["value"]
             last_processed_id = s2
 
+            # Total-Accumulator immer mit allen Daten füttern (inklusive Wartezeit)
+            total_accumulator.update(cur_chunk, vol_chunk)
+
             if not measuring:
                 # Edge-Detektion: Suchen den ersten Übergang LOW(0) -> HIGH(1).
-                # Beruecksichtigt den vorherigen Zustand (last_gpi_value), damit ein Edge,
-                # der genau an der Chunk-Grenze liegt, nicht verloren geht.
                 rising_edge_idx = None
                 prev = last_gpi_value
                 for i in range(len(gpi_chunk)):
@@ -522,7 +570,6 @@ def measure_triggered(
                     prev = gpi_chunk[i]
 
                 if rising_edge_idx is None:
-                    # Kein Rising Edge in diesem Chunk -> aktuellen Zustand merken und weiter warten
                     last_gpi_value = gpi_chunk[-1] if len(gpi_chunk) > 0 else last_gpi_value
                     continue
 
@@ -535,11 +582,37 @@ def measure_triggered(
                 # Erfasse ab dem Rising Edge bis zum Ende des Chunks (oder bis zum LOW im selben Chunk)
                 low_indices = np.where(gpi_chunk[first_high + 1:] == 0)[0]
                 if len(low_indices) == 0:
+                    # Noch kein LOW in diesem Chunk - Messung laeuft weiter
                     accumulator.update(cur_chunk[first_high:], vol_chunk[first_high:])
                 else:
                     first_low = first_high + 1 + low_indices[0]
                     accumulator.update(cur_chunk[first_high:first_low], vol_chunk[first_high:first_low])
-                    print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
+
+                    # Dauer der HIGH-Phase berechnen
+                    measure_duration_s = (first_low - first_high) / sampling_freq
+                    measure_duration_ms = measure_duration_s * 1000.0
+
+                    # Handshake-Erkennung: Kurze HIGH-Phase (< HANDSHAKE_MAX_MS)
+                    if measure_duration_ms < HANDSHAKE_MAX_MS:
+                        handshake_count += 1
+                        print(f"[Trigger] >>> Handshake-Signal erkannt ({measure_duration_ms:.0f} ms), ignoriert. <<<")
+                        reset_accumulator()
+                        measuring = False
+                        last_gpi_value = 0
+                        continue
+
+                    # Gueltige Messung? (>= MIN_VALID_MEASURE_MS)
+                    if measure_duration_ms < MIN_VALID_MEASURE_MS:
+                        retry_count += 1
+                        print(f"[Trigger] >>> Messung zu kurz ({measure_duration_ms:.0f} ms < {MIN_VALID_MEASURE_MS:.0f} ms), ignoriert. <<<")
+                        print(f"[Trigger] Versuch #{retry_count}, warte auf naechsten Zyklus...")
+                        reset_accumulator()
+                        measuring = False
+                        last_gpi_value = 0
+                        continue
+
+                    # Gueltige Messung gefunden!
+                    print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet ({measure_duration_ms:.0f} ms). <<<")
                     break
             else:
                 # Messung laeuft: Suche nach fallender Flanke (LOW)
@@ -549,7 +622,31 @@ def measure_triggered(
                 else:
                     first_low = low_indices[0]
                     accumulator.update(cur_chunk[:first_low], vol_chunk[:first_low])
-                    print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet. <<<")
+
+                    # Dauer berechnen und pruefen
+                    measure_duration_s = accumulator.num_samples / sampling_freq
+                    measure_duration_ms = measure_duration_s * 1000.0
+
+                    # Handshake-Erkennung: Kurze HIGH-Phase (< HANDSHAKE_MAX_MS)
+                    # Muss auch hier geprueft werden, weil Handshake-Signale mehrere Chunks ueberspannen koennen
+                    if measure_duration_ms < HANDSHAKE_MAX_MS:
+                        handshake_count += 1
+                        print(f"[Trigger] >>> Handshake-Signal erkannt ({measure_duration_ms:.0f} ms), ignoriert. <<<")
+                        reset_accumulator()
+                        measuring = False
+                        last_gpi_value = 0
+                        continue
+
+                    if measure_duration_ms < MIN_VALID_MEASURE_MS:
+                        retry_count += 1
+                        print(f"[Trigger] >>> Messung zu kurz ({measure_duration_ms:.0f} ms), ignoriert. <<<")
+                        print(f"[Trigger] Versuch #{retry_count}, warte auf naechsten Zyklus...")
+                        reset_accumulator()
+                        measuring = False
+                        last_gpi_value = 0
+                        continue
+
+                    print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet ({measure_duration_ms:.0f} ms). <<<")
                     break
 
     finally:
@@ -557,10 +654,27 @@ def measure_triggered(
             device.stop()
         except Exception:
             pass
-        # Kurze Pause, damit die Joulescope-Treiberthreads und USB-Puffer sauber stoppen können
         time.sleep(0.05)
 
-    return accumulator.compute_and_display()
+    # Zusammenfassung der erkannten Signale
+    if handshake_count > 0:
+        print(f"\n[Trigger] {handshake_count} Handshake-Signal(e) erkannt und ignoriert.")
+    if retry_count > 0:
+        print(f"[Trigger] {retry_count} zu kurze Messung(en) wiederholt.")
+
+    # GPIO-Trigger-Messung anzeigen
+    metrics = accumulator.compute_and_display()
+
+    # Durchschnittsleistung aus der gesamten Messdauer hinzufügen
+    if total_accumulator.num_samples > 0:
+        total_dt = 1.0 / sampling_freq
+        total_duration = total_accumulator.num_samples * total_dt
+        total_avg_power = total_accumulator.sum_power / total_accumulator.num_samples
+        metrics["avg_power_mw_total"] = total_avg_power * 1000.0  # mW
+        metrics["duration_total_s"] = total_duration
+        print(f"[Messung] Durchschnittsleistung (gesamte Dauer): {total_avg_power * 1000:.2f} mW ({total_duration:.2f} s)")
+
+    return metrics
 
 
 def measure_duration(device, duration: float = 10.0, num_inferences: int = None) -> dict:
@@ -963,7 +1077,7 @@ def main():
                     except (KeyboardInterrupt, EOFError):
                         print("\nMessung durch Benutzer abgebrochen.")
                         break
-                serial_metrics = capture_esp32_serial_metrics(port=args.port, timeout=30.0)
+                serial_metrics = capture_esp32_serial_metrics(port=args.port, timeout=60.0)
                 if serial_metrics and "esp32_acc" in serial_metrics:
                     print(f"[ESP32] Ermittelte Test-Genauigkeit (über UART): {serial_metrics['esp32_acc']:.2f}% ({serial_metrics.get('esp32_correct')}/{serial_metrics.get('esp32_total')} korrekt)")
 
