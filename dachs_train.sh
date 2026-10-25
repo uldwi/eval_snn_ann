@@ -15,7 +15,7 @@ python3 -m venv dachs_env
 python3 -m pip install --upgrade pip
 
 # PyTorch mit CUDA 12.4-Support (kompatibel zum DACHS CUDA-Modul)
-python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+python3 -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 python3 -m pip install -r $HOME/code/eval_snn_ann/requirements.txt
 

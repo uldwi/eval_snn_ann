@@ -16,7 +16,7 @@ if [ ! -d "dachs_env" ]; then
 fi
 source dachs_env/bin/activate
 python3 -m pip install --upgrade pip
-python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+python3 -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 python3 -m pip install -r requirements.txt
 
 # Alle Datensätze einmal laden (triggert Download, wenn nicht vorhanden)
@@ -43,6 +43,9 @@ python3 -c "from datasets_hub import get_dataset; get_dataset('eeg_data', data_d
 
 echo "Lade EEG Eye State..."
 python3 -c "from datasets_hub import get_dataset; get_dataset('eeg_eye_state', data_dir='./data', download=True); print('EEG Eye State OK')"
+
+echo "Lade PhysioNet EEG Motor Imagery (109 Personen, Läufe 4/8/12)..."
+python3 -c "from datasets_hub import get_dataset; train, test, info = get_dataset('physionet_eeg_mi', data_dir='./data', download=True); print(f'PhysioNet EEGMI OK: {len(train)} Train, {len(info.validation_dataset)} Val, {len(test)} Test')"
 
 echo "Lade ECG..."
 python3 -c "from datasets_hub import get_dataset; get_dataset('ecg_data', data_dir='./data', download=True); print('ECG OK')"
