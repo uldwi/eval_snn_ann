@@ -9,8 +9,8 @@ Unterstützte Datensätze und Domänen:
    - "cifar10": Objektkategorien (herunterskaliert auf 1x16x16=256 oder 1x32x32=1024), 10 Klassen
 
 2. Audio / Keyword Recognition (Keyword Spotting - KWS):
-   - "speech_commands" / "kws": Sprachbefehle ("yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"),
-     1x16x16 = 256 Features (Zeit-Frequenz-Spektrogramm / Mel-Filterbänke), 10 Klassen
+   - "speech_commands" / "kws": Echte Sprachaufnahmen aus Speech Commands v0.02,
+     alle 35 gesprochenen Wörter, als 1x16x16 Mel-Spektrogramm mit 35 Klassen
 
 3. Sensordaten / Time Series (Inertialmessdaten / Human Activity Recognition):
    - "har_time_series" / "uci_har": Beschleunigungs- & Gyroskopsensoren (6 Achsen x 20 Zeitschritte = 120 Features),
@@ -25,6 +25,10 @@ Unterstützte Datensätze und Domänen:
 5. Biomedizinische Signale / Kardiologie (ECG / EKG):
    - "ecg_data" / "ecg_heartbeat": EKG-Herzschlag-Klassifikation (MIT-BIH Arrhythmie Standard),
      128 Zeitschritte = 128 Features, 5 Klassen (Normal, Supraventrikulär, Ventrikulär, Fusion, Unbekannt)
+
+6. Reale EEG-Motor-Imagery:
+   - "physionet_eeg_mi" / "eeg_mi": PhysioNet EEGMMIDB, vorgestellte linke vs. rechte Faustbewegung
+     aus den offiziellen Läufen 4, 8 und 12, 64x16 spektrale Merkmale, 2 Klassen
 """
 
 import os
@@ -33,6 +37,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from scipy.io import wavfile
+from scipy.signal import welch
 from torch.utils.data import Dataset, TensorDataset
 from torchvision import datasets, transforms
 
@@ -49,6 +55,7 @@ class DatasetInfo:
     in_width: int
     num_classes: int
     class_names: List[str] = field(default_factory=list)
+    validation_dataset: Optional[Dataset] = field(default=None, repr=False)
 
 
 AVAILABLE_DATASETS: Dict[str, Dict[str, Union[str, int, List[str]]]] = {
@@ -87,23 +94,23 @@ AVAILABLE_DATASETS: Dict[str, Dict[str, Union[str, int, List[str]]]] = {
     # 2. Audio & Keyword Recognition (Sprachbefehle)
     "speech_commands": {
         "domain": "Audio & Keyword Spotting (Sprachbefehlserkennung)",
-        "description": "Speech Commands Spektrogramme für 10 Schlüsselwörter (yes, no, up, down, left, right, on, off, stop, go)",
+        "description": "Echte Sprachaufnahmen aus Speech Commands v0.02, alle 35 gesprochenen Wörter als Mel-Spektrogramm",
         "input_size": 256,
         "in_channels": 1,
         "in_height": 16,
         "in_width": 16,
-        "num_classes": 10,
-        "class_names": ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"],
+        "num_classes": 35,
+        "class_names": ["backward", "bed", "bird", "cat", "dog", "down", "eight", "five", "follow", "forward", "four", "go", "happy", "house", "learn", "left", "marvin", "nine", "no", "off", "on", "one", "right", "seven", "sheila", "six", "stop", "three", "tree", "two", "up", "visual", "wow", "yes", "zero"],
     },
     "kws": {
         "domain": "Audio & Keyword Spotting (Sprachbefehlserkennung)",
-        "description": "Alias für speech_commands (Keyword Spotting, 10 Klassen)",
+        "description": "Alias für Speech Commands v0.02 mit allen 35 gesprochenen Wörtern",
         "input_size": 256,
         "in_channels": 1,
         "in_height": 16,
         "in_width": 16,
-        "num_classes": 10,
-        "class_names": ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"],
+        "num_classes": 35,
+        "class_names": ["backward", "bed", "bird", "cat", "dog", "down", "eight", "five", "follow", "forward", "four", "go", "happy", "house", "learn", "left", "marvin", "nine", "no", "off", "on", "one", "right", "seven", "sheila", "six", "stop", "three", "tree", "two", "up", "visual", "wow", "yes", "zero"],
     },
 
     # 3. Sensordaten / Zeitreihen (Human Activity Recognition & Time Series)
@@ -169,6 +176,16 @@ AVAILABLE_DATASETS: Dict[str, Dict[str, Union[str, int, List[str]]]] = {
         "num_classes": 2,
         "class_names": ["Augen geschlossen", "Augen geoeffnet"],
     },
+    "physionet_eeg_mi": {
+        "domain": "Biomedizinische Signale (EEG Motor Imagery)",
+        "description": "Echte PhysioNet EEGMMIDB-Aufnahmen: vorgestellte linke vs. rechte Faustbewegung, personengetrennte Splits",
+        "input_size": 1024,
+        "in_channels": 1,
+        "in_height": 64,
+        "in_width": 16,
+        "num_classes": 2,
+        "class_names": ["Linke Faust (Motor Imagery)", "Rechte Faust (Motor Imagery)"],
+    },
 
     # 5. Biomedizinische Signale / Kardiologie (ECG / EKG)
     "ecg_data": {
@@ -198,6 +215,7 @@ DATASET_ALIASES: Dict[str, str] = {
     "kws": "speech_commands",
     "uci_har": "har_time_series",
     "eeg_bands": "eeg_data",
+    "eeg_mi": "physionet_eeg_mi",
     "ecg_heartbeat": "ecg_data",
 }
 
@@ -210,7 +228,7 @@ def normalize_dataset_name(name: str) -> str:
 
 def list_available_datasets() -> List[DatasetInfo]:
     """Gibt eine Liste aller verfügbaren Datensätze und deren Metadaten zurück."""
-    unique_names = ["mnist", "fashion_mnist", "cifar10", "speech_commands", "har_time_series", "synthetic_time_series", "eeg_data", "eeg_eye_state", "ecg_data"]
+    unique_names = ["mnist", "fashion_mnist", "cifar10", "speech_commands", "har_time_series", "synthetic_time_series", "eeg_data", "eeg_eye_state", "physionet_eeg_mi", "ecg_data"]
     results = []
     for name in unique_names:
         if name in AVAILABLE_DATASETS:
@@ -244,94 +262,88 @@ def print_available_datasets_table():
 
 
 # ---------------------------------------------------------------------------
-# Deterministische Generatoren für Audio-, Sensor- und Biomedizin-Datensätze
+# Deterministische Generatoren für synthetische Sensor- und Biomedizin-Datensätze
 # ---------------------------------------------------------------------------
 
-def _generate_synthetic_speech_commands(
-    num_train: int = 5000,
-    num_test: int = 1000,
-    seed: int = 42,
-) -> Tuple[Dataset, Dataset]:
+SPEECH_COMMANDS = (
+    "backward", "bed", "bird", "cat", "dog", "down", "eight", "five", "follow",
+    "forward", "four", "go", "happy", "house", "learn", "left", "marvin", "nine",
+    "no", "off", "on", "one", "right", "seven", "sheila", "six", "stop", "three",
+    "tree", "two", "up", "visual", "wow", "yes", "zero",
+)
+
+
+class SpeechCommandsDataset(Dataset):
+    """Alle 35 Speech-Commands-Wörter als kompakte Mel-Spektrogramme.
+
+    Nichtsprachliche Hintergrundgeräusche sind keine Wortklasse und werden
+    ausgelassen.
     """
-    Erzeugt akustische Zeit-Frequenz-Repräsentationen (16x16 Mel-Spektrogramm-Äquivalente)
-    für 10 Sprachbefehle mit formantenbasierten akustischen Charakteristiken.
-    """
-    rng = np.random.RandomState(seed)
-    num_classes = 10
-    h, w = 16, 16
 
-    # Formant- und Energiemuster pro Schlüsselwort
-    patterns = [
-        # 0: "yes" - steigender hoher Formant (e->s)
-        {"f1": 3, "f2": 11, "slope": 0.5, "noise": 0.2, "burst_pos": 0.7},
-        # 1: "no" - tiefer fallender Formant (n->o)
-        {"f1": 2, "f2": 6, "slope": -0.4, "noise": 0.1, "burst_pos": 0.2},
-        # 2: "up" - steiler Anstieg mit Plosiv am Ende (p)
-        {"f1": 4, "f2": 8, "slope": 0.8, "noise": 0.25, "burst_pos": 0.85},
-        # 3: "down" - breites Frequenzspektrum sinkend
-        {"f1": 5, "f2": 9, "slope": -0.6, "noise": 0.15, "burst_pos": 0.15},
-        # 4: "left" - zweiphasiges Vokal-Frikativ-Muster
-        {"f1": 4, "f2": 12, "slope": 0.2, "noise": 0.35, "burst_pos": 0.6},
-        # 5: "right" - starker Diphtong mit Rauschkomponente
-        {"f1": 3, "f2": 10, "slope": 0.6, "noise": 0.2, "burst_pos": 0.3},
-        # 6: "on" - resonantes Mittelfrequenzband
-        {"f1": 5, "f2": 7, "slope": 0.0, "noise": 0.1, "burst_pos": 0.5},
-        # 7: "off" - langes Rauschband am Ende (ff)
-        {"f1": 4, "f2": 8, "slope": -0.2, "noise": 0.5, "burst_pos": 0.7},
-        # 8: "stop" - Plosiv (st) + Vokal (o) + Plosiv (p)
-        {"f1": 2, "f2": 13, "slope": 0.0, "noise": 0.4, "burst_pos": 0.1},
-        # 9: "go" - tiefer Vokal mit Obertönen
-        {"f1": 2, "f2": 5, "slope": -0.3, "noise": 0.1, "burst_pos": 0.4},
-    ]
+    def __init__(self, source: Dataset, torchaudio_module):
+        self.source = source
+        self.keyword_to_index = {word: i for i, word in enumerate(SPEECH_COMMANDS)}
+        self.samples = []
+        for i in range(len(source)):
+            relative_path, sample_rate, label, _, _ = source.get_metadata(i)
+            if label in self.keyword_to_index:
+                # get_metadata() returns paths relative to the archive root (_archive),
+                # while _path already includes the speech_commands_v0.02 subdirectory.
+                self.samples.append((os.path.join(source._archive, relative_path), sample_rate, label))
 
-    def make_samples(n_samples: int):
-        x_data = np.zeros((n_samples, 1, h, w), dtype=np.float32)
-        y_data = np.zeros((n_samples,), dtype=np.int64)
+        self.mel_transform = torchaudio_module.transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=400,
+            win_length=400,
+            hop_length=160,
+            n_mels=40,
+            f_min=20.0,
+            f_max=7600.0,
+            power=2.0,
+        )
+        self.feature_cache = [None] * len(self.samples)
 
-        for i in range(n_samples):
-            cls = i % num_classes
-            y_data[i] = cls
-            pat = patterns[cls]
+    def __len__(self):
+        return len(self.samples)
 
-            spec = np.zeros((h, w), dtype=np.float32)
-            time_axis = np.linspace(0, 1, w)
+    def __getitem__(self, index):
+        cached = self.feature_cache[index]
+        if cached is not None:
+            return cached
 
-            f1_center = pat["f1"] + rng.uniform(-0.5, 0.5)
-            f2_center = pat["f2"] + rng.uniform(-0.5, 0.5)
-            slope = pat["slope"] + rng.uniform(-0.1, 0.1)
+        wav_path, sample_rate, label = self.samples[index]
+        sample_rate, audio = wavfile.read(wav_path)
+        if sample_rate != 16000:
+            raise ValueError(f"Speech Commands erwartet 16 kHz, erhalten: {sample_rate} Hz")
 
-            for t_idx, t_val in enumerate(time_axis):
-                cur_f1 = np.clip(f1_center + slope * t_val * 4, 0, h - 1)
-                cur_f2 = np.clip(f2_center + slope * t_val * 3, 0, h - 1)
+        if np.issubdtype(audio.dtype, np.integer):
+            dtype_info = np.iinfo(audio.dtype)
+            if dtype_info.min < 0:
+                audio = audio.astype(np.float32) / float(max(abs(dtype_info.min), dtype_info.max + 1))
+            else:
+                midpoint = (dtype_info.max + 1) / 2.0
+                audio = (audio.astype(np.float32) - midpoint) / midpoint
+        else:
+            audio = audio.astype(np.float32)
+        waveform = torch.from_numpy(audio.copy())
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        else:
+            waveform = waveform.transpose(0, 1)
+        waveform = waveform.mean(dim=0, keepdim=True)
+        if waveform.size(1) < sample_rate:
+            waveform = torch.nn.functional.pad(waveform, (0, sample_rate - waveform.size(1)))
+        else:
+            waveform = waveform[:, :sample_rate]
 
-                # Formant-Energie Gauss
-                for freq_bin in range(h):
-                    d1 = (freq_bin - cur_f1) ** 2
-                    d2 = (freq_bin - cur_f2) ** 2
-                    spec[freq_bin, t_idx] += 0.8 * np.exp(-d1 / 1.8) + 0.6 * np.exp(-d2 / 2.2)
-
-                # Plosiv / Konsonanten-Burst
-                burst_diff = abs(t_val - pat["burst_pos"])
-                if burst_diff < 0.15:
-                    burst_energy = (1.0 - burst_diff / 0.15) * pat["noise"]
-                    spec[:, t_idx] += burst_energy * rng.uniform(0.2, 1.0, size=(h,))
-
-            # Rausch- und Varianzbeimischung
-            noise = rng.normal(0.0, 0.05 + 0.05 * pat["noise"], size=(h, w))
-            spec = np.clip(spec + noise, 0.0, 1.0)
-            # Normalisierung auf 0.0 - 1.0
-            if spec.max() > 0:
-                spec = spec / spec.max()
-
-            x_data[i, 0] = spec.astype(np.float32)
-        return x_data, y_data
-
-    x_tr, y_tr = make_samples(num_train)
-    x_te, y_te = make_samples(num_test)
-
-    train_ds = TensorDataset(torch.from_numpy(x_tr), torch.from_numpy(y_tr))
-    test_ds = TensorDataset(torch.from_numpy(x_te), torch.from_numpy(y_te))
-    return train_ds, test_ds
+        mel = self.mel_transform(waveform)
+        mel_db = 10.0 * torch.log10(mel.clamp_min(1e-10))
+        mel_db = (mel_db - mel_db.max()).clamp(min=-80.0, max=0.0)
+        mel = (mel_db + 80.0) / 80.0
+        features = torch.nn.functional.adaptive_avg_pool2d(mel.unsqueeze(0), (16, 16)).squeeze(0)
+        result = (features.to(torch.float32), self.keyword_to_index[label])
+        self.feature_cache[index] = result
+        return result
 
 
 def _generate_synthetic_har(
@@ -534,6 +546,119 @@ def _generate_synthetic_ecg(
     return TensorDataset(torch.from_numpy(x_tr), torch.from_numpy(y_tr)), TensorDataset(torch.from_numpy(x_te), torch.from_numpy(y_te))
 
 
+def _load_physionet_eeg_mi(data_dir: str, seed: int) -> Tuple[Dataset, Dataset, Dataset]:
+    """Lädt PhysioNet EEGMMIDB mit personengetrenntem Train/Val/Test-Split."""
+    try:
+        import mne
+        from mne.datasets import eegbci
+    except ImportError as exc:
+        raise ImportError(
+            "Der echte PhysioNet EEG-Motor-Imagery-Datensatz benötigt MNE. "
+            "Installiere die Projektabhängigkeiten mit `pip install -r requirements.txt`."
+        ) from exc
+
+    dataset_root = os.path.join(data_dir, "physionet_eeg_mi")
+    raw_root = os.path.join(dataset_root, "raw")
+    cache_root = os.path.join(dataset_root, "processed_v1")
+    os.makedirs(cache_root, exist_ok=True)
+
+    subject_ids = np.arange(1, 110)
+    rng = np.random.RandomState(seed)
+    shuffled_subjects = rng.permutation(subject_ids)
+    train_subjects = set(shuffled_subjects[:76].tolist())
+    validation_subjects = set(shuffled_subjects[76:92].tolist())
+    test_subjects = set(shuffled_subjects[92:].tolist())
+    split_features = {"train": [], "validation": [], "test": []}
+    split_labels = {"train": [], "validation": [], "test": []}
+
+    def subject_split(subject_id: int) -> str:
+        if subject_id in train_subjects:
+            return "train"
+        if subject_id in validation_subjects:
+            return "validation"
+        return "test"
+
+    for subject_id in subject_ids:
+        cache_path = os.path.join(cache_root, f"subject_{subject_id:03d}.npz")
+        if os.path.isfile(cache_path):
+            with np.load(cache_path) as cache:
+                features = cache["features"]
+                labels = cache["labels"]
+        else:
+            try:
+                raw_paths = eegbci.load_data(
+                    int(subject_id), [4, 8, 12], path=raw_root, update_path=False, verbose="ERROR"
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"PhysioNet EEGMMIDB konnte für Person {subject_id} nicht geladen werden. "
+                    "Prüfe die Internetverbindung und den freien Speicherplatz."
+                ) from exc
+
+            subject_features = []
+            subject_labels = []
+            for raw_path in raw_paths:
+                raw = mne.io.read_raw_edf(raw_path, preload=True, verbose="ERROR")
+                eegbci.standardize(raw)
+                raw.filter(8.0, 30.0, picks="eeg", method="iir", verbose="ERROR")
+                sample_rate = float(raw.info["sfreq"])
+                signals = raw.get_data(picks="eeg")
+                events, event_codes = mne.events_from_annotations(raw, verbose="ERROR")
+
+                for event_name, class_id in (("T1", 0), ("T2", 1)):
+                    if event_name not in event_codes:
+                        continue
+                    for event in events[events[:, 2] == event_codes[event_name]]:
+                        start = int(event[0] - raw.first_samp + round(0.5 * sample_rate))
+                        stop = start + int(round(2.0 * sample_rate))
+                        if start < 0 or stop > signals.shape[1]:
+                            continue
+                        segment = signals[:, start:stop]
+                        freqs, power = welch(
+                            segment,
+                            fs=sample_rate,
+                            nperseg=min(256, segment.shape[1]),
+                            axis=1,
+                        )
+                        frequency_edges = np.linspace(8.0, 30.0, 17)
+                        bands = []
+                        for low, high in zip(frequency_edges[:-1], frequency_edges[1:]):
+                            mask = (freqs >= low) & (freqs < high)
+                            if not np.any(mask):
+                                nearest = int(np.argmin(np.abs(freqs - (low + high) / 2.0)))
+                                band = power[:, nearest]
+                            else:
+                                band = power[:, mask].mean(axis=1)
+                            bands.append(band)
+                        log_power = 10.0 * np.log10(np.maximum(np.stack(bands, axis=1), 1e-30))
+                        mean = float(log_power.mean())
+                        std = float(log_power.std())
+                        normalized = np.clip((log_power - mean) / max(std, 1e-6), -3.0, 3.0)
+                        subject_features.append(((normalized + 3.0) / 6.0).astype(np.float32))
+                        subject_labels.append(class_id)
+                raw.close()
+
+            if not subject_features:
+                raise RuntimeError(f"Keine gültigen EEG-Motor-Imagery-Segmente für Person {subject_id} gefunden.")
+            features = np.stack(subject_features)
+            labels = np.asarray(subject_labels, dtype=np.int64)
+            np.savez_compressed(cache_path, features=features, labels=labels)
+
+        split = subject_split(int(subject_id))
+        split_features[split].append(features)
+        split_labels[split].append(labels)
+        if int(subject_id) % 10 == 0:
+            print(f"[PhysioNet EEGMI] Vorverarbeitung: {subject_id}/109 Personen")
+
+    datasets_by_split = {}
+    for split in ("train", "validation", "test"):
+        x = np.concatenate(split_features[split], axis=0)[:, None, :, :]
+        y = np.concatenate(split_labels[split], axis=0)
+        datasets_by_split[split] = TensorDataset(torch.from_numpy(x), torch.from_numpy(y))
+
+    return datasets_by_split["train"], datasets_by_split["validation"], datasets_by_split["test"]
+
+
 def _generate_synthetic_general_time_series(
     num_train: int = 4000,
     num_test: int = 800,
@@ -596,7 +721,7 @@ def get_dataset(
 
     Gibt (train_dataset, test_dataset, dataset_info) zurück.
     """
-    key = str(name).strip().lower()
+    key = normalize_dataset_name(name)
     if key not in AVAILABLE_DATASETS:
         supported = ", ".join(f"'{k}'" for k in AVAILABLE_DATASETS.keys())
         raise ValueError(
@@ -618,6 +743,11 @@ def get_dataset(
     )
 
     os.makedirs(data_dir, exist_ok=True)
+
+    if key in ("physionet_eeg_mi", "eeg_mi"):
+        train_ds, validation_ds, test_ds = _load_physionet_eeg_mi(data_dir=data_dir, seed=seed)
+        info.validation_dataset = validation_ds
+        return train_ds, test_ds, info
 
     # Falls Daten lokal bereits vorhanden, Download überspringen (z. B. ohne Internetzugang auf HPC)
     if download:
@@ -660,10 +790,34 @@ def get_dataset(
         test_ds = datasets.CIFAR10(root=data_dir, train=False, download=download, transform=transform)
         return train_ds, test_ds, info
 
-    # 4. Audio: Speech Commands (Keyword Spotting)
+    # 4. Audio: reales Speech Commands v0.02 (Keyword Spotting)
     if key in ("speech_commands", "kws"):
-        train_ds, test_ds = _generate_synthetic_speech_commands(num_train=5000, num_test=1000, seed=seed)
-        return train_ds, test_ds, info
+        try:
+            import torchaudio
+        except (ImportError, OSError) as exc:
+            raise ImportError(
+                "Speech Commands benötigt ein lauffähiges torchaudio. Installiere torch, torchvision und "
+                "torchaudio gemeinsam aus demselben Build. CPU-only: "
+                "pip install --force-reinstall torch torchvision torchaudio "
+                "--index-url https://download.pytorch.org/whl/cpu. "
+                "Für CUDA muss das TorchAudio-Paket zur installierten CUDA-Version passen."
+            ) from exc
+
+        train_source = torchaudio.datasets.SPEECHCOMMANDS(
+            root=data_dir, download=download, subset="training"
+        )
+        validation_source = torchaudio.datasets.SPEECHCOMMANDS(
+            root=data_dir, download=download, subset="validation"
+        )
+        test_source = torchaudio.datasets.SPEECHCOMMANDS(
+            root=data_dir, download=download, subset="testing"
+        )
+        info.validation_dataset = SpeechCommandsDataset(validation_source, torchaudio)
+        return (
+            SpeechCommandsDataset(train_source, torchaudio),
+            SpeechCommandsDataset(test_source, torchaudio),
+            info,
+        )
 
     # 5. Sensordaten / HAR (Human Activity Recognition)
     if key in ("har_time_series", "uci_har"):

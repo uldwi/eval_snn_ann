@@ -1621,18 +1621,20 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
 }
 #endif
 
-static int run_snn_inference_dense(const float *img, uint32_t *out_spikes) {
+static int run_snn_inference_dense(const float *img, uint32_t *out_spikes, uint32_t *out_synops) {
     const snn_config_t &cfg = g_snn_config;
     uint32_t total_spk = 0;
+    uint32_t total_synops = 0;
 
     reset_snn_state();
     encode_input_times(img);
 
     for (int t = 0; t < cfg.num_steps; ++t) {
-        snn_step(img, t, &total_spk, nullptr);
+        snn_step(img, t, &total_spk, &total_synops);
     }
 
     if (out_spikes) *out_spikes = total_spk;
+    if (out_synops) *out_synops = total_synops;
     return snn_argmax();
 }
 
@@ -1657,8 +1659,7 @@ static int run_snn_inference(const float *img, uint32_t *out_spikes, uint32_t *o
     if (g_snn_config.execution_mode == EXECUTION_MODE_EVENT_BASED) {
         return run_snn_inference_event_based(img, out_spikes, out_synops);
     } else {
-        if (out_synops) *out_synops = 0;
-        return run_snn_inference_dense(img, out_spikes);
+        return run_snn_inference_dense(img, out_spikes, out_synops);
     }
 }
 
@@ -1797,18 +1798,25 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Trigger-Pin GPIO %d (mit Joulescope IN1 verbunden) bereit.\n", TRIGGER_GPIO);
 
     while (1) {
-        ESP_LOGI(TAG, "Warte 3 Sekunden vor Start des Inferenz-Messzyklus...");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGI(TAG, "Warte 2 Sekunden vor Start des Inferenz-Messzyklus...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
 
-        // GPIO-Handshake: Langeres LOW-HIGH-LOW-Signal, damit der Joulescope sich synchronisieren kann
-        // 300ms HIGH ist unter dem Handshake-Limit von 500ms in measure_power.py,
-        // sodass es als Handshake erkannt und ignoriert wird.
+        // GPIO-Start-Muster: 3x HIGH(200ms) mit LOW(100ms) dazwischen -> Messung(HIGH)
+        // Drei Impulse unterscheiden sich klar vom Ende-Muster (2 Impulse) und von Rauschen.
         gpio_set_level(TRIGGER_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(300));
+        vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(TRIGGER_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        ESP_LOGI(TAG, "Handshake-Signal gesendet, warte 3 Sekunden vor Inferenz...");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(TRIGGER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(TRIGGER_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(TRIGGER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(TRIGGER_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "Start-Muster (3 Impulse) gesendet, warte 1 Sekunde vor Inferenz...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
         // Start der Messung: Trigger-Pin auf HIGH
         ESP_LOGI(TAG, ">>> START: Setze GPIO %d auf HIGH (Inferenz laeuft) <<<", TRIGGER_GPIO);
@@ -1849,9 +1857,19 @@ extern "C" void app_main(void)
 
         int64_t end_time = esp_timer_get_time();
 
-        // Ende der Messung: Trigger-Pin auf LOW
+        // Ende-Muster: LOW(100ms) -> HIGH(200ms) -> LOW(100ms) -> HIGH(200ms) -> LOW(500ms)
+        // Zwei Impulse unterscheiden sich klar vom Start-Muster (3 Impulse).
         gpio_set_level(TRIGGER_GPIO, 0);
-        ESP_LOGI(TAG, ">>> ENDE: Setze GPIO %d auf LOW (Inferenz beendet) <<<", TRIGGER_GPIO);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(TRIGGER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(TRIGGER_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(TRIGGER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(TRIGGER_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI(TAG, ">>> ENDE: Ende-Muster (2 Impulse) gesendet (Inferenz beendet) <<<", TRIGGER_GPIO);
 
         int64_t elapsed_us = end_time - start_time;
 #if SNN_PROFILE
@@ -1878,10 +1896,8 @@ extern "C" void app_main(void)
             float avg_synops_per_inf = (float)total_all_synops / (float)MNIST_TEST_SUBSET;
             ESP_LOGI(TAG, "  - Spikes gesamt:      %" PRIu64 " (Ø %.1f Spikes/Inferenz)",
                      total_all_spikes, avg_spk_per_inf);
-            if (g_snn_config.execution_mode == EXECUTION_MODE_EVENT_BASED) {
-                ESP_LOGI(TAG, "  - SynOps gesamt:      %" PRIu64 " (Ø %.1f SynOps/Inferenz)",
-                         total_all_synops, avg_synops_per_inf);
-            }
+            ESP_LOGI(TAG, "  - SynOps gesamt:      %" PRIu64 " (Ø %.1f SynOps/Inferenz)",
+                     total_all_synops, avg_synops_per_inf);
     #if SNN_PROFILE
         {
             uint64_t c = 0, p = 0, f = 0, cs = 0, ce = 0;

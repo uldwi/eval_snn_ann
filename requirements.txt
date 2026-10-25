@@ -1,12 +1,14 @@
-# DACHS GPU Training Requirements
-# Install PyTorch with CUDA 12.4 support first:
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-#
-# Then install remaining dependencies:
+# Install torch, torchvision, and torchaudio together from one matching build.
+# CPU-only (recommended for this project on machines without a configured CUDA runtime):
+# pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# For CUDA, use the matching command at https://pytorch.org/get-started/locally/.
+# Then install the remaining project dependencies:
 # pip install -r requirements.txt
 
 joulescope
 numpy>=1.20.0
+scipy>=1.10.0
+mne>=1.8.0
 flatbuffers>=23.0.0
 tflite>=2.10.0
 pyyaml>=6.0.0

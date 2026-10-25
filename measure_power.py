@@ -358,15 +358,15 @@ def print_comparison_summary(all_results: list):
     if not all_results:
         return
 
-    print("\n" + "=" * 136)
+    print("\n" + "=" * 184)
     print("                                GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)")
-    print("=" * 136)
+    print("=" * 184)
 
-    header = f"{'Modell-Name':<20} | {'Typ':<5} | {'Netzwerk-Architektur':<38} | {'Host Acc (10k)':<14} | {'ESP32 Acc (Test)':<18} | {'Größe':<9} | {'Zeit/Inf':<10} | {'Energie/Inf':<12} | {'Mittl. Leist.'}"
-    sub_hdr = f"{'':<20} | {'':<5} | {'':<38} | {'(%)':<14} | {'(% [korrekt])':<18} | {'(Bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)'}"
+    header = f"{'Modell-Name':<20} | {'Typ':<5} | {'Netzwerk-Architektur':<38} | {'Host Acc (10k)':<14} | {'ESP32 Acc (Test)':<18} | {'Größe':<9} | {'Zeit/Inf':<10} | {'Energie/Inf':<12} | {'Mittl. Leist.':<14} | {'Spikes gesamt (Ø/Inf)':<24} | {'SynOps gesamt (Ø/Inf)'}"
+    sub_hdr = f"{'':<20} | {'':<5} | {'':<38} | {'(%)':<14} | {'(% [korrekt])':<18} | {'(Bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)':<14} | {'(Anzahl)':<24} | {'(Anzahl)'}"
     print(header)
     print(sub_hdr)
-    print("-" * 136)
+    print("-" * 184)
 
     for res in all_results:
         name = res.get("name", "Modell")[:20]
@@ -413,17 +413,35 @@ def print_comparison_summary(all_results: list):
                     e_inf_val = avg_power_mw * t_inf_val  # mW * ms = µJ
                     e_inf = f"{e_inf_val:.2f} µJ"
                 else:
-                    e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else f"{m['energy_uj']:.1f} µJ"
+                    e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else (f"{m['energy_uj']:.1f} µJ" if m.get("energy_uj") is not None else "N/A")
             else:
                 t_inf = f"{m['time_per_inf_ms']:.2f} ms" if m.get("time_per_inf_ms") is not None else f"{m['duration_s']*1000:.1f} ms"
-                e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else f"{m['energy_uj']:.1f} µJ"
+                e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else (f"{m['energy_uj']:.1f} µJ" if m.get("energy_uj") is not None else "N/A")
             p_avg = f"{m['avg_power_mw']:.2f} mW" if m.get("avg_power_mw") is not None else "N/A"
         else:
             t_inf, e_inf, p_avg = "Keine Daten", "Keine Daten", "Keine Daten"
 
-        print(f"{name:<20} | {m_type:<5} | {structure:<38} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg}")
+        spike_str = "-"
+        synops_str = "-"
+        if m_type == "SNN":
+            metrics = res.get("metrics") or {}
+            sample_count = metrics.get("esp32_total") or res.get("num_test_samples")
+            spikes = metrics.get("esp32_spikes")
+            synops = metrics.get("esp32_synops")
+            if spikes is not None:
+                spike_avg = spikes / sample_count if sample_count else None
+                spike_str = f"{spikes:,} ({spike_avg:.1f}/Inf)" if spike_avg is not None else f"{spikes:,}"
+            else:
+                spike_str = "N/A"
+            if synops is not None:
+                synops_avg = synops / sample_count if sample_count else None
+                synops_str = f"{synops:,} ({synops_avg:.1f}/Inf)" if synops_avg is not None else f"{synops:,}"
+            else:
+                synops_str = "N/A"
 
-    print("=" * 136 + "\n")
+        print(f"{name:<20} | {m_type:<5} | {structure:<38} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg:<14} | {spike_str:<24} | {synops_str}")
+
+    print("=" * 184 + "\n")
 
 
 def measure_triggered(
@@ -434,26 +452,53 @@ def measure_triggered(
     max_duration: float = None,
 ) -> dict:
     """
-    Misst den Energieverbrauch synchron zu einem digitalen Triggersignal an IN1 (oder IN0).
-    Startet die Abtastung, wartet auf HIGH, erfasst Daten solange HIGH anliegt, und stoppt bei LOW.
+    Misst den Energieverbrauch synchron zu einem muster-basierten Triggersignal an IN1 (oder IN0).
 
-    Der ESP32 sendet vor jedem Inferenz-Zyklus ein Handshake-Signal (kurzes HIGH < 500 ms),
-    gefolgt vom eigentlichen Mess-Trigger (HIGH waehrend der gesamten Inferenz).
-    Handshake-Signale werden erkannt und ignoriert.
+    Protokoll (ESP32 sendet diese Muster):
+      Start-Muster:  3x HIGH(200ms) mit LOW(100ms) dazwischen -> Messung(HIGH)
+      Messung:       HIGH waehrend der gesamten Inferenz (>= 100ms)
+      Ende-Muster:   2x HIGH(200ms) mit LOW(100ms) dazwischen -> LOW(500ms)
+    
+    Start- und Ende-Muster sind durch die Anzahl der Impulse (3 vs. 2) eindeutig unterscheidbar.
 
-    Wenn eine Messung zu kurz war (< 100 ms, d.h. der Trigger wurde teilweise verpasst),
-    wird der Accumulator zurueckgesetzt und auf den naechsten Zyklus gewartet.
-    Der ESP32 laeuft in einer Endlosschleife, also stehen mehrere Zyklen zur Verfuegung.
+    Ein zustandsbasierter Parser erkennt die Muster auch bei verpassten Samples oder
+    Chunk-Grenzen. Der ESP32 laeuft in einer Endlosschleife, also stehen mehrere Zyklen
+    zur Verfuegung.
     """
     gpi_field = "gpi1" if pin.lower() in ("in1", "gpi1", "1") else "gpi0"
-    channel_label = "IN1 (ESP32-C6 Pin 4)" if gpi_field == "gpi1" else "IN0"
+    # Lese den Mikrocontroller aus der config.yaml, um das Board-Label korrekt anzuzeigen
+    try:
+        import yaml as yaml_mod
+        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                mc_config = yaml_mod.safe_load(f)
+            mcu_target = mc_config.get("microcontroller", {}).get("target", "esp32c6")
+            mcu_boards = mc_config.get("microcontroller", {}).get("boards", {})
+            mcu_board = mcu_boards.get(mcu_target, {})
+            board_name = mcu_board.get("name", "ESP32")
+            trigger_gpio = mcu_board.get("trigger_gpio", 4)
+        else:
+            board_name = "ESP32"
+            trigger_gpio = 4
+    except Exception:
+        board_name = "ESP32"
+        trigger_gpio = 4
+    channel_label = f"IN1 ({board_name} Pin {trigger_gpio})" if gpi_field == "gpi1" else "IN0"
 
-    # Handshake-Signale sind < 500 ms HIGH (ESP32 sendet 300 ms Handshake)
-    HANDSHAKE_MAX_MS = 500.0
-    # Eine gueltige Messung muss mindestens 100 ms dauern (Inferenz laeuft immer laenger)
-    MIN_VALID_MEASURE_MS = 100.0
+    # Muster-Toleranzen (in ms) — der ESP32 sendet exakte Zeiten, aber wir erlauben Spielraum
+    # Ein Impuls im Muster: HIGH ~200ms (Toleranz 150-300ms), LOW zwischen Impulsen ~100ms (Toleranz 50-200ms)
+    PULSE_HIGH_MIN_MS = 150.0
+    PULSE_HIGH_MAX_MS = 300.0
+    GAP_LOW_MIN_MS = 50.0
+    GAP_LOW_MAX_MS = 200.0
+    # Die eigentliche Messung dauert mindestens 100ms (Inferenz ist immer laenger)
+    MIN_MEASURE_MS = 100.0
+    # Nach dem Start-Muster: LOW-Phase vor Messung ~1100ms (100ms Gap + 1000ms Wartezeit)
+    # Wir warten auf HIGH nach >= 300ms LOW (um das Start-Muster von der Messung zu trennen)
+    START_TO_MEASURE_GAP_MIN_MS = 300.0
 
-    # Berechne maximal zulässige Messdauer während HIGH aktiv ist (dynamisch nach Anzahl Samples)
+    # Berechne maximal zulässige Messdauer (dynamisch nach Anzahl Samples)
     if max_duration is None:
         max_duration = max(60.0, (num_inferences or 50) * 2.0)
 
@@ -464,14 +509,15 @@ def measure_triggered(
         pass
 
     sampling_freq = device.output_sampling_frequency
+    samples_per_ms = sampling_freq / 1000.0
+
     print(f"Abtastrate Joulescope:   {sampling_freq / 1e6:.2f} MSPS")
-    print(f"Warte auf Startsignal an {channel_label} (Pegel = HIGH)...")
+    print(f"Warte auf Startmuster an {channel_label}...")
+    print(f"  Protokoll: Start-Muster (3x Impuls) -> Messung(HIGH) -> Ende-Muster (2x Impuls)")
     if timeout > 0:
         print(f"Trigger-Timeout:         {timeout:.1f} Sekunden (gesamt)")
     if max_duration > 0:
         print(f"Max. Messdauer:          {max_duration:.1f} Sekunden (pro Zyklus)")
-    print(f"Handshake-Limit:         {HANDSHAKE_MAX_MS:.0f} ms (darauf folgt der eigentliche Trigger)")
-    print(f"Min. Messdauer:          {MIN_VALID_MEASURE_MS:.0f} ms (kuerzere Messungen werden wiederholt)")
 
     device.start()
 
@@ -487,30 +533,72 @@ def measure_triggered(
         title="GESAMTE MESSDAUER",
     )
     last_processed_id = None
-    measuring = False
-    last_gpi_value = 0  # Vorheriger Triggersignal-Zustand (LOW=0, HIGH=1)
+
+    # Zustandsmaschine fuer Muster-Erkennung
+    # Start-Muster: 3 Impulse (unterscheidbar vom Ende-Muster mit 2 Impulsen)
+    # Staende:
+    #   IDLE           - Wartet auf den ersten HIGH-Impuls (Start-Muster Puls 1)
+    #   START_PULSE1   - Erster HIGH-Impuls des Start-Musters
+    #   START_GAP1     - LOW zwischen Puls 1 und Puls 2 des Start-Musters
+    #   START_PULSE2   - Zweiter HIGH-Impuls des Start-Musters
+    #   START_GAP2     - LOW zwischen Puls 2 und Puls 3 des Start-Musters
+    #   START_PULSE3   - Dritter HIGH-Impuls des Start-Musters
+    #   START_WAIT     - LOW nach Start-Muster, wartet auf Messung (HIGH)
+    #   MEASURING      - Messung laeuft (HIGH)
+    #   END_GAP1       - LOW nach Messung, vor Ende-Muster Puls 1
+    #   END_PULSE1     - Erster HIGH-Impuls des Ende-Musters
+    #   END_GAP2       - LOW zwischen Puls 1 und Puls 2 des Ende-Musters
+    #   END_PULSE2     - Zweiter HIGH-Impuls des Ende-Musters (nach diesem ist die Messung fertig)
+    STATE_IDLE = 0
+    STATE_START_PULSE1 = 1
+    STATE_START_GAP1 = 2
+    STATE_START_PULSE2 = 3
+    STATE_START_GAP2 = 4
+    STATE_START_PULSE3 = 5
+    STATE_START_WAIT = 6
+    STATE_MEASURING = 7
+    STATE_END_GAP1 = 8
+    STATE_END_PULSE1 = 9
+    STATE_END_GAP2 = 10
+    STATE_END_PULSE2 = 11
+
+    state = STATE_IDLE
+    state_start_samples = 0  # Sample-Index, an dem der aktuelle Zustand begonnen hat
+    last_gpi_value = 0
     t_wait_start = time.time()
     t_measure_start = None
     t_last_progress = 0.0
-    handshake_count = 0
-    retry_count = 0  # Zählt verpasste/ungueltige Messungen
+    retry_count = 0
+    pattern_start_idx = 0  # Sample-Index, ab dem das Start-Muster begonnen hat (für Accumulator-Slice)
 
-    def reset_accumulator():
-        """Accumulator zuruecksetzen fuer einen neuen Messversuch."""
-        nonlocal accumulator
+    def reset_for_retry():
+        """Zustand und Accumulator zuruecksetzen fuer einen neuen Versuch."""
+        nonlocal state, last_gpi_value, t_measure_start, t_last_progress, accumulator
+        state = STATE_IDLE
+        last_gpi_value = 0
+        t_measure_start = None
+        t_last_progress = 0.0
         accumulator = StreamingMetricsAccumulator(
             sampling_freq=sampling_freq,
             num_inferences=num_inferences,
             title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
         )
 
+    def ms_to_samples(ms):
+        return int(ms * samples_per_ms)
+
+    def samples_to_ms(samples):
+        return samples / samples_per_ms
+
     try:
         while True:
             now = time.time()
-            if not measuring:
+
+            # Timeout-Pruefung
+            if state != STATE_MEASURING:
                 if timeout > 0 and (now - t_wait_start) > timeout:
                     raise TimeoutError(
-                        f"Zeitueberschreitung: Kein gueltiges Triggersignal an {channel_label} innerhalb von {timeout:.1f} s empfangen."
+                        f"Zeitueberschreitung: Kein gueltiges Startmuster an {channel_label} innerhalb von {timeout:.1f} s empfangen."
                     )
             else:
                 elapsed = now - t_measure_start
@@ -520,13 +608,9 @@ def measure_triggered(
 
                 if max_duration > 0 and elapsed > max_duration:
                     print(f"\n[Trigger] >>> Timeout: Messung dauerte laenger als {max_duration:.1f} s. <<<")
-                    # Messung als ungueltig markieren und auf naechsten Zyklus warten
                     retry_count += 1
-                    print(f"[Trigger] Messung #{retry_count} war ungueltig (Timeout), warte auf naechsten Zyklus...")
-                    reset_accumulator()
-                    measuring = False
-                    last_gpi_value = 0
-                    t_measure_start = None
+                    print(f"[Trigger] Versuch #{retry_count}, warte auf naechstes Startmuster...")
+                    reset_for_retry()
 
             time.sleep(0.01)  # 10 ms Polling-Intervall
             s1, s2 = device.stream_buffer.sample_id_range
@@ -535,120 +619,194 @@ def measure_triggered(
 
             if last_processed_id is None:
                 last_processed_id = s1
-
             if last_processed_id < s1:
                 last_processed_id = s1
-
             if s2 <= last_processed_id:
                 continue
 
-            # Datenchunk mit Strom, Spannung und Triggersignal abrufen
+            # Datenchunk abrufen
             try:
                 data = device.stream_buffer.samples_get(
                     last_processed_id, s2, fields=["current", "voltage", gpi_field]
                 )
             except ValueError:
-                # Buffer-Synchronisation noch nicht bereit
                 continue
 
             cur_chunk = data["signals"]["current"]["value"]
             vol_chunk = data["signals"]["voltage"]["value"]
             gpi_chunk = data["signals"][gpi_field]["value"]
+            chunk_len = len(gpi_chunk)
             last_processed_id = s2
 
-            # Total-Accumulator immer mit allen Daten füttern (inklusive Wartezeit)
+            # Total-Accumulator immer mit allen Daten füttern
             total_accumulator.update(cur_chunk, vol_chunk)
 
-            if not measuring:
-                # Edge-Detektion: Suchen den ersten Übergang LOW(0) -> HIGH(1).
-                rising_edge_idx = None
-                prev = last_gpi_value
-                for i in range(len(gpi_chunk)):
-                    if prev == 0 and gpi_chunk[i] == 1:
-                        rising_edge_idx = i
-                        break
-                    prev = gpi_chunk[i]
+            # Zustandsmaschine: Verarbeite den Chunk Sample-fuer-Sample
+            chunk_start_global = last_processed_id - chunk_len
+            
+            # Fuer MEASURING-Zustand: sammle die Indices der Mess-Samples in diesem Chunk
+            measure_start_in_chunk = None
+            measure_end_in_chunk = None
 
-                if rising_edge_idx is None:
-                    last_gpi_value = gpi_chunk[-1] if len(gpi_chunk) > 0 else last_gpi_value
-                    continue
+            for i in range(chunk_len):
+                gpi_val = gpi_chunk[i]
+                global_idx = chunk_start_global + i
+                samples_in_state = global_idx - state_start_samples
 
-                first_high = rising_edge_idx
-                measuring = True
-                t_measure_start = time.time()
-                t_last_progress = 0.0
-                print(f"\n[Trigger] >>> Rising Edge erkannt ({channel_label} LOW->HIGH)! Messung gestartet. <<<")
+                if state == STATE_IDLE:
+                    # In IDLE: Jeder HIGH-Wert startet die Mustererkennung.
+                    # Ein Rising-Edge-Check (last_gpi_value == 0) wuerde den Start verpassen,
+                    # wenn der erste Chunk bereits HIGH zeigt oder der Edge ueber Chunk-Grenzen liegt.
+                    if gpi_val == 1:
+                        state = STATE_START_PULSE1
+                        state_start_samples = global_idx
+                        pattern_start_idx = global_idx
 
-                # Erfasse ab dem Rising Edge bis zum Ende des Chunks (oder bis zum LOW im selben Chunk)
-                low_indices = np.where(gpi_chunk[first_high + 1:] == 0)[0]
-                if len(low_indices) == 0:
-                    # Noch kein LOW in diesem Chunk - Messung laeuft weiter
-                    accumulator.update(cur_chunk[first_high:], vol_chunk[first_high:])
+                elif state == STATE_START_PULSE1:
+                    if gpi_val == 0:
+                        pulse_ms = samples_to_ms(samples_in_state)
+                        if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
+                            state = STATE_IDLE
+                        else:
+                            state = STATE_START_GAP1
+                            state_start_samples = global_idx
+
+                elif state == STATE_START_GAP1:
+                    if gpi_val == 1:
+                        gap_ms = samples_to_ms(samples_in_state)
+                        if gap_ms < GAP_LOW_MIN_MS or gap_ms > GAP_LOW_MAX_MS:
+                            state = STATE_IDLE
+                        else:
+                            state = STATE_START_PULSE2
+                            state_start_samples = global_idx
+
+                elif state == STATE_START_PULSE2:
+                    if gpi_val == 0:
+                        pulse_ms = samples_to_ms(samples_in_state)
+                        if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
+                            state = STATE_IDLE
+                        else:
+                            state = STATE_START_GAP2
+                            state_start_samples = global_idx
+
+                elif state == STATE_START_GAP2:
+                    if gpi_val == 1:
+                        gap_ms = samples_to_ms(samples_in_state)
+                        if gap_ms < GAP_LOW_MIN_MS or gap_ms > GAP_LOW_MAX_MS:
+                            state = STATE_IDLE
+                        else:
+                            state = STATE_START_PULSE3
+                            state_start_samples = global_idx
+
+                elif state == STATE_START_PULSE3:
+                    if gpi_val == 0:
+                        pulse_ms = samples_to_ms(samples_in_state)
+                        if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
+                            state = STATE_IDLE
+                        else:
+                            print(f"\n[Trigger] >>> Start-Muster (3 Impulse) erkannt! Warte auf Messung... <<<")
+                            state = STATE_START_WAIT
+                            state_start_samples = global_idx
+
+                elif state == STATE_START_WAIT:
+                    # Nach dem Start-Muster: Jeder HIGH-Wert nach ausreichender LOW-Wartezeit
+                    # startet die Messung — kein Rising-Edge-Check, da der Edge verpasst werden koennte.
+                    if gpi_val == 1:
+                        wait_ms = samples_to_ms(samples_in_state)
+                        if wait_ms < START_TO_MEASURE_GAP_MIN_MS:
+                            state = STATE_IDLE
+                        else:
+                            print(f"[Trigger] >>> Messung gestartet (nach {wait_ms:.0f} ms Wartezeit). <<<")
+                            state = STATE_MEASURING
+                            state_start_samples = global_idx
+                            t_measure_start = time.time()
+                            t_last_progress = 0.0
+                            measure_start_in_chunk = i  # Messung beginnt bei diesem Sample
+
+                elif state == STATE_MEASURING:
+                    if gpi_val == 0:
+                        measure_end_in_chunk = i  # Messung endet bei diesem Sample
+                        measure_ms = samples_to_ms(samples_in_state)
+                        if measure_ms < MIN_MEASURE_MS:
+                            retry_count += 1
+                            print(f"[Trigger] >>> Messung zu kurz ({measure_ms:.0f} ms), retry... <<<")
+                            reset_for_retry()
+                            break
+                        else:
+                            print(f"[Trigger] >>> Messung beendet ({measure_ms:.0f} ms), warte auf Ende-Muster... <<<")
+                            state = STATE_END_GAP1
+                            state_start_samples = global_idx
+
+                elif state == STATE_END_GAP1:
+                    if gpi_val == 1:
+                        gap_ms = samples_to_ms(samples_in_state)
+                        if gap_ms < GAP_LOW_MIN_MS or gap_ms > GAP_LOW_MAX_MS:
+                            retry_count += 1
+                            print(f"[Trigger] >>> Ende-Muster nicht erkannt, retry... <<<")
+                            reset_for_retry()
+                            break
+                        else:
+                            state = STATE_END_PULSE1
+                            state_start_samples = global_idx
+
+                elif state == STATE_END_PULSE1:
+                    if gpi_val == 0:
+                        pulse_ms = samples_to_ms(samples_in_state)
+                        if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
+                            retry_count += 1
+                            print(f"[Trigger] >>> Ende-Muster fehlerhaft, retry... <<<")
+                            reset_for_retry()
+                            break
+                        else:
+                            state = STATE_END_GAP2
+                            state_start_samples = global_idx
+
+                elif state == STATE_END_GAP2:
+                    if gpi_val == 1:
+                        gap_ms = samples_to_ms(samples_in_state)
+                        if gap_ms < GAP_LOW_MIN_MS or gap_ms > GAP_LOW_MAX_MS:
+                            retry_count += 1
+                            print(f"[Trigger] >>> Ende-Muster fehlerhaft, retry... <<<")
+                            reset_for_retry()
+                            break
+                        else:
+                            state = STATE_END_PULSE2
+                            state_start_samples = global_idx
+
+                elif state == STATE_END_PULSE2:
+                    if gpi_val == 0:
+                        pulse_ms = samples_to_ms(samples_in_state)
+                        if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
+                            retry_count += 1
+                            print(f"[Trigger] >>> Ende-Muster unvollstaendig, retry... <<<")
+                            reset_for_retry()
+                            break
+                        else:
+                            print(f"[Trigger] >>> Ende-Muster erkannt! Messung abgeschlossen. <<<")
+                            raise SystemExit(0)
+
+                last_gpi_value = gpi_val
+
+            # Nach der Sample-fuer-Sample-Verarbeitung: Accumulator mit den Mess-Samples fuettern
+            if measure_start_in_chunk is not None:
+                if measure_end_in_chunk is not None:
+                    # Messung hat in diesem Chunk begonnen UND geendet
+                    accumulator.update(cur_chunk[measure_start_in_chunk:measure_end_in_chunk],
+                                       vol_chunk[measure_start_in_chunk:measure_end_in_chunk])
                 else:
-                    first_low = first_high + 1 + low_indices[0]
-                    accumulator.update(cur_chunk[first_high:first_low], vol_chunk[first_high:first_low])
+                    # Messung beginnt in diesem Chunk und laeuft weiter
+                    accumulator.update(cur_chunk[measure_start_in_chunk:],
+                                       vol_chunk[measure_start_in_chunk:])
+            elif measure_end_in_chunk is not None:
+                # Messung lief bereits vor diesem Chunk und endet in diesem Chunk
+                accumulator.update(cur_chunk[:measure_end_in_chunk], vol_chunk[:measure_end_in_chunk])
+            elif state == STATE_MEASURING:
+                # Messung lief bereits vor diesem Chunk und laeuft weiter (kein Ende in diesem Chunk)
+                accumulator.update(cur_chunk, vol_chunk)
 
-                    # Dauer der HIGH-Phase berechnen
-                    measure_duration_s = (first_low - first_high) / sampling_freq
-                    measure_duration_ms = measure_duration_s * 1000.0
-
-                    # Handshake-Erkennung: Kurze HIGH-Phase (< HANDSHAKE_MAX_MS)
-                    if measure_duration_ms < HANDSHAKE_MAX_MS:
-                        handshake_count += 1
-                        print(f"[Trigger] >>> Handshake-Signal erkannt ({measure_duration_ms:.0f} ms), ignoriert. <<<")
-                        reset_accumulator()
-                        measuring = False
-                        last_gpi_value = 0
-                        continue
-
-                    # Gueltige Messung? (>= MIN_VALID_MEASURE_MS)
-                    if measure_duration_ms < MIN_VALID_MEASURE_MS:
-                        retry_count += 1
-                        print(f"[Trigger] >>> Messung zu kurz ({measure_duration_ms:.0f} ms < {MIN_VALID_MEASURE_MS:.0f} ms), ignoriert. <<<")
-                        print(f"[Trigger] Versuch #{retry_count}, warte auf naechsten Zyklus...")
-                        reset_accumulator()
-                        measuring = False
-                        last_gpi_value = 0
-                        continue
-
-                    # Gueltige Messung gefunden!
-                    print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet ({measure_duration_ms:.0f} ms). <<<")
-                    break
-            else:
-                # Messung laeuft: Suche nach fallender Flanke (LOW)
-                low_indices = np.where(gpi_chunk == 0)[0]
-                if len(low_indices) == 0:
-                    accumulator.update(cur_chunk, vol_chunk)
-                else:
-                    first_low = low_indices[0]
-                    accumulator.update(cur_chunk[:first_low], vol_chunk[:first_low])
-
-                    # Dauer berechnen und pruefen
-                    measure_duration_s = accumulator.num_samples / sampling_freq
-                    measure_duration_ms = measure_duration_s * 1000.0
-
-                    # Handshake-Erkennung: Kurze HIGH-Phase (< HANDSHAKE_MAX_MS)
-                    # Muss auch hier geprueft werden, weil Handshake-Signale mehrere Chunks ueberspannen koennen
-                    if measure_duration_ms < HANDSHAKE_MAX_MS:
-                        handshake_count += 1
-                        print(f"[Trigger] >>> Handshake-Signal erkannt ({measure_duration_ms:.0f} ms), ignoriert. <<<")
-                        reset_accumulator()
-                        measuring = False
-                        last_gpi_value = 0
-                        continue
-
-                    if measure_duration_ms < MIN_VALID_MEASURE_MS:
-                        retry_count += 1
-                        print(f"[Trigger] >>> Messung zu kurz ({measure_duration_ms:.0f} ms), ignoriert. <<<")
-                        print(f"[Trigger] Versuch #{retry_count}, warte auf naechsten Zyklus...")
-                        reset_accumulator()
-                        measuring = False
-                        last_gpi_value = 0
-                        continue
-
-                    print(f"[Trigger] >>> Stopp-Signal erkannt ({channel_label} = LOW)! Messung beendet ({measure_duration_ms:.0f} ms). <<<")
-                    break
-
+    except SystemExit as e:
+        if e.code != 0:
+            raise
     finally:
         try:
             device.stop()
@@ -656,11 +814,9 @@ def measure_triggered(
             pass
         time.sleep(0.05)
 
-    # Zusammenfassung der erkannten Signale
-    if handshake_count > 0:
-        print(f"\n[Trigger] {handshake_count} Handshake-Signal(e) erkannt und ignoriert.")
+    # Zusammenfassung
     if retry_count > 0:
-        print(f"[Trigger] {retry_count} zu kurze Messung(en) wiederholt.")
+        print(f"\n[Trigger] {retry_count} fehlerhafte(r) Zyklus(se) wiederholt.")
 
     # GPIO-Trigger-Messung anzeigen
     metrics = accumulator.compute_and_display()

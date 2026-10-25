@@ -106,11 +106,30 @@ DEFAULT_CONFIG = {
     "evaluation": {
         "num_test_samples": 500,
     },
-    "esp32": {
-        "trigger_pin": 4,
+    "microcontroller": {
+        "target": "esp32c6",
+        "boards": {
+            "esp32c6": {
+                "name": "ESP32-C6",
+                "board": "ESP32-C6-DevKitC-1",
+                "architecture": "RISC-V",
+                "cpu_freq_mhz": 160,
+                "sram_kb": 512,
+                "trigger_gpio": 4,
+                "joulescope_gpi": "in1",
+            },
+            "esp32s3": {
+                "name": "ESP32-S3",
+                "board": "ESP32-S3-DevKitC-1 v1.1",
+                "architecture": "Xtensa LX7",
+                "cpu_freq_mhz": 240,
+                "sram_kb": 512,
+                "trigger_gpio": 4,
+                "joulescope_gpi": "in1",
+            },
+        },
     },
     "joulescope": {
-        "trigger_pin": "in1",
         "timeout": 60.0,
         "max_duration": None,
     },
@@ -891,6 +910,7 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "num_steps": int(model_cfg.get("num_steps", model_cfg.get("steps", 10))),
             "beta": float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0,
             "threshold": float(model_cfg.get("threshold", 1.0)),
+            "ann_checkpoint": model_cfg.get("ann_checkpoint"),
         }
     else:
         signature["ann_params"] = {
@@ -1446,6 +1466,13 @@ def train_model(
         data_dir=data_dir,
         seed=random_seed if random_seed is not None else 42,
     )
+    selection_dataset = dataset_info.validation_dataset or test_dataset
+    selection_label = "Validierung" if dataset_info.validation_dataset is not None else "Test"
+    in_channels = int(dataset_info.in_channels)
+    in_height = int(dataset_info.in_height)
+    in_width = int(dataset_info.in_width)
+    input_size = int(dataset_info.input_size)
+    output_size = int(dataset_info.num_classes)
 
     signature, sig_hash = compute_model_signature(config, dataset_info)
     model = build_model_from_config(config, dataset_info, device=device)
@@ -1480,12 +1507,6 @@ def train_model(
                 print(f"[Transfer] Fehler beim Laden des ANN-Checkpoints: {e}\n")
         else:
             print(f"[Transfer] Kein ANN-Checkpoint '{ann_checkpoint_path}' gefunden - SNN wird zufällig initialisiert.\n")
-
-    in_channels = int(dataset_info.in_channels)
-    in_height = int(dataset_info.in_height)
-    in_width = int(dataset_info.in_width)
-    input_size = int(dataset_info.input_size)
-    output_size = int(dataset_info.num_classes)
 
     safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in model_name)
     checkpoint_path = os.path.join(resolved_save_dir, f"{safe_name}.pt")
@@ -1570,7 +1591,7 @@ def train_model(
     print("=" * 65 + "\n")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    test_loader = DataLoader(selection_dataset, batch_size=128, shuffle=False)
 
     criterion = nn.CrossEntropyLoss()
     optimizer_name = optimizer_name.lower()
@@ -1632,7 +1653,7 @@ def train_model(
                 correct += pred.eq(target).sum().item()
 
         test_loss /= len(test_loader)
-        test_acc = 100.0 * correct / len(test_dataset)
+        test_acc = 100.0 * correct / len(selection_dataset)
         avg_loss = running_loss / max(1, total_batches)
 
         # Early Stopping Überprüfung
@@ -1663,7 +1684,7 @@ def train_model(
         else:
             best_tag = f" [Patience: {patience_counter}/{patience}]" if early_stopping_enabled else ""
 
-        print(f"  Epoche {epoch:02d}/{epochs:02d} | Train-Verlust: {avg_loss:.4f} | Test-Verlust: {test_loss:.4f} | Test-Genauigkeit: {test_acc:.2f}%{best_tag}")
+        print(f"  Epoche {epoch:02d}/{epochs:02d} | Train-Verlust: {avg_loss:.4f} | {selection_label}-Verlust: {test_loss:.4f} | {selection_label}-Genauigkeit: {test_acc:.2f}%{best_tag}")
 
         scheduler.step()
 
@@ -1675,9 +1696,9 @@ def train_model(
         model.load_state_dict(best_state_dict)
         test_acc = best_test_acc
         avg_loss = best_test_loss
-        print(f"[PyTorch] Bestes Modell aus Epoche {best_epoch} für Export und Inferenz aktiviert (Test-Genauigkeit: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
+        print(f"[PyTorch] Bestes Modell aus Epoche {best_epoch} für Export und Inferenz aktiviert ({selection_label}-Genauigkeit: {best_test_acc:.2f}%, {selection_label}-Verlust: {best_test_loss:.4f}).")
 
-    print(f"[PyTorch] Training für '{model_name}' abgeschlossen (Beste Test-Genauigkeit: {test_acc:.2f}%).\n")
+    print(f"[PyTorch] Training für '{model_name}' abgeschlossen (beste {selection_label}-Genauigkeit: {test_acc:.2f}%).\n")
 
     # ---------------------------------------------------------
     # Post-Training Optimierung (Pruning, Quantisierung, Clustering)
@@ -1685,13 +1706,17 @@ def train_model(
     model, opt_info = optimize_model(
         model=model,
         config=config,
-        test_dataset=test_dataset,
+        test_dataset=selection_dataset,
         train_dataset=train_dataset,
         device=device,
     )
     if opt_info.get("applied", False):
         test_acc = float(opt_info.get("post_acc", test_acc))
         avg_loss = float(opt_info.get("post_loss", avg_loss))
+
+    if dataset_info.validation_dataset is not None:
+        test_acc, avg_loss = evaluate_model(model, test_dataset, device=device)
+        print(f"[PyTorch] Offizielle Testgenauigkeit auf dem unangetasteten Speech-Commands-Testsplit: {test_acc:.2f}%.")
 
     # ---------------------------------------------------------
     # Automatisches Speichern des trainierten Modells (Checkpoint & Metadaten)
@@ -1947,6 +1972,17 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
             use_relu = (not is_last) and (getattr(model, "activation_name", "relu") == "relu")
 
             w = fc.weight.detach().cpu().numpy().astype(np.float32)
+            if f_idx == 0:
+                # TFLite Conv2D produces NHWC data, while PyTorch's Flatten
+                # presents the same activations to this layer in NCHW order.
+                # Keep the TFLite graph in NHWC and reorder the first FC
+                # layer's columns to match that layout.
+                last_conv = model.resolved_conv[-1]
+                channels = last_conv["out_channels"]
+                height = last_conv["pool_out_h"]
+                width = last_conv["pool_out_w"]
+                w = w.reshape(fc.out_features, channels, height, width)
+                w = w.transpose(0, 2, 3, 1).reshape(fc.out_features, -1)
             b = fc.bias.detach().cpu().numpy().astype(np.float32)
             w_buf = make_buffer(w)
             b_buf = make_buffer(b)
@@ -2366,8 +2402,16 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
     global_training = dict(config.get("training", {}))
     global_evaluation = dict(config.get("evaluation", {}))
     global_optimization = dict(config.get("optimization", {})) if isinstance(config.get("optimization"), dict) else {}
-    global_esp32 = dict(config.get("esp32", {}))
+    global_microcontroller = dict(config.get("microcontroller", {}))
     global_joulescope = dict(config.get("joulescope", {}))
+    
+    # Hole die Board-spezifischen Einstellungen für das ausgewählte Target
+    mcu_target = global_microcontroller.get("target", "esp32c6")
+    mcu_boards = global_microcontroller.get("boards", {})
+    mcu_board = mcu_boards.get(mcu_target, {})
+    if not mcu_board:
+        # Fallback: alter esp32-Block (rückwärtskompatibel)
+        mcu_board = dict(config.get("esp32", {}))
 
     target_ds_filter = normalize_dataset_name(dataset_filter) if dataset_filter else None
 
@@ -2439,6 +2483,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 model_dict["num_steps"] = int(m.get("num_steps", m.get("steps", 10)))
                 model_dict["beta"] = float(m.get("beta", 0.9))
                 model_dict["threshold"] = float(m.get("threshold", 1.0))
+                if m.get("ann_checkpoint"):
+                    model_dict["ann_checkpoint"] = str(m["ann_checkpoint"])
             else:
                 model_dict["activation"] = str(m.get("activation", config.get("model", {}).get("activation", "relu")))
 
@@ -2495,7 +2541,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "training": model_training,
                 "evaluation": model_evaluation,
                 "optimization": model_optimization,
-                "esp32": global_esp32,
+                "microcontroller": global_microcontroller,
                 "joulescope": global_joulescope,
             })
         return resolved_models
@@ -2596,7 +2642,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         "training": model_training,
         "evaluation": model_evaluation,
         "optimization": model_optimization,
-        "esp32": global_esp32,
+        "microcontroller": global_microcontroller,
         "joulescope": global_joulescope,
     })
     return resolved_models
@@ -2836,7 +2882,7 @@ if __name__ == "__main__":
         "-d", "--dataset",
         type=str,
         default=None,
-        help="Wählt den Datensatz (z.B. 'mnist', 'fashion_mnist', 'cifar10', 'speech_commands', 'har_time_series', 'eeg_data', 'ecg_data', 'synthetic_time_series')",
+        help="Wählt den Datensatz (z.B. 'mnist', 'fashion_mnist', 'cifar10', 'speech_commands', 'physionet_eeg_mi'/'eeg_mi', 'har_time_series', 'eeg_data', 'ecg_data', 'synthetic_time_series')",
     )
     parser.add_argument(
         "--list-datasets",
