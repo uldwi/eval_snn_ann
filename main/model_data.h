@@ -27,11 +27,12 @@ extern "C" {
 typedef struct {
     int in_channels;
     int out_channels;
-    int kernel_size;
+    int kernel_h, kernel_w;
     int stride;
-    int padding;
-    int pool_size;
-    int pool_stride;
+    int padding_h, padding_w;
+    int pool_h, pool_w;
+    int pool_stride_h, pool_stride_w;
+    int pool_type;  // 0=max, 1=average
     int in_h, in_w;
     int out_h, out_w;
     int pool_out_h, pool_out_w;
@@ -51,6 +52,9 @@ typedef struct {
     int neuron_type;
     int encoding_type;
     int execution_mode;
+    int temporal_input;
+    float input_scale;
+    int analog_readout;
 } snn_config_t;
 
 extern const int g_model_type;

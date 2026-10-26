@@ -130,12 +130,13 @@ static int s_opt_fcq   = SNN_SEL_INT8_FC;
 // Indexarithmetik in den innersten Schleifen)
 // ---------------------------------------------------------------------
 typedef struct {
-    int k, k2;
+    int k_h, k_w, k2;
     int in_c, out_c;
     int in_h, in_w, in_hw;
     int out_h, out_w, oc_plane;
     int w_oc_stride;
-    int pool_stride, pool_out_h, pool_out_w;
+    int pool_h, pool_w, pool_stride_h, pool_stride_w, pool_out_h, pool_out_w;
+    int pool_type;
     int n_neurons, n_pool;
     bool has_pool;
     bool has_neg_bias;   // mindestens ein Output-Channel mit Bias < 0
@@ -147,6 +148,7 @@ static snn_geom_t s_geom[SNN_MAX_CONV_LAYERS] = {};
 static float    *s_snn_conv_mem[SNN_MAX_CONV_LAYERS] = {nullptr};
 static uint16_t *s_snn_conv_events[SNN_MAX_CONV_LAYERS] = {nullptr};
 static uint16_t *s_snn_conv_pool_events[SNN_MAX_CONV_LAYERS] = {nullptr};
+static float *s_snn_conv_pool_scales[SNN_MAX_CONV_LAYERS] = {nullptr};
 static float    *s_snn_fc_mem[SNN_MAX_FC_LAYERS] = {nullptr};
 static uint16_t *s_snn_fc_events[SNN_MAX_FC_LAYERS] = {nullptr};
 
@@ -239,9 +241,11 @@ static bool need_stamp_tbl(void) {
 #endif
 
 static int s_snn_spk_sum[128] = {0};
+static float s_snn_readout_sum[128] = {0.0f};
 static int16_t s_snn_in_tf[MNIST_IMAGE_SIZE];
 static uint16_t *s_snn_in_events = nullptr;
 static uint16_t *s_snn_flat_events = nullptr;
+static float *s_snn_flat_scales = nullptr;
 static uint8_t  *s_snn_pool_visited = nullptr;
 static int s_conv_variant = SNN_CFG_NHWC | (SNN_CFG_INT8 << 1) | (SNN_CFG_ACC32 << 2);
 
@@ -250,8 +254,9 @@ static void init_geometry(void) {
     for (int l = 0; l < cfg.num_conv_layers; ++l) {
         const snn_conv_layer_cfg_t &cl = cfg.conv_layers[l];
         snn_geom_t &g = s_geom[l];
-        g.k       = cl.kernel_size;
-        g.k2      = cl.kernel_size * cl.kernel_size;
+        g.k_h     = cl.kernel_h;
+        g.k_w     = cl.kernel_w;
+        g.k2      = cl.kernel_h * cl.kernel_w;
         g.in_c    = cl.in_channels;
         g.out_c   = cl.out_channels;
         g.in_h    = cl.in_h;
@@ -261,12 +266,16 @@ static void init_geometry(void) {
         g.out_w   = cl.out_w;
         g.oc_plane = cl.out_h * cl.out_w;
         g.w_oc_stride = cl.in_channels * g.k2;
-        g.pool_stride = (cl.pool_stride > 0) ? cl.pool_stride : cl.pool_size;
+        g.pool_h = cl.pool_h;
+        g.pool_w = cl.pool_w;
+        g.pool_stride_h = (cl.pool_stride_h > 0) ? cl.pool_stride_h : cl.pool_h;
+        g.pool_stride_w = (cl.pool_stride_w > 0) ? cl.pool_stride_w : cl.pool_w;
+        g.pool_type = cl.pool_type;
         g.pool_out_h = cl.pool_out_h;
         g.pool_out_w = cl.pool_out_w;
         g.n_neurons  = cl.out_channels * g.oc_plane;
         g.n_pool     = cl.out_channels * cl.pool_out_h * cl.pool_out_w;
-        g.has_pool   = cl.pool_size > 1;
+        g.has_pool   = cl.pool_h > 1 || cl.pool_w > 1;
         const float *bc = g_snn_conv_biases[l];
         g.has_neg_bias = false;
         if (bc) {
@@ -426,14 +435,14 @@ static bool build_sparse_tables(void) {
             for (int ih = 0; ih < g.in_h; ++ih) {
                 for (int iw = 0; iw < g.in_w; ++iw) {
                     uint16_t *t = toff + ((size_t)ih * g.in_w + iw) * g.k2;
-                    for (int kh = 0; kh < g.k; ++kh) {
-                        const int oh_u = ih + cl.padding - kh;
+                    for (int kh = 0; kh < g.k_h; ++kh) {
+                        const int oh_u = ih + cl.padding_h - kh;
                         const bool row_ok = (oh_u >= 0) && (oh_u < g.out_h * cl.stride) && ((oh_u % cl.stride) == 0);
                         const int oh = row_ok ? (oh_u / cl.stride) : -1;
-                        for (int kw = 0; kw < g.k; ++kw) {
-                            const int ow_u = iw + cl.padding - kw;
+                        for (int kw = 0; kw < g.k_w; ++kw) {
+                            const int ow_u = iw + cl.padding_w - kw;
                             const bool ok = row_ok && (ow_u >= 0) && (ow_u < g.out_w * cl.stride) && ((ow_u % cl.stride) == 0);
-                            if (!ok) { t[kh * g.k + kw] = 0xFFFFu; continue; }
+                            if (!ok) { t[kh * g.k_w + kw] = 0xFFFFu; continue; }
                             const int ow = ow_u / cl.stride;
                             const int flat = oh * g.out_w + ow;
 #if SNN_SEL_RUNTIME
@@ -442,7 +451,7 @@ static bool build_sparse_tables(void) {
                             const bool nhwc = SNN_CFG_NHWC;
 #endif
                             const uint32_t v = nhwc ? (uint32_t)(flat * g.out_c) : (uint32_t)flat;
-                            t[kh * g.k + kw] = (v > 0xFFFEu) ? 0xFFFFu : (uint16_t)v;
+                            t[kh * g.k_w + kw] = (v > 0xFFFEu) ? 0xFFFFu : (uint16_t)v;
                         }
                     }
                 }
@@ -572,6 +581,10 @@ static bool init_snn_buffers(void) {
         if (g.has_pool && g.n_pool > max_pool) {
             max_pool = g.n_pool;
         }
+        if (g.has_pool && g.pool_type == 1) {
+            s_snn_conv_pool_scales[l] = (float*)heap_caps_calloc(g.n_pool, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+            if (!s_snn_conv_pool_scales[l]) { ESP_LOGE(TAG, "FAIL: pool_scales[%d] (%d B)", l, g.n_pool * 4); return false; }
+        }
         const int in_size = g.in_c * g.in_h * g.in_w;
         if (in_size > s_max_in_ev) s_max_in_ev = in_size;
     }
@@ -632,6 +645,11 @@ static bool init_snn_buffers(void) {
         } else {
             s_snn_flat_events = (uint16_t*)heap_caps_calloc(cfg.flat_size, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
             if (!s_snn_flat_events) { ESP_LOGE(TAG, "FAIL: flat_events (%d B)", cfg.flat_size * 2); return false; }
+        }
+        const snn_geom_t &last = s_geom[cfg.num_conv_layers - 1];
+        if (last.has_pool && last.pool_type == 1) {
+            s_snn_flat_scales = (float*)heap_caps_calloc(cfg.flat_size, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+            if (!s_snn_flat_scales) { ESP_LOGE(TAG, "FAIL: flat_scales (%d B)", cfg.flat_size * 4); return false; }
         }
     }
 
@@ -723,7 +741,10 @@ static int build_input_events(const float *img, int t) {
         }
         default: // ENCODING_DIRECT
             for (int j = 0; j < cfg.input_size; ++j) {
-                if (img[j] > 0.0f) out[n++] = (uint16_t)j;
+                // Direct temporal inputs may be signed analog currents.
+                // Include both polarities in the sparse event list; fc_body
+                // applies the original signed value when accumulating.
+                if (cfg.temporal_input ? (img[j] != 0.0f) : (img[j] > 0.0f)) out[n++] = (uint16_t)j;
             }
             break;
     }
@@ -1191,7 +1212,8 @@ static int pool_body(int l, const uint16_t *ev, int n_ev) {
     const int out_w = g.out_w;
     const int oc_plane = g.oc_plane;
     const int out_c = g.out_c;
-    const int pool_stride = g.pool_stride;
+    const int pool_stride_h = g.pool_stride_h;
+    const int pool_stride_w = g.pool_stride_w;
     const int pool_out_h = g.pool_out_h;
     const int pool_out_w = g.pool_out_w;
     int n = 0;
@@ -1210,14 +1232,20 @@ static int pool_body(int l, const uint16_t *ev, int n_ev) {
             oh = rem / out_w;
             ow = rem - oh * out_w;
         }
-        const int ph  = oh / pool_stride;
-        const int pw  = ow / pool_stride;
+        const int ph  = oh / pool_stride_h;
+        const int pw  = ow / pool_stride_w;
         if (ph >= pool_out_h || pw >= pool_out_w) continue;
         const int p_idx = NHWC ? ((ph * pool_out_w + pw) * out_c + oc)
                                : ((oc * pool_out_h + ph) * pool_out_w + pw);
-        if (!s_snn_pool_visited[p_idx]) {
-            s_snn_pool_visited[p_idx] = 1;
-            out[n++] = (uint16_t)p_idx;
+        if (s_snn_pool_visited[p_idx] == 0) out[n++] = (uint16_t)p_idx;
+        if (s_snn_pool_visited[p_idx] < 255) s_snn_pool_visited[p_idx]++;
+    }
+    if (g.pool_type == 1) {
+        float *scales = s_snn_conv_pool_scales[l];
+        const float denom = (float)(g.pool_h * g.pool_w);
+        for (int i = 0; i < n; ++i) {
+            const int idx = out[i];
+            scales[idx] = (float)s_snn_pool_visited[idx] / denom;
         }
     }
     return n;
@@ -1256,6 +1284,7 @@ static int fc_body(int l, const uint16_t *ev, int n_ev,
     float *mem = s_snn_fc_mem[l];
     const float beta = cfg.beta;
     const float thr = cfg.threshold;
+    const float input_scale = (cfg.input_scale > 0.0f) ? cfg.input_scale : 1.0f;
     const bool unit_scale = (scale_src == nullptr);
     uint8_t *last = LAZY ? s_last_t_fc[l] : nullptr;
     const float *pb = LAZY ? s_pow_beta : nullptr;
@@ -1280,7 +1309,7 @@ static int fc_body(int l, const uint16_t *ev, int n_ev,
             } else {
                 for (int e = 0; e < n_ev; ++e) {
                     const int j = ev[e];
-                    isum += (int32_t)row[j] * (int32_t)lroundf(scale_src[j] * 127.0f);
+                    isum += (int32_t)row[j] * (int32_t)lroundf(scale_src[j] * input_scale * 127.0f);
                 }
             }
             sum = (float)isum * wsc[i];
@@ -1293,9 +1322,14 @@ static int fc_body(int l, const uint16_t *ev, int n_ev,
             } else {
                 for (int e = 0; e < n_ev; ++e) {
                     const int j = ev[e];
-                    sum += row[j] * scale_src[j];
+                    sum += row[j] * scale_src[j] * input_scale;
                 }
             }
+        }
+
+        if (cfg.analog_readout && l == cfg.hidden_layers_count) {
+            s_snn_readout_sum[i] += bv + sum;
+            continue;
         }
 
         float v;
@@ -1345,17 +1379,21 @@ static void snn_step(const float *img, int t, uint32_t *total_spk,
     int n_ev = build_input_events(img, t);
     const uint16_t *ev = s_snn_in_events;
 
+    const float *scale_src = nullptr;
     for (int l = 0; l < L; ++l) {
-        const int n_conv = CONV_FWD(l, ev, n_ev, (l == 0 && direct) ? img : nullptr, t, total_synops);
+        if (l == 0 && direct) scale_src = img;
+        const int n_conv = CONV_FWD(l, ev, n_ev, scale_src, t, total_synops);
         if (total_spk) *total_spk += (uint32_t)n_conv;
         if (s_geom[l].has_pool) {
             PROF_T(t_pool);
             n_ev = POOL_FWD(l, s_snn_conv_events[l], n_conv);
             PROF_ADD(t_pool, 2);
             ev = s_snn_conv_pool_events[l];
+            scale_src = (s_geom[l].pool_type == 1) ? s_snn_conv_pool_scales[l] : nullptr;
         } else {
             n_ev = n_conv;
             ev = s_snn_conv_events[l];
+            scale_src = nullptr;
         }
     }
 
@@ -1369,20 +1407,24 @@ static void snn_step(const float *img, int t, uint32_t *total_spk,
             for (int e = 0; e < n_ev; ++e) {
                 const uint16_t idx = ev[e];
                 if (idx >= cfg.flat_size && map == nullptr) continue;
-                s_snn_flat_events[n_flat++] = map ? map[idx] : idx;
+                const uint16_t dst_idx = map ? map[idx] : idx;
+                s_snn_flat_events[n_flat++] = dst_idx;
+                if (s_snn_flat_scales) s_snn_flat_scales[dst_idx] = last.pool_type == 1 ? s_snn_conv_pool_scales[L - 1][idx] : 1.0f;
             }
             ev = s_snn_flat_events;
             n_ev = n_flat;
+        } else if (s_snn_flat_scales) {
+            for (int e = 0; e < n_ev; ++e) s_snn_flat_scales[ev[e]] = s_snn_conv_pool_scales[L - 1][ev[e]];
         }
     }
 
     for (int l = 0; l < num_fc_layers; ++l) {
-        const float *scale = (L == 0 && l == 0 && direct) ? img : nullptr;
+        const float *scale = (L == 0 && l == 0 && direct) ? img : (l == 0 && s_snn_flat_scales ? s_snn_flat_scales : nullptr);
         PROF_T(t_fc);
         const int n_out = FC_FWD(l, ev, n_ev, scale, t, total_synops);
         PROF_ADD(t_fc, 3);
         if (total_spk) *total_spk += (uint32_t)n_out;
-        if (l == num_fc_layers - 1) {
+        if (l == num_fc_layers - 1 && !cfg.analog_readout) {
             const uint16_t *out_ev = s_snn_fc_events[l];
             for (int e = 0; e < n_out; ++e) {
                 s_snn_spk_sum[out_ev[e]]++;
@@ -1413,15 +1455,17 @@ static void reset_snn_state(void) {
         }
     }
     memset(s_snn_spk_sum, 0, sizeof(s_snn_spk_sum));
+    memset(s_snn_readout_sum, 0, sizeof(s_snn_readout_sum));
 }
 
 static int snn_argmax(void) {
     const snn_config_t &cfg = g_snn_config;
     int best_class = 0;
-    int max_spk = s_snn_spk_sum[0];
+    float max_spk = cfg.analog_readout ? s_snn_readout_sum[0] : (float)s_snn_spk_sum[0];
     for (int i = 1; i < cfg.output_size && i < 128; ++i) {
-        if (s_snn_spk_sum[i] > max_spk) {
-            max_spk = s_snn_spk_sum[i];
+        const float score = cfg.analog_readout ? s_snn_readout_sum[i] : (float)s_snn_spk_sum[i];
+        if (score > max_spk) {
+            max_spk = score;
             best_class = i;
         }
     }
@@ -1487,14 +1531,14 @@ static void conv_dense_ref(int l, const float *src) {
             for (int ow = 0; ow < g.out_w; ++ow) {
                 float acc = 0.0f;
                 for (int ic = 0; ic < g.in_c; ++ic) {
-                    for (int kh = 0; kh < g.k; ++kh) {
-                        const int ih = oh * cl.stride + kh - cl.padding;
+                    for (int kh = 0; kh < g.k_h; ++kh) {
+                        const int ih = oh * cl.stride + kh - cl.padding_h;
                         if (ih < 0 || ih >= g.in_h) continue;
-                        for (int kw = 0; kw < g.k; ++kw) {
-                            const int iw = ow * cl.stride + kw - cl.padding;
+                        for (int kw = 0; kw < g.k_w; ++kw) {
+                            const int iw = ow * cl.stride + kw - cl.padding_w;
                             if (iw < 0 || iw >= g.in_w) continue;
                             const float x = src[(ic * g.in_h + ih) * g.in_w + iw];
-                            if (x != 0.0f) acc += wrow[(ic * g.k + kh) * g.k + kw] * x;
+                            if (x != 0.0f) acc += wrow[(ic * g.k_h + kh) * g.k_w + kw] * x;
                         }
                     }
                 }
@@ -1514,18 +1558,18 @@ static void pool_dense_ref(int l, float *dst) {
     for (int oc = 0; oc < g.out_c; ++oc) {
         for (int ph = 0; ph < g.pool_out_h; ++ph) {
             for (int pw = 0; pw < g.pool_out_w; ++pw) {
-                uint8_t any = 0;
-                for (int dh = 0; dh < g.pool_stride && !any; ++dh) {
-                    const int oh = ph * g.pool_stride + dh;
-                    for (int dw = 0; dw < g.pool_stride; ++dw) {
-                        const int ow = pw * g.pool_stride + dw;
-                        if (oh < g.out_h && ow < g.out_w && spk[oc * g.oc_plane + oh * g.out_w + ow]) {
-                            any = 1;
-                            break;
-                        }
+                int count = 0;
+                for (int dh = 0; dh < g.pool_h; ++dh) {
+                    const int oh = ph * g.pool_stride_h + dh;
+                    for (int dw = 0; dw < g.pool_w; ++dw) {
+                        const int ow = pw * g.pool_stride_w + dw;
+                        if (oh < g.out_h && ow < g.out_w) count += spk[oc * g.oc_plane + oh * g.out_w + ow];
                     }
                 }
-                dst[oc * g.pool_out_h * g.pool_out_w + ph * g.pool_out_w + pw] = any ? 1.0f : 0.0f;
+                const float pooled = g.pool_type == 1
+                    ? (float)count / (float)(g.pool_h * g.pool_w)
+                    : (count > 0 ? 1.0f : 0.0f);
+                dst[oc * g.pool_out_h * g.pool_out_w + ph * g.pool_out_w + pw] = pooled;
             }
         }
     }
@@ -1544,17 +1588,20 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
         memset(s_ref_mem_fc[l], 0, (size_t)cfg.fc_layer_sizes[l + 1] * sizeof(float));
     }
     int spk_sum[128];
+    float readout_sum[128];
     memset(spk_sum, 0, sizeof(spk_sum));
-    encode_input_times(img);
+    memset(readout_sum, 0, sizeof(readout_sum));
+    if (!cfg.temporal_input) encode_input_times(img);
 
     uint32_t spikes = 0;
     for (int t = 0; t < cfg.num_steps; ++t) {
+        const float *step_img = cfg.temporal_input ? img + (size_t)t * cfg.input_size : img;
         for (int j = 0; j < cfg.input_size; ++j) {
             switch (cfg.encoding_type) {
                 case ENCODING_TTFS:     s_ref_in[j] = (s_snn_in_tf[j] == t) ? 1.0f : 0.0f; break;
                 case ENCODING_PERIODIC: s_ref_in[j] = (t < s_snn_in_tf[j]) ? 1.0f : 0.0f; break;
                 case ENCODING_POISSON: {
-                    const float p = img[j];
+                    const float p = step_img[j];
                     if (p > 0.0f) {
                         const float r = (float)(esp_random() & 0xFFFF) / 65535.0f;
                         s_ref_in[j] = (r < p) ? 1.0f : 0.0f;
@@ -1563,7 +1610,9 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
                     }
                     break;
                 }
-                default: s_ref_in[j] = (img[j] > 0.0f) ? img[j] : 0.0f; break;
+                default:
+                    s_ref_in[j] = cfg.temporal_input ? step_img[j] : ((step_img[j] > 0.0f) ? step_img[j] : 0.0f);
+                    break;
             }
         }
 
@@ -1595,11 +1644,17 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
                 float acc = 0.0f;
                 if (l == 0 && direct) {
                     for (int j = 0; j < in_dim; ++j) {
-                        const float x = img[j];
+                        const float input_scale = (cfg.input_scale > 0.0f) ? cfg.input_scale : 1.0f;
+                        const float x = step_img[j] * input_scale;
                         if (x != 0.0f) acc += row[j] * x;
                     }
                 } else {
                     for (int j = 0; j < in_dim; ++j) acc += row[j] * in_fc[j];
+                }
+                if (cfg.analog_readout && l == num_fc_layers - 1) {
+                    readout_sum[i] += (b ? b[i] : 0.0f) + acc;
+                    next[i] = 0.0f;
+                    continue;
                 }
                 const float v = cfg.beta * s_ref_mem_fc[l][i] + (b ? b[i] : 0.0f) + acc;
                 const int sp = (v >= cfg.threshold);
@@ -1615,7 +1670,15 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
     if (out_spikes) *out_spikes = spikes;
     int best = 0;
     for (int i = 1; i < cfg.output_size && i < 128; ++i) {
-        if (spk_sum[i] > spk_sum[best]) best = i;
+        const float candidate = cfg.analog_readout ? readout_sum[i] : (float)spk_sum[i];
+        const float current = cfg.analog_readout ? readout_sum[best] : (float)spk_sum[best];
+        if (candidate > current) best = i;
+    }
+    for (int l = 0; l < L; ++l) {
+        memset(s_ref_mem[l], 0, (size_t)s_geom[l].n_neurons * sizeof(float));
+    }
+    for (int l = 0; l < num_fc_layers; ++l) {
+        memset(s_ref_mem_fc[l], 0, (size_t)cfg.fc_layer_sizes[l + 1] * sizeof(float));
     }
     return best;
 }
@@ -1627,15 +1690,18 @@ static int run_snn_inference_dense(const float *img, uint32_t *out_spikes, uint3
     uint32_t total_synops = 0;
 
     reset_snn_state();
-    encode_input_times(img);
+    if (!cfg.temporal_input) encode_input_times(img);
 
     for (int t = 0; t < cfg.num_steps; ++t) {
-        snn_step(img, t, &total_spk, &total_synops);
+        const float *step_img = cfg.temporal_input ? img + (size_t)t * cfg.input_size : img;
+        snn_step(step_img, t, &total_spk, &total_synops);
     }
 
     if (out_spikes) *out_spikes = total_spk;
     if (out_synops) *out_synops = total_synops;
-    return snn_argmax();
+    const int prediction = snn_argmax();
+    reset_snn_state();
+    return prediction;
 }
 
 static int run_snn_inference_event_based(const float *img, uint32_t *out_spikes, uint32_t *out_synops) {
@@ -1644,15 +1710,18 @@ static int run_snn_inference_event_based(const float *img, uint32_t *out_spikes,
     uint32_t total_synops = 0;
 
     reset_snn_state();
-    encode_input_times(img);
+    if (!cfg.temporal_input) encode_input_times(img);
 
     for (int t = 0; t < cfg.num_steps; ++t) {
-        snn_step(img, t, &total_spk, &total_synops);
+        const float *step_img = cfg.temporal_input ? img + (size_t)t * cfg.input_size : img;
+        snn_step(step_img, t, &total_spk, &total_synops);
     }
 
     if (out_spikes) *out_spikes = total_spk;
     if (out_synops) *out_synops = total_synops;
-    return snn_argmax();
+    const int prediction = snn_argmax();
+    reset_snn_state();
+    return prediction;
 }
 
 static int run_snn_inference(const float *img, uint32_t *out_spikes, uint32_t *out_synops = nullptr) {

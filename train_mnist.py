@@ -250,27 +250,50 @@ def parse_conv_layers(val: Any) -> List[Dict[str, Any]]:
         for item in val:
             if isinstance(item, dict):
                 out_channels = int(item.get("out_channels", item.get("channels", item.get("filters", 8))))
-                kernel_size = int(item.get("kernel_size", item.get("kernel", 3)))
+                kernel_value = item.get("kernel_size", item.get("kernel", 3))
+                if isinstance(kernel_value, (list, tuple)):
+                    kernel_h, kernel_w = int(kernel_value[0]), int(kernel_value[1])
+                else:
+                    kernel_h = kernel_w = int(kernel_value)
                 stride = int(item.get("stride", 1))
                 padding = item.get("padding", None)
                 if padding is None:
-                    padding = 1 if kernel_size == 3 else 0
+                    ph, pw = ((kernel_h // 2, kernel_w // 2)
+                              if (kernel_h, kernel_w) == (3, 3) else (0, 0))
+                    padding = ph if ph == pw else (ph, pw)
                 else:
-                    padding = int(padding) if isinstance(padding, (int, str)) and str(padding).isdigit() else 0
+                    if isinstance(padding, (list, tuple)):
+                        ph, pw = int(padding[0]), int(padding[1])
+                        padding = ph if ph == pw else (ph, pw)
+                    else:
+                        p = int(padding) if isinstance(padding, (int, str)) and str(padding).isdigit() else 0
+                        padding = p
 
-                pool_size = item.get("pool_size", item.get("pool", item.get("max_pool", 0)))
-                pool_size = int(pool_size) if pool_size else 0
-                pool_stride = item.get("pool_stride", pool_size)
-                pool_stride = int(pool_stride) if pool_stride else pool_size
+                pool_value = item.get("pool_size", item.get("pool", item.get("max_pool", 0)))
+                if isinstance(pool_value, (list, tuple)):
+                    pool_h, pool_w = int(pool_value[0]), int(pool_value[1])
+                else:
+                    pool_h = pool_w = int(pool_value) if pool_value else 0
+                pool_stride_value = item.get("pool_stride", pool_value)
+                if isinstance(pool_stride_value, (list, tuple)):
+                    pool_stride_h, pool_stride_w = int(pool_stride_value[0]), int(pool_stride_value[1])
+                else:
+                    pool_stride_h = pool_stride_w = int(pool_stride_value) if pool_stride_value else 0
                 pool_type = str(item.get("pool_type", "max")).lower()
 
                 result.append({
                     "out_channels": out_channels,
-                    "kernel_size": kernel_size,
+                    "kernel_size": kernel_h if kernel_h == kernel_w else (kernel_h, kernel_w),
+                    "kernel_h": kernel_h,
+                    "kernel_w": kernel_w,
                     "stride": stride,
                     "padding": padding,
-                    "pool_size": pool_size,
-                    "pool_stride": pool_stride,
+                    "pool_size": pool_h if pool_h == pool_w else (pool_h, pool_w),
+                    "pool_h": pool_h,
+                    "pool_w": pool_w,
+                    "pool_stride": pool_stride_h if pool_stride_h == pool_stride_w else (pool_stride_h, pool_stride_w),
+                    "pool_stride_h": pool_stride_h,
+                    "pool_stride_w": pool_stride_w,
                     "pool_type": pool_type,
                 })
             elif isinstance(item, (list, tuple)):
@@ -283,10 +306,16 @@ def parse_conv_layers(val: Any) -> List[Dict[str, Any]]:
                 result.append({
                     "out_channels": out_c,
                     "kernel_size": k_size,
+                    "kernel_h": k_size,
+                    "kernel_w": k_size,
                     "stride": stride,
                     "padding": padding,
                     "pool_size": pool_size,
+                    "pool_h": pool_size,
+                    "pool_w": pool_size,
                     "pool_stride": pool_stride,
+                    "pool_stride_h": pool_stride,
+                    "pool_stride_w": pool_stride,
                     "pool_type": "max",
                 })
         return result
@@ -301,18 +330,21 @@ def compute_conv_layer_dims(conv_layers: List[Dict[str, Any]], in_c: int = 1, in
     resolved_layers = []
     for cl in conv_layers:
         out_c = cl["out_channels"]
-        k_size = cl["kernel_size"]
+        k_h = cl.get("kernel_h", cl["kernel_size"])
+        k_w = cl.get("kernel_w", cl["kernel_size"])
         stride = cl["stride"]
-        pad = cl["padding"]
-        pool_size = cl["pool_size"]
-        pool_stride = cl["pool_stride"]
+        pad_h, pad_w = cl.get("padding", 0) if isinstance(cl.get("padding", 0), tuple) else (cl.get("padding", 0),) * 2
+        pool_h = cl.get("pool_h", cl["pool_size"])
+        pool_w = cl.get("pool_w", cl["pool_size"])
+        pool_stride_h = cl.get("pool_stride_h", cl["pool_stride"])
+        pool_stride_w = cl.get("pool_stride_w", cl["pool_stride"])
 
-        out_h = (cur_h + 2 * pad - k_size) // stride + 1
-        out_w = (cur_w + 2 * pad - k_size) // stride + 1
+        out_h = (cur_h + 2 * pad_h - k_h) // stride + 1
+        out_w = (cur_w + 2 * pad_w - k_w) // stride + 1
 
-        if pool_size > 1:
-            pool_out_h = (out_h - pool_size) // pool_stride + 1
-            pool_out_w = (out_w - pool_size) // pool_stride + 1
+        if pool_h > 1 or pool_w > 1:
+            pool_out_h = (out_h - pool_h) // pool_stride_h + 1
+            pool_out_w = (out_w - pool_w) // pool_stride_w + 1
         else:
             pool_out_h = out_h
             pool_out_w = out_w
@@ -376,18 +408,18 @@ class ConfigurableANN(nn.Module):
                 mods.append(nn.Conv2d(
                     in_channels=cl["in_channels"],
                     out_channels=cl["out_channels"],
-                    kernel_size=cl["kernel_size"],
+                    kernel_size=(cl["kernel_h"], cl["kernel_w"]),
                     stride=cl["stride"],
                     padding=cl["padding"],
                     bias=True,
                 ))
                 if self.activation_name == "relu":
                     mods.append(nn.ReLU())
-                if cl["pool_size"] > 1:
+                if cl["pool_h"] > 1 or cl["pool_w"] > 1:
                     if cl["pool_type"] == "avg":
-                        mods.append(nn.AvgPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                        mods.append(nn.AvgPool2d((cl["pool_h"], cl["pool_w"]), stride=(cl["pool_stride_h"], cl["pool_stride_w"])))
                     else:
-                        mods.append(nn.MaxPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                        mods.append(nn.MaxPool2d((cl["pool_h"], cl["pool_w"]), stride=(cl["pool_stride_h"], cl["pool_stride_w"])))
                 self.conv_modules.append(nn.Sequential(*mods))
             self.flatten = nn.Flatten()
             fc_in = self.flat_size
@@ -440,8 +472,8 @@ class ConfigurableANN(nn.Module):
         parts = []
         if self.has_conv:
             for cl in self.resolved_conv:
-                p_str = f",p{cl['pool_size']}" if cl['pool_size'] > 1 else ""
-                parts.append(f"Conv({cl['in_channels']}->{cl['out_channels']},{cl['kernel_size']}x{cl['kernel_size']}{p_str})")
+                p_str = f",p{cl['pool_h']}x{cl['pool_w']}" if cl['pool_h'] > 1 or cl['pool_w'] > 1 else ""
+                parts.append(f"Conv({cl['in_channels']}->{cl['out_channels']},{cl['kernel_h']}x{cl['kernel_w']}{p_str})")
             parts.append(f"Flat({self.flat_size})")
         else:
             parts.append(str(self.input_size))
@@ -524,6 +556,9 @@ class ConfigurableSpikingJellySNN(nn.Module):
         in_height: int = 28,
         in_width: int = 28,
         dropout_rate: float = 0.0,
+        temporal_input: bool = False,
+        input_scale: float = 1.0,
+        output_readout: str = "spike",
     ):
         super().__init__()
         self.input_size = int(input_size)
@@ -545,6 +580,21 @@ class ConfigurableSpikingJellySNN(nn.Module):
         else:
             self.execution_mode = "dense"
         self.num_steps = int(num_steps)
+        self.temporal_input = bool(temporal_input)
+        self.input_scale = float(input_scale)
+        self.output_readout = str(output_readout).lower().strip()
+        if self.output_readout not in ("spike", "analog"):
+            raise ValueError("output_readout muss 'spike' oder 'analog' sein.")
+        if self.input_scale <= 0.0:
+            raise ValueError("input_scale muss groesser als 0 sein.")
+        if self.temporal_input and conv_layers:
+            raise ValueError("temporal_input benötigt derzeit ein SNN ohne Conv-Layer.")
+        if self.temporal_input:
+            if self.encoding_type != "direct":
+                raise ValueError("temporal_input benötigt encoding_type: direct.")
+            # Dataset-Tensor liegt als [Kanal, Merkmal, Zeit] vor. Jeder
+            # Zeitschritt wird als eigener Vektor in die FC-Schichten gegeben.
+            self.num_steps = int(in_width)
         self.threshold = float(threshold)
         self.dropout_rate = float(dropout_rate) if dropout_rate is not None else 0.0
         if self.dropout_rate > 0:
@@ -595,26 +645,32 @@ class ConfigurableSpikingJellySNN(nn.Module):
                 self.conv_layers_list.append(sj_layer.Conv2d(
                     in_channels=cl["in_channels"],
                     out_channels=cl["out_channels"],
-                    kernel_size=cl["kernel_size"],
+                    kernel_size=(cl["kernel_h"], cl["kernel_w"]),
                     stride=cl["stride"],
                     padding=cl["padding"],
                     bias=True,
                 ))
                 self.conv_lif_list.append(create_neuron())
-                if cl["pool_size"] > 1:
+                if cl["pool_h"] > 1 or cl["pool_w"] > 1:
                     if cl["pool_type"] == "avg":
-                        self.conv_pool_list.append(sj_layer.AvgPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                        self.conv_pool_list.append(sj_layer.AvgPool2d(
+                            (cl["pool_h"], cl["pool_w"]),
+                            stride=(cl["pool_stride_h"], cl["pool_stride_w"]),
+                        ))
                     else:
-                        self.conv_pool_list.append(sj_layer.MaxPool2d(cl["pool_size"], stride=cl["pool_stride"]))
+                        self.conv_pool_list.append(sj_layer.MaxPool2d(
+                            (cl["pool_h"], cl["pool_w"]),
+                            stride=(cl["pool_stride_h"], cl["pool_stride_w"]),
+                        ))
                 else:
                     self.conv_pool_list.append(nn.Identity())
             self.flatten = sj_layer.Flatten()
             fc_in = self.flat_size
         else:
             self.resolved_conv = []
-            self.flat_size = self.input_size
+            self.flat_size = (self.in_channels * self.in_height) if self.temporal_input else self.input_size
             self.flatten = sj_layer.Flatten()
-            fc_in = self.input_size
+            fc_in = self.flat_size
 
         all_fc_sizes = [fc_in] + self.hidden_layers + [self.output_size]
         self.fcs = nn.ModuleList([
@@ -642,13 +698,20 @@ class ConfigurableSpikingJellySNN(nn.Module):
                 cur = pool(cur)
             cur = self.flatten(cur)
         else:
-            x_flat = x.view(batch_size, -1)
-            x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+            if self.temporal_input:
+                x_seq = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
+                x_seq = x_seq.reshape(batch_size, self.in_channels * self.in_height, self.in_width)
+                x_seq = x_seq.permute(2, 0, 1).contiguous()
+                x_seq = x_seq * self.input_scale
+            else:
+                x_flat = x.view(batch_size, -1)
+                x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
             cur = x_seq
 
         for i, (fc, lif) in enumerate(zip(self.fcs, self.lif_layers)):
             cur = fc(cur)
-            cur = lif(cur)
+            if not (self.output_readout == "analog" and i == len(self.fcs) - 1):
+                cur = lif(cur)
             if self.dropouts is not None:
                 cur = self.dropouts[i](cur)
 
@@ -674,8 +737,14 @@ class ConfigurableSpikingJellySNN(nn.Module):
                     x_4d = x
                 x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
             else:
-                x_flat = x.view(batch_size, -1)
-                x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+                if self.temporal_input:
+                    x_seq = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
+                    x_seq = x_seq.reshape(batch_size, self.in_channels * self.in_height, self.in_width)
+                    x_seq = x_seq.permute(2, 0, 1).contiguous()
+                    x_seq = x_seq * self.input_scale
+                else:
+                    x_flat = x.view(batch_size, -1)
+                    x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
 
             total_spikes = 0
             total_synops = 0
@@ -698,14 +767,15 @@ class ConfigurableSpikingJellySNN(nn.Module):
             else:
                 cur = x_seq
 
-            for fc, lif in zip(self.fcs, self.lif_layers):
+            for layer_idx, (fc, lif) in enumerate(zip(self.fcs, self.lif_layers)):
                 in_spikes_count = (cur != 0).sum().item()
                 out_dim = fc.out_features
                 total_synops += int(in_spikes_count * out_dim)
                 total_possible_ops += int(cur.numel() * out_dim)
                 cur = fc(cur)
-                cur = lif(cur)
-                total_spikes += int((cur != 0).sum().item())
+                if not (self.output_readout == "analog" and layer_idx == len(self.fcs) - 1):
+                    cur = lif(cur)
+                    total_spikes += int((cur != 0).sum().item())
 
             out_spikes = cur.sum(dim=0)
             if HAS_SPIKINGJELLY:
@@ -724,11 +794,14 @@ class ConfigurableSpikingJellySNN(nn.Module):
         parts = []
         if self.has_conv:
             for cl in self.resolved_conv:
-                p_str = f",p{cl['pool_size']}" if cl['pool_size'] > 1 else ""
-                parts.append(f"Conv({cl['in_channels']}->{cl['out_channels']},{cl['kernel_size']}x{cl['kernel_size']}{p_str})")
+                p_str = f",p{cl['pool_h']}x{cl['pool_w']}" if cl['pool_h'] > 1 or cl['pool_w'] > 1 else ""
+                parts.append(f"Conv({cl['in_channels']}->{cl['out_channels']},{cl['kernel_h']}x{cl['kernel_w']}{p_str})")
             parts.append(f"Flat({self.flat_size})")
         else:
-            parts.append(str(self.input_size))
+            if self.temporal_input:
+                parts.append(f"{self.flat_size}×{self.num_steps} temporal")
+            else:
+                parts.append(str(self.input_size))
 
         for h in self.hidden_layers:
             parts.append(str(h))
@@ -736,11 +809,14 @@ class ConfigurableSpikingJellySNN(nn.Module):
 
         n_label = "SNN-IF" if self.neuron_type == "if" else "SNN-LIF"
         enc_label = self.encoding_type.upper()
+        if self.temporal_input:
+            enc_label = f"TEMPORAL/{enc_label}"
+        readout_label = f", Readout={self.output_readout.upper()}"
         if self.neuron_type == "if":
             param_str = f"T={self.num_steps}, Enc={enc_label}, θ={self.threshold:.1f}"
         else:
             param_str = f"T={self.num_steps}, Enc={enc_label}, β={self.beta:.2f}, θ={self.threshold:.1f}"
-        return f"SpikingJelly {n_label} [{' -> '.join(parts)}] ({param_str})"
+        return f"SpikingJelly {n_label} [{' -> '.join(parts)}] ({param_str}{readout_label})"
 
 
 # -------------------------------------------------------------
@@ -874,6 +950,12 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
         "name": str(config.get("name", model_cfg.get("name", "model"))),
         "type": model_type,
         "dataset": dataset_name,
+        # Bump when cached dataset preprocessing changes without changing its
+        # public dataset name or tensor dimensions.
+        "dataset_pipeline_version": (
+            1 if str(dataset_name).lower() == "physionet_eeg_mi_csp_temporal"
+            else (4 if str(dataset_name).lower() == "physionet_eeg_mi_temporal" else 1)
+        ),
         "conv_layers": canonical_conv,
         "hidden_layers": hidden_layers,
         "optimization": canonical_opt,
@@ -908,6 +990,9 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "encoding_type": str(model_cfg.get("encoding_type", model_cfg.get("encoding", "direct"))).lower(),
             "execution_mode": exec_mode,
             "num_steps": int(model_cfg.get("num_steps", model_cfg.get("steps", 10))),
+            "temporal_input": bool(model_cfg.get("temporal_input", False)),
+            "input_scale": float(model_cfg.get("input_scale", 1.0)),
+            "output_readout": str(model_cfg.get("output_readout", "spike")).lower(),
             "beta": float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0,
             "threshold": float(model_cfg.get("threshold", 1.0)),
             "ann_checkpoint": model_cfg.get("ann_checkpoint"),
@@ -993,6 +1078,9 @@ def build_model_from_config(
         beta = float(model_cfg.get("beta", 0.9)) if neuron_type == "lif" else 1.0
         threshold = float(model_cfg.get("threshold", 1.0))
         dropout_rate = float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.0)))
+        temporal_input = bool(model_cfg.get("temporal_input", False))
+        input_scale = float(model_cfg.get("input_scale", 1.0))
+        output_readout = str(model_cfg.get("output_readout", "spike"))
         model = ConfigurableSpikingJellySNN(
             input_size=input_size,
             conv_layers=conv_layers,
@@ -1008,6 +1096,9 @@ def build_model_from_config(
             in_height=in_height,
             in_width=in_width,
             dropout_rate=dropout_rate,
+            temporal_input=temporal_input,
+            input_scale=input_scale,
+            output_readout=output_readout,
         ).to(device)
     else:
         activation = model_cfg.get("activation", "relu")
@@ -1575,6 +1666,9 @@ def train_model(
         print(f"  - Neuronen-Typ:        {model.neuron_type.upper()}")
         print(f"  - Encoding-Typ:        {model.encoding_type.upper()}")
         print(f"  - Zeitschritte (Steps):{model.num_steps}")
+        if model.temporal_input:
+            print(f"  - Sequenz-Eingabe:     {model.flat_size} Merkmale pro Zeitschritt, State-Reset nach dem Sample")
+            print(f"  - Eingangsverstärkung: {model.input_scale:g}x")
         if model.neuron_type == "lif":
             print(f"  - Membran-Decay (Beta):{model.beta}")
         print(f"  - Schwellenwert (Thresh):{model.threshold}")
@@ -1689,7 +1783,7 @@ def train_model(
         scheduler.step()
 
         if early_stopping_enabled and patience_counter >= patience:
-            print(f"[Early Stopping] Vorzeitiger Abbruch in Epoche {epoch}/{epochs}: Keine Verbesserung der Metrik '{monitor}' seit {patience} Epochen (Bester Stand in Epoche {best_epoch}: Test-Acc: {best_test_acc:.2f}%, Test-Verlust: {best_test_loss:.4f}).")
+            print(f"[Early Stopping] Vorzeitiger Abbruch in Epoche {epoch}/{epochs}: Keine Verbesserung der Metrik '{monitor}' seit {patience} Epochen (Bester Stand in Epoche {best_epoch}: {selection_label}-Acc: {best_test_acc:.2f}%, {selection_label}-Verlust: {best_test_loss:.4f}).")
             break
 
     if best_state_dict is not None and restore_best_weights:
@@ -1716,7 +1810,7 @@ def train_model(
 
     if dataset_info.validation_dataset is not None:
         test_acc, avg_loss = evaluate_model(model, test_dataset, device=device)
-        print(f"[PyTorch] Offizielle Testgenauigkeit auf dem unangetasteten Speech-Commands-Testsplit: {test_acc:.2f}%.")
+        print(f"[PyTorch] Genauigkeit auf dem unangetasteten {dataset_info.name}-Testsplit: {test_acc:.2f}%.")
 
     # ---------------------------------------------------------
     # Automatisches Speichern des trainierten Modells (Checkpoint & Metadaten)
@@ -1855,7 +1949,7 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
             w_buf_idx = len(buffers) - 2
             b_buf_idx = len(buffers) - 1
 
-            t_w = make_tensor(f"conv{c_idx+1}_w", [cl["out_channels"], cl["kernel_size"], cl["kernel_size"], cl["in_channels"]], tflite.TensorType.FLOAT32, w_buf_idx)
+            t_w = make_tensor(f"conv{c_idx+1}_w", [cl["out_channels"], cl["kernel_h"], cl["kernel_w"], cl["in_channels"]], tflite.TensorType.FLOAT32, w_buf_idx)
             t_b = make_tensor(f"conv{c_idx+1}_b", [cl["out_channels"]], tflite.TensorType.FLOAT32, b_buf_idx)
             t_conv_out = make_tensor(f"conv{c_idx+1}_out", [1, cl["out_h"], cl["out_w"], cl["out_channels"]], tflite.TensorType.FLOAT32, 0)
 
@@ -1866,7 +1960,8 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
 
             op_conv_idx = get_opcode_idx(tflite.BuiltinOperator.CONV_2D)
             tflite.Conv2DOptionsStart(bld)
-            tflite.Conv2DOptionsAddPadding(bld, tflite.Padding.SAME if cl["padding"] > 0 else tflite.Padding.VALID)
+            has_padding = any(cl["padding"]) if isinstance(cl["padding"], tuple) else cl["padding"] > 0
+            tflite.Conv2DOptionsAddPadding(bld, tflite.Padding.SAME if has_padding else tflite.Padding.VALID)
             tflite.Conv2DOptionsAddStrideH(bld, cl["stride"])
             tflite.Conv2DOptionsAddStrideW(bld, cl["stride"])
             act_type = tflite.ActivationFunctionType.RELU if getattr(model, "activation_name", "relu") == "relu" else tflite.ActivationFunctionType.NONE
@@ -1892,7 +1987,7 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
             ops.append(tflite.OperatorEnd(bld))
             cur_tensor_idx = conv_out_idx
 
-            if cl["pool_size"] > 1:
+            if cl["pool_h"] > 1 or cl["pool_w"] > 1:
                 t_pool_out = make_tensor(f"pool{c_idx+1}_out", [1, cl["pool_out_h"], cl["pool_out_w"], cl["out_channels"]], tflite.TensorType.FLOAT32, 0)
                 pool_out_idx = len(tensors)
                 tensors.append(t_pool_out)
@@ -1901,10 +1996,10 @@ def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJe
                 op_pool_idx = get_opcode_idx(pool_op_code)
                 tflite.Pool2DOptionsStart(bld)
                 tflite.Pool2DOptionsAddPadding(bld, tflite.Padding.VALID)
-                tflite.Pool2DOptionsAddStrideH(bld, cl["pool_stride"])
-                tflite.Pool2DOptionsAddStrideW(bld, cl["pool_stride"])
-                tflite.Pool2DOptionsAddFilterHeight(bld, cl["pool_size"])
-                tflite.Pool2DOptionsAddFilterWidth(bld, cl["pool_size"])
+                tflite.Pool2DOptionsAddStrideH(bld, cl["pool_stride_h"])
+                tflite.Pool2DOptionsAddStrideW(bld, cl["pool_stride_w"])
+                tflite.Pool2DOptionsAddFilterHeight(bld, cl["pool_h"])
+                tflite.Pool2DOptionsAddFilterWidth(bld, cl["pool_w"])
                 tflite.Pool2DOptionsAddFusedActivationFunction(bld, tflite.ActivationFunctionType.NONE)
                 opt_pool = tflite.Pool2DOptionsEnd(bld)
 
@@ -2159,6 +2254,10 @@ def export_c_files(
     eval_cfg = config.get("evaluation", {})
 
     input_size = int(model_cfg.get("input_size", 784))
+    dataset_input_size = input_size
+    temporal_input = bool(getattr(model, "temporal_input", False))
+    if temporal_input:
+        input_size = int(model.flat_size)
     output_size = int(model_cfg.get("output_size", 10))
     num_test_samples = int(eval_cfg.get("num_test_samples", 500))
     if test_dataset is not None and hasattr(test_dataset, "__len__"):
@@ -2186,11 +2285,12 @@ def export_c_files(
         f.write("typedef struct {\n")
         f.write("    int in_channels;\n")
         f.write("    int out_channels;\n")
-        f.write("    int kernel_size;\n")
+        f.write("    int kernel_h, kernel_w;\n")
         f.write("    int stride;\n")
-        f.write("    int padding;\n")
-        f.write("    int pool_size;\n")
-        f.write("    int pool_stride;\n")
+        f.write("    int padding_h, padding_w;\n")
+        f.write("    int pool_h, pool_w;\n")
+        f.write("    int pool_stride_h, pool_stride_w;\n")
+        f.write("    int pool_type;  // 0=max, 1=average\n")
         f.write("    int in_h, in_w;\n")
         f.write("    int out_h, out_w;\n")
         f.write("    int pool_out_h, pool_out_w;\n")
@@ -2209,6 +2309,9 @@ def export_c_files(
         f.write("    int neuron_type;\n")
         f.write("    int encoding_type;\n")
         f.write("    int execution_mode;\n")
+        f.write("    int temporal_input;\n")
+        f.write("    float input_scale;\n")
+        f.write("    int analog_readout;\n")
         f.write("} snn_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
@@ -2337,7 +2440,13 @@ def export_c_files(
             f.write("    .conv_layers = {\n")
             if num_conv > 0:
                 for cl in model.resolved_conv:
-                    f.write(f"        {{{cl['in_channels']}, {cl['out_channels']}, {cl['kernel_size']}, {cl['stride']}, {cl['padding']}, {cl['pool_size']}, {cl['pool_stride']}, {cl['in_h']}, {cl['in_w']}, {cl['out_h']}, {cl['out_w']}, {cl['pool_out_h']}, {cl['pool_out_w']}}},\n")
+                    pad_h, pad_w = cl["padding"] if isinstance(cl["padding"], tuple) else (cl["padding"], cl["padding"])
+                    f.write(
+                        f"        {{{cl['in_channels']}, {cl['out_channels']}, {cl['kernel_h']}, {cl['kernel_w']}, "
+                        f"{cl['stride']}, {pad_h}, {pad_w}, {cl['pool_h']}, {cl['pool_w']}, "
+                        f"{cl['pool_stride_h']}, {cl['pool_stride_w']}, {1 if cl['pool_type'] == 'avg' else 0}, "
+                        f"{cl['in_h']}, {cl['in_w']}, {cl['out_h']}, {cl['out_w']}, {cl['pool_out_h']}, {cl['pool_out_w']}}},\n"
+                    )
             f.write("    },\n")
             f.write(f"    .flat_size = {model.flat_size},\n")
             f.write(f"    .hidden_layers_count = {len(model.hidden_layers)},\n")
@@ -2349,6 +2458,9 @@ def export_c_files(
             f.write(f"    .neuron_type = {n_type_code},\n")
             f.write(f"    .encoding_type = {enc_code},\n")
             f.write(f"    .execution_mode = {exec_mode_code},\n")
+            f.write(f"    .temporal_input = {1 if temporal_input else 0},\n")
+            f.write(f"    .input_scale = {getattr(model, 'input_scale', 1.0):.6f}f,\n")
+            f.write(f"    .analog_readout = {1 if getattr(model, 'output_readout', 'spike') == 'analog' else 0},\n")
             f.write("};\n")
 
     dataset_name = config.get("dataset", config.get("training", {}).get("dataset", "mnist"))
@@ -2362,10 +2474,10 @@ def export_c_files(
         f.write("#pragma once\n")
         f.write("#include <stdint.h>\n\n")
         f.write(f"#define DATASET_NAME \"{dataset_name}\"\n")
-        f.write(f"#define DATASET_INPUT_SIZE {input_size}\n")
+        f.write(f"#define DATASET_INPUT_SIZE {dataset_input_size}\n")
         f.write(f"#define DATASET_NUM_CLASSES {output_size}\n\n")
         f.write(f"#define MNIST_TEST_SUBSET {num_test_samples}\n")
-        f.write(f"#define MNIST_IMAGE_SIZE {input_size}\n")
+        f.write(f"#define MNIST_IMAGE_SIZE {dataset_input_size}\n")
         f.write(f"#define MNIST_NUM_OUTPUTS {output_size}\n\n")
 
         labels = [int(test_dataset[i][1]) for i in range(num_test_samples)]
@@ -2376,10 +2488,16 @@ def export_c_files(
         f.write("static const float mnist_test_images[MNIST_TEST_SUBSET][MNIST_IMAGE_SIZE] = {\n")
         for i in range(num_test_samples):
             img_tensor, _ = test_dataset[i]
-            img_np = img_tensor.view(-1).numpy()
+            if temporal_input:
+                # Speichere temporal SNN Eingaben time-major, damit jeder
+                # Firmware-Schritt einen zusammenhängenden Feature-Vektor liest.
+                img_np = img_tensor.reshape(1, model.in_channels * model.in_height, model.in_width)
+                img_np = img_np.permute(2, 1, 0).reshape(-1).numpy()
+            else:
+                img_np = img_tensor.view(-1).numpy()
             f.write("  {\n")
-            for row in range(0, input_size, 14):
-                chunk = img_np[row:min(row + 14, input_size)]
+            for row in range(0, dataset_input_size, 14):
+                chunk = img_np[row:min(row + 14, dataset_input_size)]
                 f.write("    " + ", ".join(f"{v:.4f}f" for v in chunk) + ",\n")
             f.write("  },\n")
         f.write("};\n")
@@ -2483,6 +2601,10 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 model_dict["num_steps"] = int(m.get("num_steps", m.get("steps", 10)))
                 model_dict["beta"] = float(m.get("beta", 0.9))
                 model_dict["threshold"] = float(m.get("threshold", 1.0))
+                model_dict["temporal_input"] = bool(m.get("temporal_input", False))
+                model_dict["input_scale"] = float(m.get("input_scale", 1.0))
+                model_dict["output_readout"] = str(m.get("output_readout", "spike")).lower()
+                model_dict["execution_mode"] = str(m.get("execution_mode", m.get("execution", "dense")))
                 if m.get("ann_checkpoint"):
                     model_dict["ann_checkpoint"] = str(m["ann_checkpoint"])
             else:
@@ -2586,6 +2708,10 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         model_dict["num_steps"] = int(single_m.get("num_steps", single_m.get("steps", 10)))
         model_dict["beta"] = float(single_m.get("beta", 0.9))
         model_dict["threshold"] = float(single_m.get("threshold", 1.0))
+        model_dict["temporal_input"] = bool(single_m.get("temporal_input", False))
+        model_dict["input_scale"] = float(single_m.get("input_scale", 1.0))
+        model_dict["output_readout"] = str(single_m.get("output_readout", "spike")).lower()
+        model_dict["execution_mode"] = str(single_m.get("execution_mode", single_m.get("execution", "dense")))
     else:
         model_dict["activation"] = str(single_m.get("activation", "relu"))
 

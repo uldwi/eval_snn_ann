@@ -41,244 +41,277 @@ microcontroller:
       trigger_gpio: 4
   target: esp32s3
 models:
-- activation: relu
-  batch_size: 64
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 16
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: mnist
-  epochs: 5
-  hidden_layers:
-  - 64
-  learning_rate: 0.001
-  name: ANN_MNIST_Conv16_32_64
-  type: ann
-- batch_size: 64
-  beta: 0.9
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 16
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: mnist
-  encoding_type: ttfs
-  epochs: 5
-  hidden_layers:
-  - 64
-  learning_rate: 0.005
-  name: SNN_MNIST_LIF_Conv16_32_64_TTFS
-  neuron_type: lif
-  num_steps: 10
-  threshold: 1.0
-  type: snn
-- activation: relu
-  batch_size: 64
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 16
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: physionet_eeg_mi
-  epochs: 20
-  hidden_layers:
-  - 64
-  learning_rate: 0.001
-  name: ANN_PhysioNet_EEGMI_Conv16_32_64
-  type: ann
-- batch_size: 64
-  beta: 0.9
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 16
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: physionet_eeg_mi
-  encoding_type: ttfs
-  epochs: 40
-  early_stopping:
-    enabled: true
-    monitor: test_acc
-    patience: 8
-    restore_best_weights: true
-  hidden_layers:
-  - 64
-  learning_rate: 0.001
-  name: SNN_PhysioNet_EEGMI_IF_Conv16_32_64_TTFS
-  neuron_type: if
-  num_steps: 10
-  threshold: 1.0
-  ann_checkpoint: ANN_PhysioNet_EEGMI_Conv16_32_64
-  type: snn
-- activation: relu
-  batch_size: 64
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 64
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: fashion_mnist
-  epochs: 6
-  hidden_layers:
-  - 128
-  learning_rate: 0.005
-  name: ANN_FashionMNIST_Conv32_64_128
-  type: ann
-- batch_size: 64
-  beta: 0.9
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 64
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: fashion_mnist
-  encoding_type: ttfs
-  epochs: 10
-  hidden_layers:
-  - 128
-  learning_rate: 0.005
-  name: SNN_FashionMNIST_LIF_Conv32_64_128_Direct
-  neuron_type: if
-  num_steps: 10
-  threshold: 1.0
-  type: snn
-- activation: relu
-  batch_size: 64
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 64
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: cifar10
-  epochs: 8
-  hidden_layers:
-  - 128
-  learning_rate: 0.005
-  name: ANN_CIFAR10_Conv32_64_128
-  type: ann
-- batch_size: 64
-  beta: 0.9
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 64
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: cifar10
-  dropout: 0.5
-  early_stopping:
-    enabled: true
-    monitor: test_acc
-    patience: 10
-    restore_best_weights: true
-  encoding_type: ttfs
-  epochs: 80
-  hidden_layers:
-  - 128
-  learning_rate: 0.001
-  name: SNN_CIFAR10_LIF_Conv32_64_128_TTFS_Reg
-  neuron_type: if
-  num_steps: 20
-  threshold: 1.0
-  type: snn
-- activation: relu
-  batch_size: 64
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 16
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: speech_commands
-  epochs: 10
-  hidden_layers:
-  - 64
-  learning_rate: 0.001
-  name: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
-  type: ann
-- batch_size: 64
-  beta: 0.9
-  conv_layers:
-  - kernel_size: 3
-    out_channels: 16
-    padding: 1
-    pool_size: 2
-    stride: 1
-  - kernel_size: 3
-    out_channels: 32
-    padding: 1
-    pool_size: 2
-    stride: 1
-  dataset: speech_commands
-  encoding_type: ttfs
-  epochs: 40
-  early_stopping:
-    enabled: true
-    monitor: test_acc
-    patience: 8
-    restore_best_weights: true
-  hidden_layers:
-  - 64
-  learning_rate: 0.001
-  name: SNN_KWS_SpeechCommandsV02_35Words_IF_Conv16_32_64_TTFS
-  neuron_type: if
-  num_steps: 10
-  threshold: 1.0
-  ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
-  type: snn
+  - name: ANN_MNIST_Conv16_32_64
+    activation: relu
+    batch_size: 64
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 16
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: mnist
+    epochs: 0
+    hidden_layers:
+      - 64
+    learning_rate: 0.001
+    type: ann
+  - name: SNN_MNIST_LIF_Conv16_32_64_TTFS
+    batch_size: 64
+    beta: 0.9
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 16
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: mnist
+    encoding_type: ttfs
+    epochs: 0
+    hidden_layers:
+      - 64
+    learning_rate: 0.005
+    neuron_type: lif
+    num_steps: 10
+    threshold: 1.0
+    type: snn
+  - name: ANN_PhysioNet_EEGMI_EEGNetInspired_CSP_Temporal
+    activation: relu
+    batch_size: 64
+    conv_layers:
+      # EEGNet-inspired: temporal filters, followed by a spatial CSP-component mix.
+      - kernel_size: [1, 31]
+        out_channels: 8
+        padding: [0, 15]
+        pool_size: [1, 4]
+        pool_stride: [1, 4]
+        pool_type: avg
+      - kernel_size: [8, 1]
+        out_channels: 16
+        padding: 0
+        pool_size: [1, 2]
+        pool_stride: [1, 2]
+        pool_type: avg
+      - kernel_size: [1, 9]
+        out_channels: 16
+        padding: [0, 4]
+        pool_size: [1, 2]
+        pool_stride: [1, 2]
+        pool_type: avg
+    dataset: physionet_eeg_mi_csp_temporal
+    epochs: 60
+    early_stopping:
+      enabled: true
+      monitor: val_acc
+      patience: 10
+      restore_best_weights: true
+    hidden_layers:
+      - 32
+    learning_rate: 0.0005
+    optimization:
+      pruning:
+        enabled: false
+      quantization:
+        enabled: false
+    type: ann
+  - name: SNN_PhysioNet_EEGMI_EEGNetInspired_CSP_Temporal_IF
+    batch_size: 64
+    beta: 1.0
+    conv_layers:
+      - kernel_size: [1, 31]
+        out_channels: 8
+        padding: [0, 15]
+        pool_size: [1, 4]
+        pool_stride: [1, 4]
+        pool_type: avg
+      - kernel_size: [8, 1]
+        out_channels: 16
+        padding: 0
+        pool_size: [1, 2]
+        pool_stride: [1, 2]
+        pool_type: avg
+      - kernel_size: [1, 9]
+        out_channels: 16
+        padding: [0, 4]
+        pool_size: [1, 2]
+        pool_stride: [1, 2]
+        pool_type: avg
+    dataset: physionet_eeg_mi_csp_temporal
+    encoding_type: ttfs
+    epochs: 60
+    early_stopping:
+      enabled: true
+      monitor: val_acc
+      patience: 10
+      restore_best_weights: true
+    hidden_layers:
+      - 32
+    learning_rate: 0.0005
+    neuron_type: if
+    num_steps: 10
+    threshold: 1.0
+    output_readout: analog
+    ann_checkpoint: ANN_PhysioNet_EEGMI_EEGNetInspired_CSP_Temporal
+    optimization:
+      pruning:
+        enabled: false
+      quantization:
+        enabled: false
+    type: snn
+  - name: ANN_FashionMNIST_Conv32_64_128
+    activation: relu
+    batch_size: 64
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 64
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: fashion_mnist
+    epochs: 6
+    hidden_layers:
+      - 128
+    learning_rate: 0.005
+    type: ann
+  - name: SNN_FashionMNIST_LIF_Conv32_64_128_Direct
+    batch_size: 64
+    beta: 0.9
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 64
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: fashion_mnist
+    encoding_type: ttfs
+    epochs: 10
+    hidden_layers:
+      - 128
+    learning_rate: 0.005
+    neuron_type: if
+    num_steps: 10
+    threshold: 1.0
+    type: snn
+  - name: ANN_CIFAR10_Conv32_64_128
+    activation: relu
+    batch_size: 64
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 64
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: cifar10
+    epochs: 8
+    hidden_layers:
+      - 128
+    learning_rate: 0.005
+    type: ann
+  - name: SNN_CIFAR10_LIF_Conv32_64_128_TTFS_Reg
+    batch_size: 64
+    beta: 0.9
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 64
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: cifar10
+    dropout: 0.5
+    early_stopping:
+      enabled: true
+      monitor: test_acc
+      patience: 10
+      restore_best_weights: true
+    encoding_type: ttfs
+    epochs: 80
+    hidden_layers:
+      - 128
+    learning_rate: 0.001
+    neuron_type: if
+    num_steps: 20
+    threshold: 1.0
+    type: snn
+  - name: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
+    activation: relu
+    batch_size: 64
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 16
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: speech_commands
+    epochs: 10
+    hidden_layers:
+      - 64
+    learning_rate: 0.001
+    type: ann
+  - name: SNN_KWS_SpeechCommandsV02_35Words_IF_Conv16_32_64_TTFS
+    batch_size: 64
+    beta: 0.9
+    conv_layers:
+      - kernel_size: 3
+        out_channels: 16
+        padding: 1
+        pool_size: 2
+        stride: 1
+      - kernel_size: 3
+        out_channels: 32
+        padding: 1
+        pool_size: 2
+        stride: 1
+    dataset: speech_commands
+    encoding_type: ttfs
+    epochs: 40
+    early_stopping:
+      enabled: true
+      monitor: test_acc
+      patience: 8
+      restore_best_weights: true
+    hidden_layers:
+      - 64
+    learning_rate: 0.001
+    neuron_type: if
+    num_steps: 10
+    threshold: 1.0
+    ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
+    type: snn
 optimization:
   clustering:
     enabled: false
@@ -289,14 +322,14 @@ optimization:
     fine_tune_epochs: 2
     fine_tune_lr: 0.0001
     layers:
-    - conv
-    - fc
+      - conv
+      - fc
     method: l1_unstructured
   quantization:
     enabled: true
     layers:
-    - conv
-    - fc
+      - conv
+      - fc
     mode: symmetric
     per_channel: true
     type: int8

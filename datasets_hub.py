@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from scipy.io import wavfile
-from scipy.signal import welch
+from scipy.signal import hilbert, resample, welch
 from torch.utils.data import Dataset, TensorDataset
 from torchvision import datasets, transforms
 
@@ -184,6 +184,36 @@ AVAILABLE_DATASETS: Dict[str, Dict[str, Union[str, int, List[str]]]] = {
         "input_size": 1024,
         "in_channels": 1,
         "in_height": 64,
+        "in_width": 16,
+        "num_classes": 2,
+        "class_names": ["Linke Faust (Motor Imagery)", "Rechte Faust (Motor Imagery)"],
+    },
+    "physionet_eeg_mi_temporal": {
+        "domain": "Biomedizinische Signale (EEG Motor Imagery, Zeitbereich)",
+        "description": "PhysioNet EEGMMIDB, 64-kanalige zeitliche Hüllkurven der Mu-/Beta-Aktivität mit 128 Schritten",
+        "input_size": 8192,
+        "in_channels": 1,
+        "in_height": 64,
+        "in_width": 128,
+        "num_classes": 2,
+        "class_names": ["Linke Faust (Motor Imagery)", "Rechte Faust (Motor Imagery)"],
+    },
+    "physionet_eeg_mi_csp_temporal": {
+        "domain": "Biomedizinische Signale (EEG Motor Imagery, CSP-Zeitbereich)",
+        "description": "PhysioNet EEGMMIDB, acht train-only gelernte CSP-Komponenten als zeitliche Mu-/Beta-Hüllkurven",
+        "input_size": 1024,
+        "in_channels": 1,
+        "in_height": 8,
+        "in_width": 128,
+        "num_classes": 2,
+        "class_names": ["Linke Faust (Motor Imagery)", "Rechte Faust (Motor Imagery)"],
+    },
+    "physionet_eeg_mi_csp_spectral": {
+        "domain": "Biomedizinische Signale (EEG Motor Imagery, CSP-Spektrum)",
+        "description": "PhysioNet EEGMMIDB, acht train-only gelernte CSP-Komponenten mit 16 Spektralbändern",
+        "input_size": 128,
+        "in_channels": 1,
+        "in_height": 8,
         "in_width": 16,
         "num_classes": 2,
         "class_names": ["Linke Faust (Motor Imagery)", "Rechte Faust (Motor Imagery)"],
@@ -629,7 +659,7 @@ def _download_eegbci_run(raw_root: str, subject_id: int, run_id: int, allow_down
 
 
 def _load_physionet_eeg_mi(
-    data_dir: str, seed: int, allow_download: bool = True
+    data_dir: str, seed: int, allow_download: bool = True, temporal: bool = False, csp: bool = False
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """Lädt PhysioNet EEGMMIDB mit personengetrenntem Train/Val/Test-Split."""
     try:
@@ -643,7 +673,12 @@ def _load_physionet_eeg_mi(
 
     dataset_root = os.path.join(data_dir, "physionet_eeg_mi")
     raw_root = os.path.join(dataset_root, "raw")
-    cache_root = os.path.join(dataset_root, "processed_v1")
+    # v4 uses the band-limited analytic amplitude envelope, which preserves
+    # temporal ERD/ERS changes while avoiding signed-current cancellation.
+    cache_root = os.path.join(
+        dataset_root,
+        "raw_segments_csp_v1" if csp else ("processed_temporal_v4" if temporal else "processed_v1"),
+    )
     os.makedirs(cache_root, exist_ok=True)
 
     subject_ids = np.arange(1, 110)
@@ -666,7 +701,7 @@ def _load_physionet_eeg_mi(
         cache_path = os.path.join(cache_root, f"subject_{subject_id:03d}.npz")
         if os.path.isfile(cache_path):
             with np.load(cache_path) as cache:
-                features = cache["features"]
+                features = cache["signals" if csp else "features"]
                 labels = cache["labels"]
         else:
             subject_features = []
@@ -691,27 +726,39 @@ def _load_physionet_eeg_mi(
                         if start < 0 or stop > signals.shape[1]:
                             continue
                         segment = signals[:, start:stop]
-                        freqs, power = welch(
-                            segment,
-                            fs=sample_rate,
-                            nperseg=min(256, segment.shape[1]),
-                            axis=1,
-                        )
-                        frequency_edges = np.linspace(8.0, 30.0, 17)
-                        bands = []
-                        for low, high in zip(frequency_edges[:-1], frequency_edges[1:]):
-                            mask = (freqs >= low) & (freqs < high)
-                            if not np.any(mask):
-                                nearest = int(np.argmin(np.abs(freqs - (low + high) / 2.0)))
-                                band = power[:, nearest]
-                            else:
-                                band = power[:, mask].mean(axis=1)
-                            bands.append(band)
-                        log_power = 10.0 * np.log10(np.maximum(np.stack(bands, axis=1), 1e-30))
-                        mean = float(log_power.mean())
-                        std = float(log_power.std())
-                        normalized = np.clip((log_power - mean) / max(std, 1e-6), -3.0, 3.0)
-                        subject_features.append(((normalized + 3.0) / 6.0).astype(np.float32))
+                        if csp:
+                            # Cache filtered samples; supervised CSP filters
+                            # are fitted later using training subjects only.
+                            subject_features.append(resample(segment, 128, axis=1).astype(np.float32))
+                        elif temporal:
+                            # Motor imagery is commonly expressed through
+                            # mu/beta amplitude modulation. Use a positive
+                            # envelope to avoid signed-current cancellation.
+                            envelope = np.abs(hilbert(segment, axis=1))
+                            sequence = resample(envelope, 128, axis=1)
+                            subject_features.append(np.clip(sequence / 100e-6, 0.0, 1.0).astype(np.float32))
+                        else:
+                            freqs, power = welch(
+                                segment,
+                                fs=sample_rate,
+                                nperseg=min(256, segment.shape[1]),
+                                axis=1,
+                            )
+                            frequency_edges = np.linspace(8.0, 30.0, 17)
+                            bands = []
+                            for low, high in zip(frequency_edges[:-1], frequency_edges[1:]):
+                                mask = (freqs >= low) & (freqs < high)
+                                if not np.any(mask):
+                                    nearest = int(np.argmin(np.abs(freqs - (low + high) / 2.0)))
+                                    band = power[:, nearest]
+                                else:
+                                    band = power[:, mask].mean(axis=1)
+                                bands.append(band)
+                            log_power = 10.0 * np.log10(np.maximum(np.stack(bands, axis=1), 1e-30))
+                            mean = float(log_power.mean())
+                            std = float(log_power.std())
+                            normalized = np.clip((log_power - mean) / max(std, 1e-6), -3.0, 3.0)
+                            subject_features.append(((normalized + 3.0) / 6.0).astype(np.float32))
                         subject_labels.append(class_id)
                 raw.close()
 
@@ -719,13 +766,74 @@ def _load_physionet_eeg_mi(
                 raise RuntimeError(f"Keine gültigen EEG-Motor-Imagery-Segmente für Person {subject_id} gefunden.")
             features = np.stack(subject_features)
             labels = np.asarray(subject_labels, dtype=np.int64)
-            np.savez_compressed(cache_path, features=features, labels=labels)
+            cache_payload = {"signals": features, "labels": labels} if csp else {"features": features, "labels": labels}
+            np.savez_compressed(cache_path, **cache_payload)
 
         split = subject_split(int(subject_id))
         split_features[split].append(features)
         split_labels[split].append(labels)
         if int(subject_id) % 10 == 0:
             print(f"[PhysioNet EEGMI] Vorverarbeitung: {subject_id}/109 Personen")
+
+    if csp:
+        try:
+            from mne.decoding import CSP
+        except ImportError as exc:
+            raise ImportError(
+                "Die CSP-Vorverarbeitung benötigt scikit-learn. "
+                "Installiere die vollständigen Projektabhängigkeiten mit `pip install -r requirements.txt`."
+            ) from exc
+
+        train_x = np.concatenate(split_features["train"], axis=0)
+        train_y = np.concatenate(split_labels["train"], axis=0)
+        csp_model = CSP(
+            n_components=8,
+            reg="ledoit_wolf",
+            log=None,
+            transform_into="csp_space",
+            norm_trace=False,
+        )
+        csp_model.fit(train_x, train_y)
+        transformed = {}
+        for split in ("train", "validation", "test"):
+            raw_x = np.concatenate(split_features[split], axis=0)
+            csp_signals = csp_model.transform(raw_x)
+            if temporal:
+                transformed[split] = np.abs(hilbert(csp_signals, axis=2))
+            else:
+                sample_features = []
+                for sample in csp_signals:
+                    freqs, power = welch(sample, fs=64.0, nperseg=128, axis=1)
+                    edges = np.linspace(8.0, 30.0, 17)
+                    bands = []
+                    for low, high in zip(edges[:-1], edges[1:]):
+                        mask = (freqs >= low) & (freqs < high)
+                        if np.any(mask):
+                            band = power[:, mask].mean(axis=1)
+                        else:
+                            nearest = int(np.argmin(np.abs(freqs - (low + high) / 2.0)))
+                            band = power[:, nearest]
+                        bands.append(band)
+                    log_power = 10.0 * np.log10(np.maximum(np.stack(bands, axis=1), 1e-30))
+                    sample_features.append(log_power)
+                transformed[split] = np.stack(sample_features)
+        if temporal:
+            # Component-wise scale is estimated on training subjects only.
+            component_scale = np.percentile(transformed["train"], 99.0, axis=(0, 2))
+            component_scale = np.maximum(component_scale, 1e-12)[None, :, None]
+            for split in transformed:
+                transformed[split] = np.clip(transformed[split] / component_scale, 0.0, 1.0).astype(np.float32)
+        else:
+            # Per-feature normalization is fitted on training subjects only.
+            train_features = transformed["train"]
+            feature_mean = train_features.mean(axis=0, keepdims=True)
+            feature_std = np.maximum(train_features.std(axis=0, keepdims=True), 1e-6)
+            for split in transformed:
+                values = np.clip((transformed[split] - feature_mean) / feature_std, -3.0, 3.0)
+                transformed[split] = ((values + 3.0) / 6.0).astype(np.float32)
+        # The shared assembly below concatenates a list of per-subject arrays.
+        # Wrap each already-merged CSP split once to preserve its sample axis.
+        split_features = {split: [features] for split, features in transformed.items()}
 
     datasets_by_split = {}
     for split in ("train", "validation", "test"):
@@ -821,9 +929,13 @@ def get_dataset(
 
     os.makedirs(data_dir, exist_ok=True)
 
-    if key in ("physionet_eeg_mi", "eeg_mi"):
+    if key in ("physionet_eeg_mi", "eeg_mi", "physionet_eeg_mi_temporal", "physionet_eeg_mi_csp_temporal", "physionet_eeg_mi_csp_spectral"):
         train_ds, validation_ds, test_ds = _load_physionet_eeg_mi(
-            data_dir=data_dir, seed=seed, allow_download=download
+            data_dir=data_dir,
+            seed=seed,
+            allow_download=download,
+            temporal=key in ("physionet_eeg_mi_temporal", "physionet_eeg_mi_csp_temporal"),
+            csp=key in ("physionet_eeg_mi_csp_temporal", "physionet_eeg_mi_csp_spectral"),
         )
         info.validation_dataset = validation_ds
         return train_ds, test_ds, info
