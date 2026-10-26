@@ -486,6 +486,163 @@ class ConfigurableANN(nn.Module):
         return f"ANN [{' -> '.join(parts)}]{act_str}"
 
 
+class CompactTransformerANN(nn.Module):
+    """Kleiner Transformer für 16x16-Mel-Spektrogramme (Zeitfenster als Tokens)."""
+    def __init__(self, input_size: int, output_size: int, in_channels: int,
+                 in_height: int, in_width: int, embed_dim: int = 32,
+                 num_heads: int = 4, num_layers: int = 2,
+                 feedforward_dim: int = 64, dropout_rate: float = 0.1):
+        super().__init__()
+        if embed_dim % num_heads:
+            raise ValueError("transformer.embed_dim muss durch num_heads teilbar sein")
+        self.input_size = int(input_size)
+        self.in_channels = int(in_channels)
+        self.in_height = int(in_height)
+        self.in_width = int(in_width)
+        self.output_size = int(output_size)
+        self.hidden_layers = [int(embed_dim)]
+        self.activation_name = "gelu"
+        self.has_conv = False
+        self.is_compact_transformer = True
+        self.deployable = True
+        self.input_projection = nn.Linear(self.in_height, embed_dim)
+        self.position_embedding = nn.Parameter(torch.zeros(1, self.in_width, embed_dim))
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=feedforward_dim,
+            dropout=dropout_rate,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, output_size)
+        self.fc_layers = nn.ModuleList([self.classifier])
+        self.dropout_rate = float(dropout_rate)
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.view(x.size(0), self.in_channels, self.in_height, self.in_width)
+        if x.dim() == 4:
+            x = x.mean(dim=1)
+        if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
+            raise ValueError(f"Transformer erwartet (Batch, {self.in_height}, {self.in_width}), erhalten: {tuple(x.shape)}")
+        # Mel-Spektrogramm: Achse 0 = Frequenzbänder, Achse 1 = Zeitfenster.
+        tokens = self.input_projection(x.transpose(1, 2)) + self.position_embedding
+        encoded = self.encoder(tokens)
+        pooled = self.norm(encoded.mean(dim=1))
+        return self.classifier(pooled)
+
+    def get_structure_summary(self) -> str:
+        return (f"ANN CompactTransformer [{self.in_width} Zeit-Tokens -> "
+                f"{self.input_projection.out_features} Embedding -> "
+                f"{len(self.encoder.layers)} Encoder-Blöcke -> {self.output_size}]")
+
+
+class CompactSpikingTransformer(nn.Module):
+    """Kleiner spiking Transformer für 16x16-Mel-Spektrogramme.
+
+    Die Zeitachse bildet Tokens. Projektion, Q/K/V, Attention-Residual und
+    MLP-Residual verwenden LIF-Neuronen; die Vorhersage mittelt Spike-Raten.
+    """
+    def __init__(self, input_size: int, output_size: int, in_channels: int,
+                 in_height: int, in_width: int, embed_dim: int = 32,
+                 num_heads: int = 4, num_layers: int = 2,
+                 feedforward_dim: int = 64, num_steps: int = 8,
+                 beta: float = 0.5, threshold: float = 1.0):
+        super().__init__()
+        if not HAS_SPIKINGJELLY:
+            raise ImportError("SpikingTransformer benötigt spikingjelly")
+        if embed_dim % num_heads:
+            raise ValueError("transformer.embed_dim muss durch num_heads teilbar sein")
+        self.input_size = int(input_size)
+        self.in_channels = int(in_channels)
+        self.in_height = int(in_height)
+        self.in_width = int(in_width)
+        self.output_size = int(output_size)
+        self.hidden_layers = [int(embed_dim)]
+        self.has_conv = False
+        self.is_compact_transformer = True
+        self.is_spiking_transformer = True
+        self.deployable = True
+        self.neuron_type = "lif"
+        self.encoding_type = "direct"
+        self.num_steps = int(num_steps)
+        self.beta = float(beta)
+        self.threshold = float(threshold)
+        self.input_projection = nn.Linear(self.in_height, embed_dim)
+        self.position_embedding = nn.Parameter(torch.zeros(1, self.in_width, embed_dim))
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=feedforward_dim,
+            dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, output_size)
+        self.fc_layers = nn.ModuleList([self.classifier])
+        self.input_node = self._lif()
+        self.q_nodes = nn.ModuleList([self._lif() for _ in range(num_layers)])
+        self.k_nodes = nn.ModuleList([self._lif() for _ in range(num_layers)])
+        self.v_nodes = nn.ModuleList([self._lif() for _ in range(num_layers)])
+        self.attn_nodes = nn.ModuleList([self._lif() for _ in range(num_layers)])
+        self.ff_nodes = nn.ModuleList([self._lif() for _ in range(num_layers)])
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+
+    def _lif(self):
+        return neuron.LIFNode(
+            tau=1.0 / max(1e-4, 1.0 - self.beta), decay_input=False,
+            v_threshold=self.threshold, v_reset=0.0,
+            surrogate_function=surrogate.ATan(), detach_reset=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.view(x.size(0), self.in_channels, self.in_height, self.in_width)
+        if x.dim() == 4:
+            x = x.mean(dim=1)
+        if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
+            raise ValueError(f"SpikingTransformer erwartet (Batch, {self.in_height}, {self.in_width})")
+
+        functional.reset_net(self)
+        tokens = self.input_projection(x.transpose(1, 2)) + self.position_embedding
+        spike_sum = torch.zeros_like(tokens)
+        try:
+            for _ in range(self.num_steps):
+                cur = self.input_node(tokens)
+                for i, layer in enumerate(self.encoder.layers):
+                    b, n, d = cur.shape
+                    normed = layer.norm1(cur)
+                    qkv = F.linear(normed, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias)
+                    q, k, v = qkv.chunk(3, dim=-1)
+                    q, k, v = self.q_nodes[i](q), self.k_nodes[i](k), self.v_nodes[i](v)
+                    heads = layer.self_attn.num_heads
+                    head_dim = d // heads
+                    q = q.view(b, n, heads, head_dim).transpose(1, 2)
+                    k = k.view(b, n, heads, head_dim).transpose(1, 2)
+                    v = v.view(b, n, heads, head_dim).transpose(1, 2)
+                    attn = torch.softmax((q @ k.transpose(-2, -1)) * (head_dim ** -0.5), dim=-1) @ v
+                    attn = attn.transpose(1, 2).contiguous().view(b, n, d)
+                    attn = F.linear(attn, layer.self_attn.out_proj.weight, layer.self_attn.out_proj.bias)
+                    cur = self.attn_nodes[i](cur + attn)
+                    hidden = F.gelu(F.linear(layer.norm2(cur), layer.linear1.weight, layer.linear1.bias))
+                    ff = F.linear(hidden, layer.linear2.weight, layer.linear2.bias)
+                    cur = self.ff_nodes[i](cur + ff)
+                spike_sum = spike_sum + cur
+            pooled = spike_sum.mean(dim=1) / float(self.num_steps)
+            return self.classifier(self.norm(pooled))
+        finally:
+            functional.reset_net(self)
+
+    def get_structure_summary(self) -> str:
+        return (f"SNN-SpikingTransformer [{self.in_width} Zeit-Tokens -> "
+                f"{self.input_projection.out_features} LIF-Embedding -> "
+                f"{len(self.encoder.layers)} spikende Attention/MLP-Blöcke] "
+                f"(T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.1f})")
+
+
 def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.Tensor:
     """
     Kodiert Eingabedaten x (Batch, Features) oder (Batch, C, H, W) über num_steps Zeitschritte.
@@ -958,6 +1115,8 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
         ),
         "conv_layers": canonical_conv,
         "hidden_layers": hidden_layers,
+        "architecture": str(model_cfg.get("architecture", "standard")).lower(),
+        "transformer": model_cfg.get("transformer", {}),
         "optimization": canonical_opt,
         "training": {
             "epochs": int(train_cfg.get("epochs", 3)),
@@ -978,7 +1137,16 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "num_classes": int(dataset_info.num_classes),
         }
 
-    if model_type == "snn":
+    architecture = str(model_cfg.get("architecture", "standard")).lower()
+    if architecture in ("spiking_transformer", "spikingtransformer"):
+        signature["spiking_transformer"] = {
+            "transformer": copy.deepcopy(model_cfg.get("transformer", {})),
+            "num_steps": int(model_cfg.get("num_steps", 8)),
+            "beta": float(model_cfg.get("beta", 0.5)),
+            "threshold": float(model_cfg.get("threshold", 1.0)),
+            "ann_checkpoint": model_cfg.get("ann_checkpoint"),
+        }
+    elif model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
         exec_mode = str(model_cfg.get("execution_mode", model_cfg.get("execution", "dense"))).lower()
         if exec_mode in ("event", "event_based", "event_driven"):
@@ -1070,7 +1238,21 @@ def build_model_from_config(
     conv_layers = model_cfg.get("conv_layers", [])
     hidden_layers = model_cfg.get("hidden_layers", [64])
 
-    if model_type == "snn":
+    architecture = str(model_cfg.get("architecture", "standard")).lower()
+    if architecture in ("spiking_transformer", "spikingtransformer"):
+        transformer_cfg = model_cfg.get("transformer", {})
+        model = CompactSpikingTransformer(
+            input_size=input_size, output_size=output_size,
+            in_channels=in_channels, in_height=in_height, in_width=in_width,
+            embed_dim=int(transformer_cfg.get("embed_dim", 32)),
+            num_heads=int(transformer_cfg.get("num_heads", 4)),
+            num_layers=int(transformer_cfg.get("num_layers", 2)),
+            feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
+            num_steps=int(model_cfg.get("num_steps", 8)),
+            beta=float(model_cfg.get("beta", 0.5)),
+            threshold=float(model_cfg.get("threshold", 1.0)),
+        ).to(device)
+    elif model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
         encoding_type = str(model_cfg.get("encoding_type", model_cfg.get("encoding", "direct"))).lower()
         execution_mode = str(model_cfg.get("execution_mode", model_cfg.get("execution", "dense"))).lower()
@@ -1099,6 +1281,20 @@ def build_model_from_config(
             temporal_input=temporal_input,
             input_scale=input_scale,
             output_readout=output_readout,
+        ).to(device)
+    elif architecture in ("transformer", "compact_transformer"):
+        transformer_cfg = model_cfg.get("transformer", {})
+        model = CompactTransformerANN(
+            input_size=input_size,
+            output_size=output_size,
+            in_channels=in_channels,
+            in_height=in_height,
+            in_width=in_width,
+            embed_dim=int(transformer_cfg.get("embed_dim", 32)),
+            num_heads=int(transformer_cfg.get("num_heads", 4)),
+            num_layers=int(transformer_cfg.get("num_layers", 2)),
+            feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
+            dropout_rate=float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.1))),
         ).to(device)
     else:
         activation = model_cfg.get("activation", "relu")
@@ -1568,8 +1764,46 @@ def train_model(
     signature, sig_hash = compute_model_signature(config, dataset_info)
     model = build_model_from_config(config, dataset_info, device=device)
 
-    # Transfer Learning: ANN -> SNN (wenn SNN konfiguriert und ANN-Checkpoint existiert)
-    if model_type == "snn":
+    # Transfer Learning: denselben ANN-Transformer als Initialisierung für den
+    # Spiking-Transformer verwenden; LIF-Zustände selbst haben keine Gewichte.
+    if model_type == "snn" and getattr(model, "is_spiking_transformer", False):
+        ann_model_name = model_cfg.get(
+            "ann_checkpoint", "ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer"
+        )
+        ann_checkpoint_path = os.path.join(resolved_save_dir, f"{ann_model_name}.pt")
+        if os.path.isfile(ann_checkpoint_path):
+            try:
+                ann_checkpoint = torch.load(ann_checkpoint_path, map_location=device, weights_only=False)
+                ann_state = ann_checkpoint.get("state_dict", {})
+                target_state = model.state_dict()
+                compatible = {
+                    key: value for key, value in ann_state.items()
+                    if key in target_state and target_state[key].shape == value.shape
+                }
+                parameter_keys = dict(model.named_parameters())
+                copied_parameters = sum(
+                    parameter_keys[key].numel() for key in compatible if key in parameter_keys
+                )
+                total_parameters = sum(parameter.numel() for parameter in parameter_keys.values())
+                if copied_parameters < total_parameters * 0.9:
+                    raise ValueError(
+                        f"ANN-Checkpoint passt nur zu {copied_parameters}/{total_parameters} SNN-Parametern"
+                    )
+                model.load_state_dict(compatible, strict=False)
+                print(
+                    f"[Transfer] {copied_parameters:,}/{total_parameters:,} Parameter "
+                    f"vom ANN-Transformer '{ann_model_name}' auf den Spiking-Transformer übertragen.\n"
+                )
+            except Exception as exc:
+                print(f"[Transfer] Transformer-Gewichtstransfer fehlgeschlagen: {exc}\n")
+        else:
+            print(
+                f"[Transfer] Kein ANN-Transformer-Checkpoint '{ann_checkpoint_path}' gefunden - "
+                "SNN startet mit zufälligen Gewichten.\n"
+            )
+
+    # Transfer Learning: ANN -> konventionelles SNN.
+    elif model_type == "snn":
         ann_model_name = model_cfg.get("ann_checkpoint", f"ANN_{dataset_name.capitalize()}_Conv32_64_128")
         ann_checkpoint_path = os.path.join(resolved_save_dir, f"{ann_model_name}.pt")
         if os.path.isfile(ann_checkpoint_path):
@@ -1666,9 +1900,9 @@ def train_model(
         print(f"  - Neuronen-Typ:        {model.neuron_type.upper()}")
         print(f"  - Encoding-Typ:        {model.encoding_type.upper()}")
         print(f"  - Zeitschritte (Steps):{model.num_steps}")
-        if model.temporal_input:
+        if getattr(model, "temporal_input", False):
             print(f"  - Sequenz-Eingabe:     {model.flat_size} Merkmale pro Zeitschritt, State-Reset nach dem Sample")
-            print(f"  - Eingangsverstärkung: {model.input_scale:g}x")
+            print(f"  - Eingangsverstärkung: {getattr(model, 'input_scale', 1.0):g}x")
         if model.neuron_type == "lif":
             print(f"  - Membran-Decay (Beta):{model.beta}")
         print(f"  - Schwellenwert (Thresh):{model.threshold}")
@@ -2253,6 +2487,11 @@ def export_c_files(
     model_cfg = config.get("model", {})
     eval_cfg = config.get("evaluation", {})
 
+    dataset_name = config.get("dataset", config.get("training", {}).get("dataset", "mnist"))
+    if isinstance(dataset_name, dict):
+        dataset_name = dataset_name.get("name", "mnist")
+    dataset_name = str(dataset_name).strip().lower()
+
     input_size = int(model_cfg.get("input_size", 784))
     dataset_input_size = input_size
     temporal_input = bool(getattr(model, "temporal_input", False))
@@ -2260,6 +2499,8 @@ def export_c_files(
         input_size = int(model.flat_size)
     output_size = int(model_cfg.get("output_size", 10))
     num_test_samples = int(eval_cfg.get("num_test_samples", 500))
+    if dataset_name in ("speech_commands", "kws"):
+        num_test_samples = min(num_test_samples, 100)
     if test_dataset is not None and hasattr(test_dataset, "__len__"):
         num_test_samples = min(num_test_samples, len(test_dataset))
 
@@ -2272,6 +2513,7 @@ def export_c_files(
         f.write("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
         f.write("#define MODEL_TYPE_ANN 0\n")
         f.write("#define MODEL_TYPE_SNN 1\n\n")
+        f.write("#define MODEL_TYPE_TRANSFORMER 2\n\n")
         f.write("#define NEURON_TYPE_LIF 0\n")
         f.write("#define NEURON_TYPE_IF  1\n\n")
         f.write("#define ENCODING_DIRECT    0\n")
@@ -2313,6 +2555,12 @@ def export_c_files(
         f.write("    float input_scale;\n")
         f.write("    int analog_readout;\n")
         f.write("} snn_config_t;\n\n")
+        f.write("typedef struct {\n")
+        f.write("    const float *qkv_w, *qkv_b, *attn_out_w, *attn_out_b;\n")
+        f.write("    const float *norm1_w, *norm1_b, *ff1_w, *ff1_b;\n")
+        f.write("    const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;\n")
+        f.write("} transformer_layer_weights_t;\n\n")
+        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold; } transformer_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
         f.write("// ANN-Spezifisch (TensorFlow Lite Micro FlatBuffer)\n")
@@ -2324,6 +2572,16 @@ def export_c_files(
         f.write("extern const float* const g_snn_conv_biases[];\n")
         f.write("extern const float* const g_snn_fc_weights[];\n")
         f.write("extern const float* const g_snn_fc_biases[];\n\n")
+        f.write("extern const transformer_config_t g_transformer_config;\n")
+        f.write("extern const float* const g_transformer_input_w;\n")
+        f.write("extern const float* const g_transformer_input_b;\n")
+        f.write("extern const float* const g_transformer_position;\n")
+        f.write("extern const transformer_layer_weights_t g_transformer_layers[];\n")
+        f.write("extern const float* const g_transformer_norm_w;\n")
+        f.write("extern const float* const g_transformer_norm_b;\n")
+        f.write("extern const float* const g_transformer_classifier_w;\n")
+        f.write("extern const float* const g_transformer_classifier_b;\n\n")
+        f.write("extern const float* const g_speech_mel_filterbank;\n\n")
         f.write("#ifdef __cplusplus\n}\n#endif\n")
 
     # 2. model_data.cc
@@ -2333,12 +2591,17 @@ def export_c_files(
         f.write(f'const char* const g_model_name = "{model_name}";\n')
 
         tflite_bytes = model_entry.get("tflite_bytes", b"")
-        if model_type == "ann":
+        is_transformer = bool(getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False))
+        if is_transformer:
+            f.write("const int g_model_type = MODEL_TYPE_TRANSFORMER;\n\n")
+        elif model_type == "ann":
             f.write("const int g_model_type = MODEL_TYPE_ANN;\n\n")
         else:
             f.write("const int g_model_type = MODEL_TYPE_SNN;\n\n")
 
         f.write('alignas(16) const unsigned char g_model[] = {\n')
+        if not tflite_bytes:
+            f.write('  0x00,\n')
         for i, b in enumerate(tflite_bytes):
             if i % 12 == 0:
                 f.write('  ')
@@ -2352,7 +2615,84 @@ def export_c_files(
         f.write('};\n\n')
         f.write(f'const int g_model_len = {len(tflite_bytes)};\n\n')
 
-        if model_type == "ann":
+        if is_transformer:
+            f.write("const snn_config_t g_snn_config = {};\n")
+            f.write("const float* const g_snn_conv_weights[] = {0};\n")
+            f.write("const float* const g_snn_conv_biases[] = {0};\n")
+            f.write("const float* const g_snn_fc_weights[] = {0};\n")
+            f.write("const float* const g_snn_fc_biases[] = {0};\n\n")
+
+            def emit_transformer_array(symbol: str, tensor: torch.Tensor) -> None:
+                values = tensor.detach().cpu().numpy().astype(np.float32).reshape(-1)
+                f.write(f"static const float {symbol}[{values.size}] = {{\n")
+                for start in range(0, values.size, 8):
+                    literals = []
+                    for value in values[start:start + 8]:
+                        literal = f"{float(value):.9g}"
+                        if "." not in literal and "e" not in literal.lower():
+                            literal += ".0"
+                        literals.append(literal + "f")
+                    f.write("  " + ", ".join(literals) + ",\n")
+                f.write("};\n")
+
+            emit_transformer_array("s_transformer_input_w", model.input_projection.weight)
+            emit_transformer_array("s_transformer_input_b", model.input_projection.bias)
+            emit_transformer_array("s_transformer_position", model.position_embedding)
+            emit_transformer_array("s_transformer_norm_w", model.norm.weight)
+            emit_transformer_array("s_transformer_norm_b", model.norm.bias)
+            emit_transformer_array("s_transformer_classifier_w", model.classifier.weight)
+            emit_transformer_array("s_transformer_classifier_b", model.classifier.bias)
+
+            layer_symbols = []
+            for layer_idx, layer in enumerate(model.encoder.layers):
+                names = {
+                    "qkv_w": layer.self_attn.in_proj_weight,
+                    "qkv_b": layer.self_attn.in_proj_bias,
+                    "attn_out_w": layer.self_attn.out_proj.weight,
+                    "attn_out_b": layer.self_attn.out_proj.bias,
+                    "norm1_w": layer.norm1.weight,
+                    "norm1_b": layer.norm1.bias,
+                    "ff1_w": layer.linear1.weight,
+                    "ff1_b": layer.linear1.bias,
+                    "ff2_w": layer.linear2.weight,
+                    "ff2_b": layer.linear2.bias,
+                    "norm2_w": layer.norm2.weight,
+                    "norm2_b": layer.norm2.bias,
+                }
+                symbols = {}
+                for key, tensor in names.items():
+                    symbol = f"s_transformer_l{layer_idx}_{key}"
+                    emit_transformer_array(symbol, tensor)
+                    symbols[key] = symbol
+                layer_symbols.append(symbols)
+
+            tokens = model.in_width
+            features = model.in_height
+            embed_dim = model.input_projection.out_features
+            heads = model.encoder.layers[0].self_attn.num_heads
+            layer_count = len(model.encoder.layers)
+            ffn_dim = model.encoder.layers[0].linear1.out_features
+            if (tokens, features, embed_dim, heads, layer_count, ffn_dim, output_size) != (16, 16, 32, 4, 2, 64, 35):
+                raise ValueError("ESP32-Transformer-Export unterstützt aktuell 16x16, D=32, 4 Heads, 2 Layer, FFN=64 und 35 Klassen")
+            f.write("\nconst transformer_config_t g_transformer_config = {")
+            is_spiking_transformer = bool(getattr(model, "is_spiking_transformer", False))
+            transformer_steps = int(getattr(model, "num_steps", 1)) if is_spiking_transformer else 1
+            transformer_beta = float(getattr(model, "beta", 0.0)) if is_spiking_transformer else 0.0
+            transformer_threshold = float(getattr(model, "threshold", 1.0)) if is_spiking_transformer else 1.0
+            f.write(f"{tokens}, {features}, {embed_dim}, {heads}, {layer_count}, {ffn_dim}, {output_size}, "
+                    f"{1 if is_spiking_transformer else 0}, {transformer_steps}, {transformer_beta:.6f}f, {transformer_threshold:.6f}f" + "};\n")
+            f.write("const float* const g_transformer_input_w = s_transformer_input_w;\n")
+            f.write("const float* const g_transformer_input_b = s_transformer_input_b;\n")
+            f.write("const float* const g_transformer_position = s_transformer_position;\n")
+            f.write("const float* const g_transformer_norm_w = s_transformer_norm_w;\n")
+            f.write("const float* const g_transformer_norm_b = s_transformer_norm_b;\n")
+            f.write("const float* const g_transformer_classifier_w = s_transformer_classifier_w;\n")
+            f.write("const float* const g_transformer_classifier_b = s_transformer_classifier_b;\n")
+            f.write("const transformer_layer_weights_t g_transformer_layers[] = {\n")
+            for symbols in layer_symbols:
+                f.write("    {" + ", ".join(symbols[key] for key in ("qkv_w", "qkv_b", "attn_out_w", "attn_out_b", "norm1_w", "norm1_b", "ff1_w", "ff1_b", "ff2_w", "ff2_b", "norm2_w", "norm2_b")) + "},\n")
+            f.write("};\n")
+        elif model_type == "ann":
             f.write("const snn_config_t g_snn_config = {};\n")
             f.write("const float* const g_snn_conv_weights[] = {0};\n")
             f.write("const float* const g_snn_conv_biases[] = {0};\n")
@@ -2463,10 +2803,33 @@ def export_c_files(
             f.write(f"    .analog_readout = {1 if getattr(model, 'output_readout', 'spike') == 'analog' else 0},\n")
             f.write("};\n")
 
-    dataset_name = config.get("dataset", config.get("training", {}).get("dataset", "mnist"))
-    if isinstance(dataset_name, dict):
-        dataset_name = dataset_name.get("name", "mnist")
-    dataset_name = str(dataset_name).strip().lower()
+        if dataset_name in ("speech_commands", "kws"):
+            hz_to_mel = lambda hz: 2595.0 * np.log10(1.0 + hz / 700.0)
+            mel_to_hz = lambda mel: 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+            mel_points = np.linspace(hz_to_mel(20.0), hz_to_mel(7600.0), 42)
+            hz_points = mel_to_hz(mel_points)
+            fft_frequencies = np.linspace(0.0, 8000.0, 201)
+            filterbank = np.zeros((40, 201), dtype=np.float32)
+            for mel_idx in range(40):
+                lower, center, upper = hz_points[mel_idx:mel_idx + 3]
+                filterbank[mel_idx] = np.maximum(
+                    0.0,
+                    np.minimum((fft_frequencies - lower) / (center - lower),
+                               (upper - fft_frequencies) / (upper - center)),
+                )
+            values = filterbank.reshape(-1)
+            f.write(f"static const float s_speech_mel_filterbank[{values.size}] = {{\n")
+            for start in range(0, values.size, 8):
+                literals = []
+                for value in values[start:start + 8]:
+                    literal = f"{float(value):.9g}"
+                    if "." not in literal and "e" not in literal.lower():
+                        literal += ".0"
+                    literals.append(literal + "f")
+                f.write("  " + ", ".join(literals) + ",\n")
+            f.write("};\nconst float* const g_speech_mel_filterbank = s_speech_mel_filterbank;\n")
+        else:
+            f.write("const float* const g_speech_mel_filterbank = nullptr;\n")
 
     # 3. mnist_test_data.h
     test_header_path = out_path / "mnist_test_data.h"
@@ -2475,7 +2838,11 @@ def export_c_files(
         f.write("#include <stdint.h>\n\n")
         f.write(f"#define DATASET_NAME \"{dataset_name}\"\n")
         f.write(f"#define DATASET_INPUT_SIZE {dataset_input_size}\n")
-        f.write(f"#define DATASET_NUM_CLASSES {output_size}\n\n")
+        f.write(f"#define DATASET_NUM_CLASSES {output_size}\n")
+        f.write(f"#define HAS_SPEECH_AUDIO {1 if dataset_name in ('speech_commands', 'kws') else 0}\n")
+        if dataset_name in ("speech_commands", "kws"):
+            f.write("#define SPEECH_AUDIO_SAMPLES 16000\n")
+        f.write("\n")
         f.write(f"#define MNIST_TEST_SUBSET {num_test_samples}\n")
         f.write(f"#define MNIST_IMAGE_SIZE {dataset_input_size}\n")
         f.write(f"#define MNIST_NUM_OUTPUTS {output_size}\n\n")
@@ -2484,6 +2851,19 @@ def export_c_files(
         f.write("static const uint8_t mnist_test_labels[MNIST_TEST_SUBSET] = {\n  ")
         f.write(", ".join(str(l) for l in labels))
         f.write("\n};\n\n")
+
+        if dataset_name in ("speech_commands", "kws"):
+            if not hasattr(test_dataset, "load_normalized_audio"):
+                raise TypeError("Speech-Commands-ESP32-Export benötigt load_normalized_audio() im Dataset")
+            f.write("static const int16_t speech_test_audio[MNIST_TEST_SUBSET][SPEECH_AUDIO_SAMPLES] = {\n")
+            for sample_idx in range(num_test_samples):
+                pcm = np.rint(test_dataset.load_normalized_audio(sample_idx) * 32768.0)
+                pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
+                f.write("  {\n")
+                for row in range(0, pcm.size, 16):
+                    f.write("    " + ", ".join(str(int(v)) for v in pcm[row:row + 16]) + ",\n")
+                f.write("  },\n")
+            f.write("};\n\n")
 
         f.write("static const float mnist_test_images[MNIST_TEST_SUBSET][MNIST_IMAGE_SIZE] = {\n")
         for i in range(num_test_samples):
@@ -2502,7 +2882,10 @@ def export_c_files(
             f.write("  },\n")
         f.write("};\n")
 
-    size_desc = f"{len(model_entry.get('tflite_bytes', b'')):,} Bytes" if model_type == "ann" else f"{model_entry.get('model_size_bytes', 0):,} Bytes"
+    if getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False):
+        size_desc = f"{model_entry.get('model_size_bytes', 0):,} Bytes (FP32 Gewichte)"
+    else:
+        size_desc = f"{len(model_entry.get('tflite_bytes', b'')):,} Bytes" if model_type == "ann" else f"{model_entry.get('model_size_bytes', 0):,} Bytes"
     print(f"[Export] Modell '{model_name}' ({model_type.upper()}, {size_desc}) und {num_test_samples} Testsamples nach '{output_dir}/' exportiert:")
     print(f"  - {header_path}")
     print(f"  - {cc_path}")
@@ -2595,6 +2978,12 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "hidden_layers": hidden_layers,
                 "output_size": output_size,
             }
+            architecture = str(m.get("architecture", "standard"))
+            if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer"):
+                model_dict["architecture"] = architecture
+                model_dict["dropout_rate"] = float(m.get("dropout_rate", m.get("dropout", 0.0)))
+                if isinstance(m.get("transformer"), dict):
+                    model_dict["transformer"] = copy.deepcopy(m["transformer"])
             if m_type == "snn":
                 model_dict["neuron_type"] = str(m.get("neuron_type", m.get("neuron", "lif"))).lower()
                 model_dict["encoding_type"] = str(m.get("encoding_type", m.get("encoding", "direct"))).lower()
@@ -2647,6 +3036,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                         model_evaluation[k] = m[k]
             if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
                 model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
+            if m_ds == "speech_commands":
+                model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 100)
 
             model_optimization = copy.deepcopy(global_optimization)
             if isinstance(m.get("optimization"), dict):
@@ -2702,6 +3093,12 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         "hidden_layers": hidden_layers,
         "output_size": output_size,
     }
+    architecture = str(single_m.get("architecture", "standard"))
+    if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer"):
+        model_dict["architecture"] = architecture
+        model_dict["dropout_rate"] = float(single_m.get("dropout_rate", single_m.get("dropout", 0.0)))
+        if isinstance(single_m.get("transformer"), dict):
+            model_dict["transformer"] = copy.deepcopy(single_m["transformer"])
     if m_type == "snn":
         model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
         model_dict["encoding_type"] = str(single_m.get("encoding_type", single_m.get("encoding", "direct"))).lower()
@@ -2751,6 +3148,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 model_evaluation[k] = single_m[k]
     if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
         model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
+    if single_ds == "speech_commands":
+        model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 100)
 
     model_optimization = copy.deepcopy(global_optimization)
     if isinstance(single_m.get("optimization"), dict):
@@ -2899,12 +3298,14 @@ def train_all_models(
             )
             print(f"[Evaluation] Host-Genauigkeit auf ESP32-Testset ({subset_total} Samples): {subset_acc:.2f}% ({subset_correct}/{subset_total} korrekt).")
 
-            tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" else b""
+            deployable = bool(getattr(model, "deployable", True))
+            is_transformer = bool(getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False))
+            tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" and deployable and not is_transformer else b""
 
             # Parameteranzahl, Sparsity & Modellgröße
             total_params = sum(p.numel() for p in model.parameters())
             sparsity_info = compute_model_sparsity(model)
-            model_size_bytes = (total_params * 4) if m_type == "snn" else len(tflite_bytes)
+            model_size_bytes = (total_params * 4) if m_type == "snn" or not tflite_bytes else len(tflite_bytes)
 
             num_steps = m_cfg["model"].get("num_steps") if m_type == "snn" else None
             trained_entry = {
@@ -2926,6 +3327,7 @@ def train_all_models(
                 "sparsity_pct": sparsity_info["sparsity_pct"],
                 "zero_weights": sparsity_info["zero_weights"],
                 "structure": model.get_structure_summary(),
+                "deployable": deployable,
             }
             trained_models.append(trained_entry)
         else:

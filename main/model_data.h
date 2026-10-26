@@ -9,6 +9,7 @@ extern "C" {
 
 #define MODEL_TYPE_ANN 0
 #define MODEL_TYPE_SNN 1
+#define MODEL_TYPE_TRANSFORMER 2
 
 #define NEURON_TYPE_LIF 0
 #define NEURON_TYPE_IF  1
@@ -57,6 +58,18 @@ typedef struct {
     int analog_readout;
 } snn_config_t;
 
+typedef struct {
+    const float *qkv_w, *qkv_b, *attn_out_w, *attn_out_b;
+    const float *norm1_w, *norm1_b, *ff1_w, *ff1_b;
+    const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;
+} transformer_layer_weights_t;
+
+typedef struct {
+    int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size;
+    int spiking, num_steps;
+    float beta, threshold;
+} transformer_config_t;
+
 extern const int g_model_type;
 extern const char* const g_model_name;
 
@@ -70,6 +83,16 @@ extern const float* const g_snn_conv_weights[];
 extern const float* const g_snn_conv_biases[];
 extern const float* const g_snn_fc_weights[];
 extern const float* const g_snn_fc_biases[];
+extern const transformer_config_t g_transformer_config;
+extern const float* const g_transformer_input_w;
+extern const float* const g_transformer_input_b;
+extern const float* const g_transformer_position;
+extern const transformer_layer_weights_t g_transformer_layers[];
+extern const float* const g_transformer_norm_w;
+extern const float* const g_transformer_norm_b;
+extern const float* const g_transformer_classifier_w;
+extern const float* const g_transformer_classifier_b;
+extern const float* const g_speech_mel_filterbank;
 
 #ifdef __cplusplus
 }

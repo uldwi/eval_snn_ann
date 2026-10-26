@@ -338,12 +338,9 @@ class SpeechCommandsDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, index):
-        cached = self.feature_cache[index]
-        if cached is not None:
-            return cached
-
-        wav_path, sample_rate, label = self.samples[index]
+    def load_normalized_audio(self, index):
+        """Lädt einen Clip als mono float32 PCM mit genau einer Sekunde Länge."""
+        wav_path, sample_rate, _ = self.samples[index]
         sample_rate, audio = wavfile.read(wav_path)
         if sample_rate != 16000:
             raise ValueError(f"Speech Commands erwartet 16 kHz, erhalten: {sample_rate} Hz")
@@ -357,16 +354,21 @@ class SpeechCommandsDataset(Dataset):
                 audio = (audio.astype(np.float32) - midpoint) / midpoint
         else:
             audio = audio.astype(np.float32)
-        waveform = torch.from_numpy(audio.copy())
-        if waveform.ndim == 1:
-            waveform = waveform.unsqueeze(0)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1, dtype=np.float32)
+        if audio.size < sample_rate:
+            audio = np.pad(audio, (0, sample_rate - audio.size))
         else:
-            waveform = waveform.transpose(0, 1)
-        waveform = waveform.mean(dim=0, keepdim=True)
-        if waveform.size(1) < sample_rate:
-            waveform = torch.nn.functional.pad(waveform, (0, sample_rate - waveform.size(1)))
-        else:
-            waveform = waveform[:, :sample_rate]
+            audio = audio[:sample_rate]
+        return np.asarray(audio, dtype=np.float32)
+
+    def __getitem__(self, index):
+        cached = self.feature_cache[index]
+        if cached is not None:
+            return cached
+
+        _, sample_rate, label = self.samples[index]
+        waveform = torch.from_numpy(self.load_normalized_audio(index).copy()).unsqueeze(0)
 
         mel = self.mel_transform(waveform)
         mel_db = 10.0 * torch.log10(mel.clamp_min(1e-10))

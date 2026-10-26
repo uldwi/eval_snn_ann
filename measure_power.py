@@ -375,7 +375,7 @@ def print_comparison_summary(all_results: list):
         host_acc = f"{res['test_acc']:.2f} %" if res.get("test_acc") is not None else "N/A"
 
         esp32_acc_val = res.get("esp32_acc")
-        if esp32_acc_val is None:
+        if esp32_acc_val is None and res.get("deployment_supported", True):
             esp32_acc_val = res.get("subset_acc", res.get("subset_test_acc"))
 
         corr = res.get("esp32_correct", res.get("subset_correct"))
@@ -1173,6 +1173,27 @@ def main():
             model_name = model_entry["name"]
             model_samples = model_entry.get("num_test_samples", num_test_samples)
 
+            if not model_entry.get("deployable", True):
+                print(f"[ESP32/Joulescope] Modell '{model_name}' ist Host-only; Export und Gerätemessung werden übersprungen.")
+                all_results.append({
+                    "name": model_name,
+                    "type": model_entry.get("type", "ann"),
+                    "structure": model_entry.get("structure", "-"),
+                    "test_acc": model_entry.get("test_acc"),
+                    "subset_acc": model_entry.get("subset_acc", model_entry.get("subset_test_acc")),
+                    "subset_test_acc": model_entry.get("subset_test_acc", model_entry.get("subset_acc")),
+                    "subset_correct": model_entry.get("subset_correct"),
+                    "subset_total": model_entry.get("subset_total"),
+                    "esp32_acc": None,
+                    "esp32_correct": None,
+                    "esp32_total": None,
+                    "model_size_bytes": model_entry.get("model_size_bytes"),
+                    "metrics": {},
+                    "num_test_samples": model_samples,
+                    "deployment_supported": False,
+                })
+                continue
+
             print("\n" + "#" * 70)
             print(f"### [Modell {idx}/{total_models}]: '{model_name}' ({model_entry.get('structure', '')}) ###")
             print("#" * 70 + "\n")
@@ -1267,6 +1288,7 @@ def main():
                 "model_size_bytes": model_entry.get("model_size_bytes"),
                 "metrics": metrics,
                 "num_test_samples": model_samples,
+                "deployment_supported": model_entry.get("deployable", True),
             })
 
             # Wenn weitere Modelle folgen und wait_unplug aktiv ist:

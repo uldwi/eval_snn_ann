@@ -24,6 +24,10 @@
 #include "model_data.h"
 #include "mnist_test_data.h"
 
+#ifndef HAS_SPEECH_AUDIO
+#define HAS_SPEECH_AUDIO 0
+#endif
+
 #define TRIGGER_GPIO GPIO_NUM_4
 
 static const char *TAG = "EVAL_SNN_ANN";
@@ -42,6 +46,391 @@ static int argmax_float(const float *arr, int len) {
         }
     }
     return max_idx;
+}
+
+// ESP32-S3 FP32-Inferenz fuer den in Python definierten kompakten Transformer.
+// Dimensionen sind im Export absichtlich fest begrenzt, damit der Workspace
+// statisch bleibt und keine grossen temporären Tensoren auf dem Task-Stack liegen.
+static constexpr int KWS_TOKENS = 16;
+static constexpr int KWS_FEATURES = 16;
+static constexpr int KWS_EMBED = 32;
+static constexpr int KWS_HEADS = 4;
+static constexpr int KWS_HEAD_DIM = KWS_EMBED / KWS_HEADS;
+static constexpr int KWS_FFN = 64;
+static constexpr int KWS_LAYERS = 2;
+static constexpr int KWS_CLASSES = 35;
+
+#if HAS_SPEECH_AUDIO
+static constexpr int SPEECH_SAMPLE_RATE = 16000;
+static constexpr int SPEECH_NFFT = 400;
+static constexpr int SPEECH_BINS = 201;
+static constexpr int SPEECH_HOP = 160;
+static constexpr int SPEECH_FRAMES = 101;
+static constexpr int SPEECH_MELS = 40;
+
+struct SpeechComplex { float re, im; };
+static float s_speech_hann[SPEECH_NFFT];
+static SpeechComplex s_speech_twiddle[SPEECH_NFFT];
+static SpeechComplex s_speech_fft_input[SPEECH_NFFT];
+static SpeechComplex s_speech_fft_output[SPEECH_NFFT];
+static SpeechComplex s_speech_fft_work[8][SPEECH_NFFT];
+static float s_speech_mel_power[SPEECH_MELS * SPEECH_FRAMES];
+static float s_speech_features[KWS_FEATURES * KWS_TOKENS];
+static bool s_speech_frontend_ready = false;
+
+static void init_speech_frontend(void) {
+    constexpr float pi = 3.14159265358979323846f;
+    for (int n = 0; n < SPEECH_NFFT; ++n) {
+        s_speech_hann[n] = 0.5f - 0.5f * cosf((2.0f * pi * n) / SPEECH_NFFT);
+        const float angle = (-2.0f * pi * n) / SPEECH_NFFT;
+        s_speech_twiddle[n] = {cosf(angle), sinf(angle)};
+    }
+    s_speech_frontend_ready = true;
+}
+
+static void speech_fft400(const SpeechComplex *src, int stride, int n,
+                          SpeechComplex *dst, int level) {
+    if (n == 1) {
+        dst[0] = *src;
+        return;
+    }
+    const int radix = (n % 2 == 0) ? 2 : 5;
+    const int sub_n = n / radix;
+    SpeechComplex *sub = s_speech_fft_work[level];
+    for (int j = 0; j < radix; ++j) {
+        speech_fft400(src + j * stride, stride * radix, sub_n,
+                      sub + j * sub_n, level + 1);
+    }
+    const int twiddle_scale = SPEECH_NFFT / n;
+    for (int q = 0; q < radix; ++q) {
+        for (int k = 0; k < sub_n; ++k) {
+            const int out_idx = k + q * sub_n;
+            float real = 0.0f;
+            float imag = 0.0f;
+            for (int j = 0; j < radix; ++j) {
+                const int phase = (j * out_idx * twiddle_scale) % SPEECH_NFFT;
+                const SpeechComplex a = sub[j * sub_n + k];
+                const SpeechComplex w = s_speech_twiddle[phase];
+                real += a.re * w.re - a.im * w.im;
+                imag += a.re * w.im + a.im * w.re;
+            }
+            dst[out_idx] = {real, imag};
+        }
+    }
+}
+
+static int speech_reflect_index(int index) {
+    while (index < 0 || index >= SPEECH_SAMPLE_RATE) {
+        if (index < 0) index = -index;
+        else index = 2 * SPEECH_SAMPLE_RATE - 2 - index;
+    }
+    return index;
+}
+
+static void speech_audio_to_mel(const int16_t *audio, float *features) {
+    if (!s_speech_frontend_ready) init_speech_frontend();
+    float mel_max = -100.0f;
+    for (int frame = 0; frame < SPEECH_FRAMES; ++frame) {
+        const int center = frame * SPEECH_HOP;
+        for (int n = 0; n < SPEECH_NFFT; ++n) {
+            const int sample_idx = speech_reflect_index(center + n - SPEECH_NFFT / 2);
+            s_speech_fft_input[n] = {
+                (static_cast<float>(audio[sample_idx]) / 32768.0f) * s_speech_hann[n], 0.0f
+            };
+        }
+        speech_fft400(s_speech_fft_input, 1, SPEECH_NFFT, s_speech_fft_output, 0);
+        for (int mel = 0; mel < SPEECH_MELS; ++mel) {
+            float power = 0.0f;
+            const float *filter = g_speech_mel_filterbank + mel * SPEECH_BINS;
+            for (int bin = 0; bin < SPEECH_BINS; ++bin) {
+                const SpeechComplex value = s_speech_fft_output[bin];
+                power += (value.re * value.re + value.im * value.im) * filter[bin];
+            }
+            const float log_power = 10.0f * log10f(fmaxf(power, 1.0e-10f));
+            s_speech_mel_power[mel * SPEECH_FRAMES + frame] = log_power;
+            if (log_power > mel_max) mel_max = log_power;
+        }
+    }
+
+    for (int mel = 0; mel < SPEECH_MELS; ++mel) {
+        for (int frame = 0; frame < SPEECH_FRAMES; ++frame) {
+            float value = s_speech_mel_power[mel * SPEECH_FRAMES + frame] - mel_max;
+            value = fmaxf(-80.0f, fminf(0.0f, value));
+            s_speech_mel_power[mel * SPEECH_FRAMES + frame] = (value + 80.0f) / 80.0f;
+        }
+    }
+
+    for (int out_mel = 0; out_mel < KWS_FEATURES; ++out_mel) {
+        const int m_start = (out_mel * SPEECH_MELS) / KWS_FEATURES;
+        const int m_end = ((out_mel + 1) * SPEECH_MELS + KWS_FEATURES - 1) / KWS_FEATURES;
+        for (int out_time = 0; out_time < KWS_TOKENS; ++out_time) {
+            const int t_start = (out_time * SPEECH_FRAMES) / KWS_TOKENS;
+            const int t_end = ((out_time + 1) * SPEECH_FRAMES + KWS_TOKENS - 1) / KWS_TOKENS;
+            float sum = 0.0f;
+            for (int m = m_start; m < m_end; ++m) {
+                for (int t = t_start; t < t_end; ++t) {
+                    sum += s_speech_mel_power[m * SPEECH_FRAMES + t];
+                }
+            }
+            const int area = (m_end - m_start) * (t_end - t_start);
+            features[out_mel * KWS_TOKENS + out_time] = sum / static_cast<float>(area);
+        }
+    }
+}
+#endif
+
+static float s_tr_x[KWS_TOKENS * KWS_EMBED];
+static float s_tr_norm[KWS_TOKENS * KWS_EMBED];
+static float s_tr_qkv[KWS_TOKENS * 3 * KWS_EMBED];
+static float s_tr_attn[KWS_TOKENS * KWS_EMBED];
+static float s_tr_proj[KWS_TOKENS * KWS_EMBED];
+static float s_tr_ff1[KWS_TOKENS * KWS_FFN];
+static float s_tr_ff2[KWS_TOKENS * KWS_EMBED];
+static float s_tr_scores[KWS_TOKENS * KWS_TOKENS];
+static float s_tr_logits[KWS_CLASSES];
+static uint32_t s_transformer_spikes = 0;
+static uint32_t s_transformer_synops = 0;
+static float s_st_mem_input[KWS_TOKENS * KWS_EMBED];
+static float s_st_mem_qkv[KWS_LAYERS][3 * KWS_TOKENS * KWS_EMBED];
+static float s_st_mem_attn[KWS_LAYERS][KWS_TOKENS * KWS_EMBED];
+static float s_st_mem_ff[KWS_LAYERS][KWS_TOKENS * KWS_EMBED];
+static float s_st_spike_accum[KWS_TOKENS * KWS_EMBED];
+
+static void transformer_linear(const float *input, int rows, int in_dim,
+                               const float *weight, const float *bias,
+                               int out_dim, float *output) {
+    for (int r = 0; r < rows; ++r) {
+        const float *x = input + r * in_dim;
+        float *y = output + r * out_dim;
+        for (int o = 0; o < out_dim; ++o) {
+            float sum = bias ? bias[o] : 0.0f;
+            const float *w = weight + o * in_dim;
+            for (int i = 0; i < in_dim; ++i) sum += w[i] * x[i];
+            y[o] = sum;
+        }
+    }
+}
+
+static void transformer_layer_norm(const float *input, int rows,
+                                   const float *weight, const float *bias,
+                                   float *output) {
+    constexpr float eps = 1.0e-5f;
+    for (int r = 0; r < rows; ++r) {
+        const float *x = input + r * KWS_EMBED;
+        float *y = output + r * KWS_EMBED;
+        float mean = 0.0f;
+        for (int i = 0; i < KWS_EMBED; ++i) mean += x[i];
+        mean /= static_cast<float>(KWS_EMBED);
+        float variance = 0.0f;
+        for (int i = 0; i < KWS_EMBED; ++i) {
+            const float delta = x[i] - mean;
+            variance += delta * delta;
+        }
+        variance /= static_cast<float>(KWS_EMBED);
+        const float inv_std = 1.0f / sqrtf(variance + eps);
+        for (int i = 0; i < KWS_EMBED; ++i) y[i] = (x[i] - mean) * inv_std * weight[i] + bias[i];
+    }
+}
+
+static inline float transformer_lif(float current, float &membrane,
+                                    float beta, float threshold) {
+    membrane = beta * membrane + (1.0f - beta) * current;
+    if (membrane >= threshold) {
+        membrane = 0.0f;
+        return 1.0f;
+    }
+    return 0.0f;
+}
+
+static int run_spiking_transformer(const float *mel) {
+    const float beta = g_transformer_config.beta;
+    const float threshold = g_transformer_config.threshold;
+    const int steps = g_transformer_config.num_steps;
+    memset(s_st_mem_input, 0, sizeof(s_st_mem_input));
+    memset(s_st_mem_qkv, 0, sizeof(s_st_mem_qkv));
+    memset(s_st_mem_attn, 0, sizeof(s_st_mem_attn));
+    memset(s_st_mem_ff, 0, sizeof(s_st_mem_ff));
+    memset(s_st_spike_accum, 0, sizeof(s_st_spike_accum));
+    s_transformer_spikes = 0;
+    s_transformer_synops = 0;
+
+    for (int step = 0; step < steps; ++step) {
+        for (int t = 0; t < KWS_TOKENS; ++t) {
+            for (int d = 0; d < KWS_EMBED; ++d) {
+                float current = g_transformer_input_b[d];
+                const float *w = g_transformer_input_w + d * KWS_FEATURES;
+                for (int f = 0; f < KWS_FEATURES; ++f) current += w[f] * mel[f * KWS_TOKENS + t];
+                current += g_transformer_position[t * KWS_EMBED + d];
+                float &mem = s_st_mem_input[t * KWS_EMBED + d];
+                const float spike = transformer_lif(current, mem, beta, threshold);
+                s_tr_x[t * KWS_EMBED + d] = spike;
+                s_transformer_spikes += static_cast<uint32_t>(spike);
+            }
+        }
+
+        for (int layer_idx = 0; layer_idx < KWS_LAYERS; ++layer_idx) {
+            const transformer_layer_weights_t &layer = g_transformer_layers[layer_idx];
+            transformer_layer_norm(s_tr_x, KWS_TOKENS, layer.norm1_w, layer.norm1_b, s_tr_norm);
+            transformer_linear(s_tr_norm, KWS_TOKENS, KWS_EMBED, layer.qkv_w, layer.qkv_b,
+                               3 * KWS_EMBED, s_tr_qkv);
+            uint32_t qkv_in_spikes = 0;
+            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) qkv_in_spikes += static_cast<uint32_t>(s_tr_x[i]);
+            s_transformer_synops += qkv_in_spikes * (3 * KWS_EMBED);
+            for (int i = 0; i < 3 * KWS_TOKENS * KWS_EMBED; ++i) {
+                s_tr_qkv[i] = transformer_lif(s_tr_qkv[i], s_st_mem_qkv[layer_idx][i], beta, threshold);
+                s_transformer_spikes += static_cast<uint32_t>(s_tr_qkv[i]);
+            }
+
+            for (int h = 0; h < KWS_HEADS; ++h) {
+                const int head_offset = h * KWS_HEAD_DIM;
+                for (int q = 0; q < KWS_TOKENS; ++q) {
+                    float *scores = s_tr_scores + q * KWS_TOKENS;
+                    float max_score = -INFINITY;
+                    for (int k = 0; k < KWS_TOKENS; ++k) {
+                        float score = 0.0f;
+                        for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                            score += s_tr_qkv[q * (3 * KWS_EMBED) + head_offset + d] *
+                                     s_tr_qkv[k * (3 * KWS_EMBED) + KWS_EMBED + head_offset + d];
+                        }
+                        scores[k] = score / sqrtf(static_cast<float>(KWS_HEAD_DIM));
+                        if (scores[k] > max_score) max_score = scores[k];
+                    }
+                    float denom = 0.0f;
+                    for (int k = 0; k < KWS_TOKENS; ++k) {
+                        scores[k] = expf(scores[k] - max_score);
+                        denom += scores[k];
+                    }
+                    for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                        float value = 0.0f;
+                        for (int k = 0; k < KWS_TOKENS; ++k) {
+                            value += (scores[k] / denom) *
+                                     s_tr_qkv[k * (3 * KWS_EMBED) + 2 * KWS_EMBED + head_offset + d];
+                        }
+                        s_tr_attn[q * KWS_EMBED + head_offset + d] = value;
+                    }
+                }
+            }
+
+            transformer_linear(s_tr_attn, KWS_TOKENS, KWS_EMBED,
+                               layer.attn_out_w, layer.attn_out_b, KWS_EMBED, s_tr_proj);
+            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
+                const float spike = transformer_lif(s_tr_x[i] + s_tr_proj[i],
+                                                     s_st_mem_attn[layer_idx][i], beta, threshold);
+                s_tr_x[i] = spike;
+                s_transformer_spikes += static_cast<uint32_t>(spike);
+            }
+
+            uint32_t mlp_in_spikes = 0;
+            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) mlp_in_spikes += static_cast<uint32_t>(s_tr_x[i]);
+            s_transformer_synops += mlp_in_spikes * KWS_FFN;
+            transformer_layer_norm(s_tr_x, KWS_TOKENS, layer.norm2_w, layer.norm2_b, s_tr_norm);
+            transformer_linear(s_tr_norm, KWS_TOKENS, KWS_EMBED, layer.ff1_w, layer.ff1_b,
+                               KWS_FFN, s_tr_ff1);
+            constexpr float inv_sqrt2 = 0.7071067811865475f;
+            for (int i = 0; i < KWS_TOKENS * KWS_FFN; ++i) {
+                s_tr_ff1[i] = 0.5f * s_tr_ff1[i] * (1.0f + erff(s_tr_ff1[i] * inv_sqrt2));
+            }
+            transformer_linear(s_tr_ff1, KWS_TOKENS, KWS_FFN, layer.ff2_w, layer.ff2_b,
+                               KWS_EMBED, s_tr_ff2);
+            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
+                const float spike = transformer_lif(s_tr_x[i] + s_tr_ff2[i],
+                                                     s_st_mem_ff[layer_idx][i], beta, threshold);
+                s_tr_x[i] = spike;
+                s_transformer_spikes += static_cast<uint32_t>(spike);
+            }
+        }
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) s_st_spike_accum[i] += s_tr_x[i];
+    }
+
+    const float denom = static_cast<float>(steps * KWS_TOKENS);
+    for (int d = 0; d < KWS_EMBED; ++d) {
+        float pooled = 0.0f;
+        for (int t = 0; t < KWS_TOKENS; ++t) pooled += s_st_spike_accum[t * KWS_EMBED + d];
+        s_tr_norm[d] = pooled / denom;
+    }
+    transformer_layer_norm(s_tr_norm, 1, g_transformer_norm_w, g_transformer_norm_b, s_tr_proj);
+    transformer_linear(s_tr_proj, 1, KWS_EMBED, g_transformer_classifier_w,
+                       g_transformer_classifier_b, KWS_CLASSES, s_tr_logits);
+    return argmax_float(s_tr_logits, KWS_CLASSES);
+}
+
+static int run_transformer_inference(const float *mel) {
+    if (g_transformer_config.spiking) return run_spiking_transformer(mel);
+    // Input ist (Frequenz, Zeit); der ANN-Forward nimmt Zeit als Tokenachse.
+    for (int t = 0; t < KWS_TOKENS; ++t) {
+        float *token = s_tr_x + t * KWS_EMBED;
+        for (int d = 0; d < KWS_EMBED; ++d) {
+            float value = g_transformer_input_b[d];
+            const float *w = g_transformer_input_w + d * KWS_FEATURES;
+            for (int f = 0; f < KWS_FEATURES; ++f) value += w[f] * mel[f * KWS_TOKENS + t];
+            token[d] = value + g_transformer_position[t * KWS_EMBED + d];
+        }
+    }
+
+    for (int layer_idx = 0; layer_idx < KWS_LAYERS; ++layer_idx) {
+        const transformer_layer_weights_t &layer = g_transformer_layers[layer_idx];
+        transformer_layer_norm(s_tr_x, KWS_TOKENS, layer.norm1_w, layer.norm1_b, s_tr_norm);
+        transformer_linear(s_tr_norm, KWS_TOKENS, KWS_EMBED, layer.qkv_w, layer.qkv_b,
+                           3 * KWS_EMBED, s_tr_qkv);
+
+        for (int h = 0; h < KWS_HEADS; ++h) {
+            const int head_offset = h * KWS_HEAD_DIM;
+            for (int q = 0; q < KWS_TOKENS; ++q) {
+                float *scores = s_tr_scores + q * KWS_TOKENS;
+                float max_score = -INFINITY;
+                for (int k = 0; k < KWS_TOKENS; ++k) {
+                    float score = 0.0f;
+                    for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                        const float qv = s_tr_qkv[q * (3 * KWS_EMBED) + head_offset + d];
+                        const float kv = s_tr_qkv[k * (3 * KWS_EMBED) + KWS_EMBED + head_offset + d];
+                        score += qv * kv;
+                    }
+                    scores[k] = score / sqrtf(static_cast<float>(KWS_HEAD_DIM));
+                    if (scores[k] > max_score) max_score = scores[k];
+                }
+                float denom = 0.0f;
+                for (int k = 0; k < KWS_TOKENS; ++k) {
+                    scores[k] = expf(scores[k] - max_score);
+                    denom += scores[k];
+                }
+                const float inv_denom = 1.0f / denom;
+                for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                    float value = 0.0f;
+                    for (int k = 0; k < KWS_TOKENS; ++k) {
+                        const float probability = scores[k] * inv_denom;
+                        const float vv = s_tr_qkv[k * (3 * KWS_EMBED) + 2 * KWS_EMBED + head_offset + d];
+                        value += probability * vv;
+                    }
+                    s_tr_attn[q * KWS_EMBED + head_offset + d] = value;
+                }
+            }
+        }
+
+        transformer_linear(s_tr_attn, KWS_TOKENS, KWS_EMBED,
+                           layer.attn_out_w, layer.attn_out_b, KWS_EMBED, s_tr_proj);
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) s_tr_x[i] += s_tr_proj[i];
+
+        transformer_layer_norm(s_tr_x, KWS_TOKENS, layer.norm2_w, layer.norm2_b, s_tr_norm);
+        transformer_linear(s_tr_norm, KWS_TOKENS, KWS_EMBED,
+                           layer.ff1_w, layer.ff1_b, KWS_FFN, s_tr_ff1);
+        constexpr float inv_sqrt2 = 0.7071067811865475f;
+        for (int i = 0; i < KWS_TOKENS * KWS_FFN; ++i) {
+            s_tr_ff1[i] = 0.5f * s_tr_ff1[i] * (1.0f + erff(s_tr_ff1[i] * inv_sqrt2));
+        }
+        transformer_linear(s_tr_ff1, KWS_TOKENS, KWS_FFN,
+                           layer.ff2_w, layer.ff2_b, KWS_EMBED, s_tr_ff2);
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) s_tr_x[i] += s_tr_ff2[i];
+    }
+
+    for (int d = 0; d < KWS_EMBED; ++d) {
+        float mean = 0.0f;
+        for (int t = 0; t < KWS_TOKENS; ++t) mean += s_tr_x[t * KWS_EMBED + d];
+        s_tr_norm[d] = mean / static_cast<float>(KWS_TOKENS);
+    }
+    transformer_layer_norm(s_tr_norm, 1, g_transformer_norm_w, g_transformer_norm_b, s_tr_proj);
+    transformer_linear(s_tr_proj, 1, KWS_EMBED, g_transformer_classifier_w,
+                       g_transformer_classifier_b, KWS_CLASSES, s_tr_logits);
+    return argmax_float(s_tr_logits, KWS_CLASSES);
 }
 
 // ---------------------------------------------------------------------
@@ -1756,8 +2145,11 @@ extern "C" void app_main(void)
 #ifndef DATASET_NAME
 #define DATASET_NAME "mnist"
 #endif
+    const char *model_type_name = g_model_type == MODEL_TYPE_SNN ? "SNN" :
+                                  (g_model_type == MODEL_TYPE_TRANSFORMER ?
+                                   (g_transformer_config.spiking ? "Spiking-Transformer" : "Transformer-ANN") : "ANN");
     ESP_LOGI(TAG, "=== Initialisiere ESP32 Inferenz: %s (%s, Datensatz: %s) ===",
-             g_model_name, (g_model_type == MODEL_TYPE_SNN) ? "SNN" : "ANN", DATASET_NAME);
+             g_model_name, model_type_name, DATASET_NAME);
 
     // 1. Trigger-GPIO konfigurieren
     gpio_config_t io_conf = {
@@ -1818,7 +2210,7 @@ extern "C" void app_main(void)
                  (input->dims->size > 1) ? input->dims->data[1] : 1,
                  (input->dims->size > 2) ? input->dims->data[2] : 1,
                  (input->dims->size > 3) ? input->dims->data[3] : 1);
-    } else {
+    } else if (g_model_type == MODEL_TYPE_SNN) {
         if (!init_snn_buffers()) {
             ESP_LOGE(TAG, "Allokation der SNN-Puffer fehlgeschlagen!");
             return;
@@ -1835,7 +2227,42 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "SNN SpikingJelly Parameter: Neuron=%s, Encoding=%s, Mode=%s, Conv=%d, FC=%d, %d Steps, Beta=%.2f, Thresh=%.2f",
                  ntype_str, enc_str, exec_str, g_snn_config.num_conv_layers, g_snn_config.hidden_layers_count + 1,
                  g_snn_config.num_steps, g_snn_config.beta, g_snn_config.threshold);
+    } else if (g_model_type == MODEL_TYPE_TRANSFORMER) {
+        if (g_transformer_config.tokens != KWS_TOKENS ||
+            g_transformer_config.input_features != KWS_FEATURES ||
+            g_transformer_config.embed_dim != KWS_EMBED ||
+            g_transformer_config.num_heads != KWS_HEADS ||
+            g_transformer_config.num_layers != KWS_LAYERS ||
+            g_transformer_config.feedforward_dim != KWS_FFN ||
+            g_transformer_config.output_size != KWS_CLASSES ||
+            DATASET_INPUT_SIZE != KWS_TOKENS * KWS_FEATURES ||
+            DATASET_NUM_CLASSES != KWS_CLASSES) {
+            ESP_LOGE(TAG, "Transformer-Konfiguration passt nicht zum ESP32-Kernel.");
+            return;
+        }
+        if (g_transformer_config.spiking &&
+            (g_transformer_config.num_steps < 1 || g_transformer_config.num_steps > 32 ||
+             g_transformer_config.beta < 0.0f || g_transformer_config.beta >= 1.0f ||
+             g_transformer_config.threshold <= 0.0f)) {
+            ESP_LOGE(TAG, "Spiking-Transformer-Neuronenparameter sind ungueltig.");
+            return;
+        }
+        input_elements = DATASET_INPUT_SIZE;
+        ESP_LOGI(TAG, "Kompakter Speech-Transformer initialisiert: %d Tokens, D=%d, Heads=%d, Layer=%d, Klassen=%d",
+                 g_transformer_config.tokens, g_transformer_config.embed_dim,
+                 g_transformer_config.num_heads, g_transformer_config.num_layers,
+                 g_transformer_config.output_size);
     }
+
+#if HAS_SPEECH_AUDIO
+    if (!g_speech_mel_filterbank) {
+        ESP_LOGE(TAG, "Speech-Commands-Mel-Filterbank fehlt im Modell-Export.");
+        return;
+    }
+    init_speech_frontend();
+    ESP_LOGI(TAG, "Speech-Commands-Frontend initialisiert (16 kHz, FFT=%d, Mel=%d, Features=%dx%d).",
+             SPEECH_NFFT, SPEECH_MELS, KWS_FEATURES, KWS_TOKENS);
+#endif
 
     #if SNN_SEL_DENSE_REF > 0
         if (init_dense_reference()) {
@@ -1901,18 +2328,32 @@ extern "C" void app_main(void)
         #endif
 
         for (int i = 0; i < MNIST_TEST_SUBSET; ++i) {
+#if HAS_SPEECH_AUDIO
+            // PCM bleibt im Flash; Mel-Spektrogramm wird je Sample innerhalb
+            // des Trigger-Fensters auf dem ESP32 berechnet und mitgemessen.
+            speech_audio_to_mel(speech_test_audio[i], s_speech_features);
+            const float *model_input = s_speech_features;
+#else
             const float *img_data = mnist_test_images[i];
+            const float *model_input = img_data;
+#endif
             int predicted = -1;
 
             if (g_model_type == MODEL_TYPE_ANN && interpreter) {
-                memcpy(input->data.f, img_data, (size_t)input_elements * sizeof(float));
+                memcpy(input->data.f, model_input, (size_t)input_elements * sizeof(float));
                 if (interpreter->Invoke() == kTfLiteOk) {
                     predicted = argmax_float(output->data.f, MNIST_NUM_OUTPUTS);
+                }
+            } else if (g_model_type == MODEL_TYPE_TRANSFORMER) {
+                predicted = run_transformer_inference(model_input);
+                if (g_transformer_config.spiking) {
+                    total_all_spikes += s_transformer_spikes;
+                    total_all_synops += s_transformer_synops;
                 }
             } else {
                 uint32_t sample_spikes = 0;
                 uint32_t sample_synops = 0;
-                predicted = run_snn_inference(img_data, &sample_spikes, &sample_synops);
+                predicted = run_snn_inference(model_input, &sample_spikes, &sample_synops);
                 total_all_spikes += sample_spikes;
                 total_all_synops += sample_synops;
             }
@@ -1952,7 +2393,7 @@ extern "C" void app_main(void)
         float accuracy_pct = (100.0f * (float)correct_count) / (float)MNIST_TEST_SUBSET;
 
         ESP_LOGI(TAG, "Inferenz-Messung abgeschlossen:");
-        ESP_LOGI(TAG, "  - Modell:             %s (%s)", g_model_name, (g_model_type == MODEL_TYPE_SNN) ? "SNN" : "ANN");
+        ESP_LOGI(TAG, "  - Modell:             %s (%s)", g_model_name, model_type_name);
         ESP_LOGI(TAG, "  - Samples evaluiert:  %d", MNIST_TEST_SUBSET);
         ESP_LOGI(TAG, "  - Korrekte Samples:   %d / %d", correct_count, MNIST_TEST_SUBSET);
         ESP_LOGI(TAG, "  - Test-Genauigkeit:   %.2f %%", accuracy_pct);
@@ -1960,7 +2401,8 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "  - Zeit pro Inferenz:  %.3f ms (%.1f Infs/s)",
                  time_per_inf_ms, (time_per_inf_ms > 0) ? (1000.0f / time_per_inf_ms) : 0.0f);
 
-        if (g_model_type == MODEL_TYPE_SNN) {
+        if (g_model_type == MODEL_TYPE_SNN ||
+            (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking)) {
             float avg_spk_per_inf = (float)total_all_spikes / (float)MNIST_TEST_SUBSET;
             float avg_synops_per_inf = (float)total_all_synops / (float)MNIST_TEST_SUBSET;
             ESP_LOGI(TAG, "  - Spikes gesamt:      %" PRIu64 " (Ø %.1f Spikes/Inferenz)",

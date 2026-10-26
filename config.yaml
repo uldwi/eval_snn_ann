@@ -41,6 +41,62 @@ microcontroller:
       trigger_gpio: 4
   target: esp32s3
 models:
+  - name: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
+    architecture: compact_transformer
+    batch_size: 64
+    dataset: speech_commands
+    dropout_rate: 0.1
+    epochs: 60
+    early_stopping:
+      enabled: true
+      monitor: val_acc
+      patience: 10
+      min_delta: 0.001
+      restore_best_weights: true
+    learning_rate: 0.0005
+    transformer:
+      embed_dim: 32
+      num_heads: 4
+      num_layers: 2
+      feedforward_dim: 64
+    type: ann
+    optimization:
+      pruning:
+        enabled: false
+      quantization:
+        enabled: false
+      clustering:
+        enabled: false
+
+  - name: SNN_KWS_SpeechCommandsV02_35Words_SpikingTransformer
+    architecture: spiking_transformer
+    ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
+    batch_size: 64
+    beta: 0.5
+    dataset: speech_commands
+    early_stopping:
+      enabled: true
+      monitor: val_acc
+      patience: 12
+      min_delta: 0.001
+      restore_best_weights: true
+    epochs: 80
+    learning_rate: 0.0005
+    num_steps: 8
+    threshold: 1.0
+    transformer:
+      embed_dim: 32
+      num_heads: 4
+      num_layers: 2
+      feedforward_dim: 64
+    type: snn
+    optimization:
+      pruning:
+        enabled: false
+      quantization:
+        enabled: false
+      clustering:
+        enabled: false
   - name: ANN_MNIST_Conv16_32_64
     activation: relu
     batch_size: 64
