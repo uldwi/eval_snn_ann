@@ -1,0 +1,357 @@
+  ESP32-S3:
+    ========================================================================================================================================================================================
+    GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)
+    ========================================================================================================================================================================================
+    Modell-Name          | Typ   | Netzwerk-Architektur                   | Host Acc (10k) | ESP32 Acc (Test)   | Größe     | Zeit/Inf   | Energie/Inf  | Mittl. Leist.  | Spikes gesamt (Ø/Inf)    | SynOps gesamt (Ø/Inf)
+                         |       |                                        | (%)            | (% [korrekt])      | (Bytes)   | (ms)       | (µJ)         | (mW)           | (Anzahl)                 | (Anzahl)
+    ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    ANN_MNIST_Conv16_32_ | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 98.85 %        | 99.20 % (496/500)  | 425,244   | 267.50 ms  | 43191.08 µJ  | 161.46 mW      | -                        | -
+    SNN_MNIST_LIF_Conv16 | SNN   | SpikingJelly SNN-LIF [Conv(1->16,3x3,p | 98.49 %        | 98.60 % (493/500)  | 423,464   | 126.05 ms  | 19492.36 µJ  | 154.64 mW      | 3,381,791 (6763.6/Inf)   | 226,522,674 (453045.3/Inf)
+    ANN_PhysioNet_EEGMI_ | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 50.13 %        | 50.80 % (254/500)  | 546,040   | 346.67 ms  | 55950.00 µJ  | 161.39 mW      | -                        | -
+    SNN_PhysioNet_EEGMI_ | SNN   | SpikingJelly SNN-IF [Conv(1->16,3x3,p2 | 50.13 %        | 50.80 % (254/500)  | 544,264   | 169.98 ms  | 27017.50 µJ  | 158.94 mW      | 5,015,454 (10030.9/Inf)  | 607,551,900 (1215103.8/Inf)
+    ANN_FashionMNIST_Con | ANN   | ANN [Conv(1->32,3x3,p2) -> Conv(32->64 | 91.68 %        | 91.60 % (458/500)  | 1,688,348 | 1250.69 ms | 204587.38 µJ | 163.58 mW      | -                        | -
+    SNN_FashionMNIST_LIF | SNN   | SpikingJelly SNN-IF [Conv(1->32,3x3,p2 | 88.62 %        | 90.00 % (450/500)  | 1,686,568 | 227.99 ms  | 35339.09 µJ  | 155.01 mW      | 3,811,745 (7623.5/Inf)   | 477,953,464 (955906.9/Inf)
+    ANN_CIFAR10_Conv32_6 | ANN   | ANN [Conv(1->32,3x3,p2) -> Conv(32->64 | 50.18 %        | 53.20 % (266/500)  | 607,004   | 397.73 ms  | 63596.40 µJ  | 159.90 mW      | -                        | -
+    SNN_CIFAR10_LIF_Conv | SNN   | SpikingJelly SNN-IF [Conv(1->32,3x3,p2 | 51.36 %        | 51.00 % (255/500)  | 605,224   | 173.28 ms  | 26317.57 µJ  | 151.88 mW      | 2,065,773 (4131.5/Inf)   | 238,545,484 (477091.0/Inf)
+    ANN_KWS_SpeechComman | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 71.97 %        | 76.60 % (383/500)  | 161,404   | 85.24 ms   | 13756.40 µJ  | 161.38 mW      | -                        | -
+    SNN_KWS_SpeechComman | SNN   | SpikingJelly SNN-IF [Conv(1->16,3x3,p2 | 67.77 %        | 65.80 % (329/500)  | 159,628   | 62.49 ms   | 9620.16 µJ   | 153.94 mW      | 1,711,027 (3422.1/Inf)   | 151,699,150 (303398.3/Inf)
+    ========================================================================================================================================================================================
+
+
+  ESP32-C6:
+    ========================================================================================================================================================================================
+    GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)
+    ========================================================================================================================================================================================
+    Modell-Name          | Typ   | Netzwerk-Architektur                   | Host Acc (10k) | ESP32 Acc (Test)   | Größe     | Zeit/Inf   | Energie/Inf  | Mittl. Leist.  | Spikes gesamt (Ø/Inf)    | SynOps gesamt (Ø/Inf)
+                         |       |                                        | (%)            | (% [korrekt])      | (Bytes)   | (ms)       | (µJ)         | (mW)           | (Anzahl)                 | (Anzahl)
+    ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    ANN_MNIST_Conv16_32_ | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 98.85 %        | 99.20 % (496/500)  | 425,244   | 859.00 ms  | 97235.52 µJ  | 113.20 mW      | -                        | -
+    SNN_MNIST_LIF_Conv16 | SNN   | SpikingJelly SNN-LIF [Conv(1->16,3x3,p | 98.49 %        | 98.60 % (493/500)  | 423,464   | 410.31 ms  | 46725.24 µJ  | 113.88 mW      | 3,381,791 (6763.6/Inf)   | 226,522,674 (453045.3/Inf)
+    ANN_PhysioNet_EEGMI_ | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 50.13 %        | 50.80 % (254/500)  | 546,040   | 1087.41 ms | 123420.26 µJ | 113.50 mW      | -                        | -
+    SNN_PhysioNet_EEGMI_ | SNN   | SpikingJelly SNN-IF [Conv(1->16,3x3,p2 | 50.13 %        | 50.80 % (254/500)  | 544,264   | 754.26 ms  | 84032.95 µJ  | 111.41 mW      | 5,015,454 (10030.9/Inf)  | 607,551,900 (1215103.8/Inf)
+    ANN_FashionMNIST_Con | ANN   | ANN [Conv(1->32,3x3,p2) -> Conv(32->64 | 91.68 %        | 91.60 % (458/500)  | 1,688,348 | 3100.04 ms | 373705.64 µJ | 120.55 mW      | -                        | -
+    SNN_FashionMNIST_LIF | SNN   | SpikingJelly SNN-IF [Conv(1->32,3x3,p2 | 88.62 %        | 90.00 % (450/500)  | 1,686,568 | 779.92 ms  | 88535.50 µJ  | 113.52 mW      | 3,811,745 (7623.5/Inf)   | 477,953,464 (955906.9/Inf)
+    ANN_CIFAR10_Conv32_6 | ANN   | ANN [Conv(1->32,3x3,p2) -> Conv(32->64 | 50.18 %        | 53.20 % (266/500)  | 607,004   | 905.27 ms  | 108806.46 µJ | 120.19 mW      | -                        | -
+    SNN_CIFAR10_LIF_Conv | SNN   | SpikingJelly SNN-IF [Conv(1->32,3x3,p2 | 51.36 %        | 51.00 % (255/500)  | 605,224   | 462.71 ms  | 53192.54 µJ  | 114.96 mW      | 2,065,773 (4131.5/Inf)   | 238,545,484 (477091.0/Inf)
+    ANN_KWS_SpeechComman | ANN   | ANN [Conv(1->16,3x3,p2) -> Conv(16->32 | 71.97 %        | 76.60 % (383/500)  | 161,404   | 268.14 ms  | 30373.29 µJ  | 113.27 mW      | -                        | -
+    SNN_KWS_SpeechComman | SNN   | SpikingJelly SNN-IF [Conv(1->16,3x3,p2 | 67.77 %        | 65.80 % (329/500)  | 159,628   | 202.74 ms  | 23012.79 µJ  | 113.51 mW      | 1,711,027 (3422.1/Inf)   | 151,699,150 (303398.3/Inf)
+    ========================================================================================================================================================================================
+
+
+  dataset:
+  name: mnist
+evaluation:
+  num_test_samples: 500
+joulescope:
+  max_duration: 6000.0
+  timeout: 6000.0
+microcontroller:
+  boards:
+    esp32c6:
+      architecture: RISC-V
+      board: ESP32-C6-DevKitC-1
+      cpu_freq_mhz: 160
+      joulescope_gpi: in1
+      name: ESP32-C6
+      snn_optimization:
+        SNN_PROFILE: 0
+        SNN_SEL_CONV_ACC32: 0
+        SNN_SEL_DENSE_REF: 0
+        SNN_SEL_INT8: 0
+        SNN_SEL_INT8_FC: 0
+        SNN_SEL_LAYOUT_NHWC: 0
+        SNN_SEL_LAZY_DECAY: 0
+      sram_kb: 512
+      trigger_gpio: 4
+    esp32s3:
+      architecture: Xtensa LX7
+      board: ESP32-S3-DevKitC-1 v1.1
+      cpu_freq_mhz: 240
+      joulescope_gpi: in1
+      name: ESP32-S3
+      snn_optimization:
+        SNN_PROFILE: 0
+        SNN_SEL_CONV_ACC32: 0
+        SNN_SEL_DENSE_REF: 0
+        SNN_SEL_INT8: 0
+        SNN_SEL_INT8_FC: 0
+        SNN_SEL_LAYOUT_NHWC: 0
+        SNN_SEL_LAZY_DECAY: 0
+      sram_kb: 512
+      trigger_gpio: 4
+  target: esp32s3
+models:
+- activation: relu
+  batch_size: 64
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 16
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: mnist
+  epochs: 5
+  hidden_layers:
+  - 64
+  learning_rate: 0.001
+  name: ANN_MNIST_Conv16_32_64
+  type: ann
+- batch_size: 64
+  beta: 0.9
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 16
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: mnist
+  encoding_type: ttfs
+  epochs: 5
+  hidden_layers:
+  - 64
+  learning_rate: 0.005
+  name: SNN_MNIST_LIF_Conv16_32_64_TTFS
+  neuron_type: lif
+  num_steps: 10
+  threshold: 1.0
+  type: snn
+- activation: relu
+  batch_size: 64
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 16
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: physionet_eeg_mi
+  epochs: 20
+  hidden_layers:
+  - 64
+  learning_rate: 0.001
+  name: ANN_PhysioNet_EEGMI_Conv16_32_64
+  type: ann
+- batch_size: 64
+  beta: 0.9
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 16
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: physionet_eeg_mi
+  encoding_type: ttfs
+  epochs: 40
+  early_stopping:
+    enabled: true
+    monitor: test_acc
+    patience: 8
+    restore_best_weights: true
+  hidden_layers:
+  - 64
+  learning_rate: 0.001
+  name: SNN_PhysioNet_EEGMI_IF_Conv16_32_64_TTFS
+  neuron_type: if
+  num_steps: 10
+  threshold: 1.0
+  ann_checkpoint: ANN_PhysioNet_EEGMI_Conv16_32_64
+  type: snn
+- activation: relu
+  batch_size: 64
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 64
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: fashion_mnist
+  epochs: 6
+  hidden_layers:
+  - 128
+  learning_rate: 0.005
+  name: ANN_FashionMNIST_Conv32_64_128
+  type: ann
+- batch_size: 64
+  beta: 0.9
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 64
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: fashion_mnist
+  encoding_type: ttfs
+  epochs: 10
+  hidden_layers:
+  - 128
+  learning_rate: 0.005
+  name: SNN_FashionMNIST_LIF_Conv32_64_128_Direct
+  neuron_type: if
+  num_steps: 10
+  threshold: 1.0
+  type: snn
+- activation: relu
+  batch_size: 64
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 64
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: cifar10
+  epochs: 8
+  hidden_layers:
+  - 128
+  learning_rate: 0.005
+  name: ANN_CIFAR10_Conv32_64_128
+  type: ann
+- batch_size: 64
+  beta: 0.9
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 64
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: cifar10
+  dropout: 0.5
+  early_stopping:
+    enabled: true
+    monitor: test_acc
+    patience: 10
+    restore_best_weights: true
+  encoding_type: ttfs
+  epochs: 80
+  hidden_layers:
+  - 128
+  learning_rate: 0.001
+  name: SNN_CIFAR10_LIF_Conv32_64_128_TTFS_Reg
+  neuron_type: if
+  num_steps: 20
+  threshold: 1.0
+  type: snn
+- activation: relu
+  batch_size: 64
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 16
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: speech_commands
+  epochs: 10
+  hidden_layers:
+  - 64
+  learning_rate: 0.001
+  name: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
+  type: ann
+- batch_size: 64
+  beta: 0.9
+  conv_layers:
+  - kernel_size: 3
+    out_channels: 16
+    padding: 1
+    pool_size: 2
+    stride: 1
+  - kernel_size: 3
+    out_channels: 32
+    padding: 1
+    pool_size: 2
+    stride: 1
+  dataset: speech_commands
+  encoding_type: ttfs
+  epochs: 40
+  early_stopping:
+    enabled: true
+    monitor: test_acc
+    patience: 8
+    restore_best_weights: true
+  hidden_layers:
+  - 64
+  learning_rate: 0.001
+  name: SNN_KWS_SpeechCommandsV02_35Words_IF_Conv16_32_64_TTFS
+  neuron_type: if
+  num_steps: 10
+  threshold: 1.0
+  ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
+  type: snn
+optimization:
+  clustering:
+    enabled: false
+    num_clusters: 16
+  pruning:
+    amount: 0.3
+    enabled: true
+    fine_tune_epochs: 2
+    fine_tune_lr: 0.0001
+    layers:
+    - conv
+    - fc
+    method: l1_unstructured
+  quantization:
+    enabled: true
+    layers:
+    - conv
+    - fc
+    mode: symmetric
+    per_channel: true
+    type: int8
+training:
+  auto_save: true
+  batch_size: 64
+  data_dir: ./data
+  dataset: mnist
+  early_stopping: false
+  epochs: 5
+  learning_rate: 0.001
+  min_delta: 0.001
+  monitor: test_acc
+  optimizer: adam
+  patience: 3
+  random_seed: 42
+  restore_best_weights: true
+  save_dir: ./saved_models
