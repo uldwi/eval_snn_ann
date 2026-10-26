@@ -32,6 +32,8 @@ Unterstützte Datensätze und Domänen:
 """
 
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -546,7 +548,85 @@ def _generate_synthetic_ecg(
     return TensorDataset(torch.from_numpy(x_tr), torch.from_numpy(y_tr)), TensorDataset(torch.from_numpy(x_te), torch.from_numpy(y_te))
 
 
-def _load_physionet_eeg_mi(data_dir: str, seed: int) -> Tuple[Dataset, Dataset, Dataset]:
+def _download_eegbci_run(raw_root: str, subject_id: int, run_id: int, allow_download: bool = True) -> str:
+    """Lädt eine EEGBCI-EDF-Datei mit Resume und großzügigem Read-Timeout."""
+    subject_name = f"S{subject_id:03d}"
+    file_name = f"{subject_name}R{run_id:02d}.edf"
+    dataset_dir = os.path.join(raw_root, "MNE-eegbci-data", "files", "eegmmidb", "1.0.0")
+    subject_dir = os.path.join(dataset_dir, subject_name)
+    os.makedirs(subject_dir, exist_ok=True)
+    file_path = os.path.join(subject_dir, file_name)
+    if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
+    if not allow_download:
+        raise FileNotFoundError(
+            f"EEGBCI-Datei fehlt: {file_path}. Aktiviere den Download oder führe dachs_setup.sh aus."
+        )
+
+    try:
+        import requests
+    except ImportError as exc:
+        raise ImportError("Der PhysioNet-Download benötigt requests; installiere requirements.txt.") from exc
+
+    partial_path = file_path + ".part"
+    url = f"https://physionet.org/files/eegmmidb/1.0.0/{subject_name}/{file_name}"
+    session = requests.Session()
+    last_error = None
+    try:
+        for attempt in range(1, 9):
+            offset = os.path.getsize(partial_path) if os.path.isfile(partial_path) else 0
+            headers = {"Range": f"bytes={offset}-"} if offset else {}
+            try:
+                print(
+                    f"[PhysioNet Download] {subject_name}/{file_name}, Versuch {attempt}/8"
+                    + (f", setze bei {offset:,} Bytes fort" if offset else "")
+                )
+                with session.get(url, headers=headers, stream=True, timeout=(30, 600)) as response:
+                    if response.status_code == 416 and offset:
+                        os.remove(partial_path)
+                        continue
+                    response.raise_for_status()
+                    append = offset > 0 and response.status_code == 206
+                    if not append:
+                        offset = 0
+                    content_range = response.headers.get("Content-Range", "")
+                    range_match = re.search(r"/([0-9]+)$", content_range)
+                    if range_match:
+                        expected_size = int(range_match.group(1))
+                    else:
+                        content_length = response.headers.get("Content-Length")
+                        expected_size = offset + int(content_length) if content_length else None
+
+                    mode = "ab" if append else "wb"
+                    with open(partial_path, mode) as output:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                output.write(chunk)
+
+                actual_size = os.path.getsize(partial_path)
+                if expected_size is not None and actual_size != expected_size:
+                    raise IOError(f"Unvollständiger Download ({actual_size}/{expected_size} Bytes)")
+                if actual_size == 0:
+                    raise IOError("Leere EDF-Datei heruntergeladen")
+                os.replace(partial_path, file_path)
+                return file_path
+            except (requests.RequestException, OSError) as exc:
+                last_error = exc
+                if attempt == 8:
+                    break
+                time.sleep(min(2 ** (attempt - 1), 30))
+    finally:
+        session.close()
+
+    raise RuntimeError(
+        f"PhysioNet-Download fehlgeschlagen: {subject_name}/{file_name}. "
+        f"Unvollständige Daten bleiben unter {partial_path} und werden beim nächsten Versuch fortgesetzt."
+    ) from last_error
+
+
+def _load_physionet_eeg_mi(
+    data_dir: str, seed: int, allow_download: bool = True
+) -> Tuple[Dataset, Dataset, Dataset]:
     """Lädt PhysioNet EEGMMIDB mit personengetrenntem Train/Val/Test-Split."""
     try:
         import mne
@@ -585,19 +665,12 @@ def _load_physionet_eeg_mi(data_dir: str, seed: int) -> Tuple[Dataset, Dataset, 
                 features = cache["features"]
                 labels = cache["labels"]
         else:
-            try:
-                raw_paths = eegbci.load_data(
-                    int(subject_id), [4, 8, 12], path=raw_root, update_path=False, verbose="ERROR"
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"PhysioNet EEGMMIDB konnte für Person {subject_id} nicht geladen werden. "
-                    "Prüfe die Internetverbindung und den freien Speicherplatz."
-                ) from exc
-
             subject_features = []
             subject_labels = []
-            for raw_path in raw_paths:
+            for run_id in (4, 8, 12):
+                raw_path = _download_eegbci_run(
+                    raw_root, int(subject_id), run_id, allow_download=allow_download
+                )
                 raw = mne.io.read_raw_edf(raw_path, preload=True, verbose="ERROR")
                 eegbci.standardize(raw)
                 raw.filter(8.0, 30.0, picks="eeg", method="iir", verbose="ERROR")
@@ -745,7 +818,9 @@ def get_dataset(
     os.makedirs(data_dir, exist_ok=True)
 
     if key in ("physionet_eeg_mi", "eeg_mi"):
-        train_ds, validation_ds, test_ds = _load_physionet_eeg_mi(data_dir=data_dir, seed=seed)
+        train_ds, validation_ds, test_ds = _load_physionet_eeg_mi(
+            data_dir=data_dir, seed=seed, allow_download=download
+        )
         info.validation_dataset = validation_ds
         return train_ds, test_ds, info
 
