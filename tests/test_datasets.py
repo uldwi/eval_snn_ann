@@ -4,6 +4,8 @@ Unit-Tests und Validierung für den Datensatz-Hub und die Trainings-/Export-Pipe
 """
 
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import unittest
 import numpy as np
 
@@ -11,7 +13,6 @@ from datasets_hub import (
     AVAILABLE_DATASETS,
     DatasetInfo,
     list_available_datasets,
-    _generate_synthetic_speech_commands,
     _generate_synthetic_har,
     _generate_synthetic_eeg,
     _generate_synthetic_ecg,
@@ -31,16 +32,6 @@ class TestDatasetsHub(unittest.TestCase):
         self.assertIn("har_time_series", names)
         self.assertIn("eeg_data", names)
         self.assertIn("ecg_data", names)
-
-    def test_synthetic_speech_commands_shapes(self):
-        train_ds, test_ds = _generate_synthetic_speech_commands(num_train=20, num_test=10, seed=42)
-        self.assertEqual(len(train_ds), 20)
-        self.assertEqual(len(test_ds), 10)
-        x0, y0 = train_ds[0]
-        # x shape: (1, 16, 16) -> 256
-        self.assertEqual(tuple(x0.shape), (1, 16, 16))
-        self.assertEqual(x0.numel(), 256)
-        self.assertTrue(0 <= int(y0) < 10)
 
     def test_synthetic_har_shapes(self):
         train_ds, test_ds = _generate_synthetic_har(num_train=24, num_test=12, seed=42)

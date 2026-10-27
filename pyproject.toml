@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eval-snn-ann"
+version = "0.1.0"
+description = "Train and evaluate ANN/SNN models with ESP32 deployment support"
+requires-python = ">=3.9"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["eval_snn_ann*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
