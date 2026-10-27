@@ -8,7 +8,18 @@ set -e
 echo "=== DACHS setup: downloading datasets (login node) ==="
 
 # Change to the project directory
-cd $HOME/code/eval_snn_ann
+PROJECT_DIR="$HOME/code/eval_snn_ann"
+cd "$PROJECT_DIR"
+
+# Fail before creating environments or downloading data if the checkout is
+# missing files introduced by the package-layout refactor.
+if [ ! -f "eval_snn_ann/__init__.py" ] || [ ! -f "eval_snn_ann/data/__init__.py" ] || [ ! -f "eval_snn_ann/data/hub.py" ]; then
+    echo "ERROR: The project checkout at '$PROJECT_DIR' is incomplete or outdated."
+    echo "The current code requires eval_snn_ann/data/{__init__.py,hub.py}."
+    echo "Update the entire checkout (for example, run 'git pull' from the repository)"
+    echo "or copy the complete project tree from your updated working copy, then rerun this script."
+    exit 1
+fi
 
 # Create a Python virtual environment on the login node (recommended for consistency)
 if [ ! -d "dachs_env" ]; then
