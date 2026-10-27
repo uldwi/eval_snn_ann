@@ -19,5 +19,10 @@ Thumbs.db
 __pycache__/
 *.pyc
 data/
+# Keep the Python dataset package tracked; only downloaded dataset contents are ignored.
+!eval_snn_ann/data/
+!eval_snn_ann/data/**
+eval_snn_ann/data/**/__pycache__/
+eval_snn_ann/data/**/*.pyc
 saved_models/
 .output.txt
