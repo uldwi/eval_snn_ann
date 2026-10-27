@@ -111,7 +111,7 @@ models:
         pool_size: 2
         stride: 1
     dataset: mnist
-    epochs: 0
+    epochs: 20
     hidden_layers:
       - 64
     learning_rate: 0.001
@@ -132,7 +132,7 @@ models:
         stride: 1
     dataset: mnist
     encoding_type: ttfs
-    epochs: 0
+    epochs: 20
     hidden_layers:
       - 64
     learning_rate: 0.005
