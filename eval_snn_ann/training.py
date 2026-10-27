@@ -177,6 +177,24 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
     sig_hash = hashlib.sha256(sig_json.encode("utf-8")).hexdigest()
     return signature, sig_hash
 
+
+def _signature_differences(previous: Any, current: Any, prefix: str = "") -> List[str]:
+    """Return readable paths and values for fields that differ between signatures."""
+    if isinstance(previous, dict) and isinstance(current, dict):
+        differences = []
+        for key in sorted(set(previous) | set(current)):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in previous:
+                differences.append(f"{path}: <missing> -> {current[key]!r}")
+            elif key not in current:
+                differences.append(f"{path}: {previous[key]!r} -> <missing>")
+            else:
+                differences.extend(_signature_differences(previous[key], current[key], path))
+        return differences
+    if previous != current:
+        return [f"{prefix}: {previous!r} -> {current!r}"]
+    return []
+
 def train_model(
     config: Dict[str, Any],
     device: str = "cpu",
@@ -337,15 +355,33 @@ def train_model(
     checkpoint_path = os.path.join(resolved_save_dir, f"{safe_name}.pt")
     meta_path = os.path.join(resolved_save_dir, f"{safe_name}.json")
 
+    # During the package-layout migration, existing checkpoints may still live
+    # beside this module in eval_snn_ann/saved_models while the configured
+    # default points to the repository-level saved_models directory.
+    cache_checkpoint_path = checkpoint_path
+    project_saved_dir = Path(__file__).resolve().parents[1] / "saved_models"
+    package_saved_dir = Path(__file__).resolve().parent / "saved_models"
+    if (
+        not os.path.isfile(cache_checkpoint_path)
+        and Path(resolved_save_dir).resolve() == project_saved_dir.resolve()
+    ):
+        legacy_checkpoint_path = package_saved_dir / f"{safe_name}.pt"
+        if legacy_checkpoint_path.is_file():
+            cache_checkpoint_path = str(legacy_checkpoint_path)
+            print(
+                f"[Cache] Found legacy checkpoint for '{model_name}' at "
+                f"'{cache_checkpoint_path}'. Checking its configuration hash."
+            )
+
     # ---------------------------------------------------------
     # Check whether a trained model can be loaded from cache.
     # ---------------------------------------------------------
-    if not should_force and auto_save and os.path.isfile(checkpoint_path):
+    if not should_force and auto_save and os.path.isfile(cache_checkpoint_path):
         try:
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                checkpoint = torch.load(cache_checkpoint_path, map_location=device, weights_only=False)
             except TypeError:
-                checkpoint = torch.load(checkpoint_path, map_location=device)
+                checkpoint = torch.load(cache_checkpoint_path, map_location=device)
 
             cached_hash = checkpoint.get("config_hash")
             if cached_hash == sig_hash and "state_dict" in checkpoint:
@@ -356,7 +392,7 @@ def train_model(
 
                 print("\n" + "=" * 65)
                 print(f">>> [Cache] Using saved model: '{model_name}' ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
-                print(f"  - Checkpoint:           {checkpoint_path}")
+                print(f"  - Checkpoint:           {cache_checkpoint_path}")
                 print(f"  - Dataset:              {dataset_info.name} ({dataset_info.domain})")
                 print(f"  - Architecture:         {model.get_structure_summary()}")
                 print(f"  - Configuration hash:   {sig_hash[:12]} (unchanged)")
@@ -368,9 +404,16 @@ def train_model(
                 old_h = str(cached_hash)[:12] if cached_hash else "None"
                 print(f"\n[Cache] Found saved model '{model_name}', but configuration/hyperparameters changed:")
                 print(f"        Previous hash: {old_h} -> New hash: {sig_hash[:12]}")
+                cached_signature = checkpoint.get("config_signature")
+                if cached_signature:
+                    differences = _signature_differences(cached_signature, signature)
+                    for difference in differences[:8]:
+                        print(f"        Changed setting: {difference}")
+                    if len(differences) > 8:
+                        print(f"        ... and {len(differences) - 8} more changed setting(s)")
                 print(f"        -> Retraining model.")
         except Exception as e:
-            print(f"\n[Cache] Could not load saved model '{checkpoint_path}' ({e}).")
+            print(f"\n[Cache] Could not load saved model '{cache_checkpoint_path}' ({e}).")
             print(f"        -> Retraining model.")
 
     teacher_model = None
