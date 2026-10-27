@@ -552,7 +552,8 @@ class CompactSpikingTransformer(nn.Module):
                  in_height: int, in_width: int, embed_dim: int = 32,
                  num_heads: int = 4, num_layers: int = 2,
                  feedforward_dim: int = 64, num_steps: int = 8,
-                 beta: float = 0.5, threshold: float = 1.0):
+                 beta: float = 0.5, threshold: float = 1.0,
+                 input_scale: float = 1.0):
         super().__init__()
         if not HAS_SPIKINGJELLY:
             raise ImportError("SpikingTransformer benötigt spikingjelly")
@@ -573,6 +574,7 @@ class CompactSpikingTransformer(nn.Module):
         self.num_steps = int(num_steps)
         self.beta = float(beta)
         self.threshold = float(threshold)
+        self.input_scale = float(input_scale)
         self.input_projection = nn.Linear(self.in_height, embed_dim)
         self.position_embedding = nn.Parameter(torch.zeros(1, self.in_width, embed_dim))
         layer = nn.TransformerEncoderLayer(
@@ -607,7 +609,7 @@ class CompactSpikingTransformer(nn.Module):
             raise ValueError(f"SpikingTransformer erwartet (Batch, {self.in_height}, {self.in_width})")
 
         functional.reset_net(self)
-        tokens = self.input_projection(x.transpose(1, 2)) + self.position_embedding
+        tokens = (self.input_projection(x.transpose(1, 2)) + self.position_embedding) * self.input_scale
         spike_sum = torch.zeros_like(tokens)
         try:
             for _ in range(self.num_steps):
@@ -640,7 +642,150 @@ class CompactSpikingTransformer(nn.Module):
         return (f"SNN-SpikingTransformer [{self.in_width} Zeit-Tokens -> "
                 f"{self.input_projection.out_features} LIF-Embedding -> "
                 f"{len(self.encoder.layers)} spikende Attention/MLP-Blöcke] "
-                f"(T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.1f})")
+                f"(T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.2f}, "
+                f"Input×{self.input_scale:g})")
+
+
+class SpikCommander(nn.Module):
+    """SpikCommander-inspired temporal SNN for Mel sequences.
+
+    This follows the paper's main recipe: temporal sequence input, spiking
+    depthwise/pointwise embedding, local and global temporal paths, and a
+    spike-aware contextual MLP. The compact defaults are sized for this repo.
+    """
+    def __init__(self, input_size: int, output_size: int, in_channels: int,
+                 in_height: int, in_width: int, embed_dim: int = 64,
+                 num_heads: int = 4, beta: float = 0.9,
+                 threshold: float = 1.0, dropout_rate: float = 0.1):
+        super().__init__()
+        if not HAS_SPIKINGJELLY:
+            raise ImportError("SpikCommander benötigt spikingjelly für Surrogate Gradients")
+        if embed_dim % num_heads:
+            raise ValueError("transformer.embed_dim muss durch num_heads teilbar sein")
+        self.input_size = int(input_size)
+        self.in_channels = int(in_channels)
+        self.in_height = int(in_height)
+        self.in_width = int(in_width)
+        self.output_size = int(output_size)
+        self.hidden_layers = [int(embed_dim)]
+        self.has_conv = False
+        self.is_spiking_transformer = True
+        self.is_spikcommander = True
+        self.is_compact_transformer = True
+        self.deployable = False  # Firmware needs the dedicated temporal architecture.
+        self.neuron_type = "lif"
+        self.encoding_type = "temporal"
+        self.beta = float(beta)
+        self.threshold = float(threshold)
+        self.num_steps = int(in_width)
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.input_projection = nn.Linear(in_height, embed_dim)
+        self.embed_pw = nn.Conv1d(embed_dim, embed_dim, 1, bias=False)
+        self.embed_dw = nn.Conv1d(embed_dim, embed_dim, 7, padding=3, groups=embed_dim, bias=False)
+        self.embed_bn1 = nn.BatchNorm1d(embed_dim)
+        self.embed_bn2 = nn.BatchNorm1d(embed_dim)
+        self.embed_res = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.layers = nn.ModuleList([_SpikCommanderBlock(embed_dim, num_heads, beta, threshold) for _ in range(1)])
+        self.dropout = nn.Dropout(float(dropout_rate))
+        self.classifier = nn.Linear(embed_dim, output_size)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.fc_layers = nn.ModuleList([self.classifier])
+        self._spike = surrogate.ATan()
+
+    def _lif_sequence(self, current: torch.Tensor) -> torch.Tensor:
+        # current is [time, batch, channels]; reset membrane for every sample.
+        v = torch.zeros_like(current[0])
+        spikes = []
+        for x_t in current.unbind(0):
+            v = self.beta * v + x_t
+            s = self._spike(v - self.threshold)
+            v = v - s.detach() * self.threshold
+            spikes.append(s)
+        return torch.stack(spikes, dim=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.view(x.size(0), self.in_channels, self.in_height, self.in_width)
+        if x.dim() == 4:
+            x = x.mean(dim=1)
+        if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
+            raise ValueError(f"SpikCommander erwartet (Batch, {self.in_height}, {self.in_width}), erhalten: {tuple(x.shape)}")
+        seq = self.input_projection(x.transpose(1, 2))  # B,T,D
+        z = seq.transpose(1, 2)
+        z = self._lif_sequence(self.embed_bn1(self.embed_pw(z)).permute(2, 0, 1)).permute(1, 2, 0)
+        local = self._lif_sequence(self.embed_bn2(self.embed_dw(z)).permute(2, 0, 1)).permute(1, 2, 0)
+        z = self._lif_sequence((local.permute(0, 2, 1) + self.embed_res(seq)).permute(1, 0, 2))
+        for block in self.layers:
+            z = block(z, self._spike)
+        # Temporal class evidence is accumulated across the full Mel sequence.
+        return self.classifier(self.norm(self.dropout(z).mean(dim=0)))
+
+    def get_structure_summary(self) -> str:
+        return (f"SNN-SpikCommander [Mel-Sequenz {self.in_width}×{self.in_height} -> "
+                f"spikendes Embedding {self.embed_dim} -> 1 Multi-view-Block -> {self.output_size}] "
+                f"(β={self.beta:.2f}, θ={self.threshold:.2f})")
+
+
+class _SpikCommanderBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, beta: float, threshold: float):
+        super().__init__()
+        self.dim, self.heads = dim, heads
+        self.norm1 = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.global_proj = nn.Linear(dim, dim)
+        self.local_proj = nn.Linear(dim, dim)
+        self.value_conv = nn.Conv1d(dim, dim, 9, padding=4, groups=dim, bias=False)
+        self.attn_proj = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff_in = nn.Linear(dim, 4 * dim)
+        self.ff_context = nn.Conv1d(4 * dim, 4 * dim, 31, padding=15, groups=4 * dim, bias=False)
+        self.ff_out = nn.Linear(4 * dim, dim)
+        self.beta, self.threshold = float(beta), float(threshold)
+
+    def _lif(self, x: torch.Tensor, spike_fn) -> torch.Tensor:
+        v = torch.zeros_like(x[0])
+        out = []
+        for x_t in x.unbind(0):
+            v = self.beta * v + x_t
+            s = spike_fn(v - self.threshold)
+            v = v - s.detach() * self.threshold
+            out.append(s)
+        return torch.stack(out, 0)
+
+    def forward(self, x: torch.Tensor, spike_fn) -> torch.Tensor:
+        # x: T,B,D. Global STASA gate + local convolutional/value view.
+        t, b, d = x.shape
+        q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
+        q, k, v = self._lif(q, spike_fn), self._lif(k, spike_fn), self._lif(v, spike_fn)
+        global_gate = self._lif(self.global_proj((q + k).sum(dim=0, keepdim=True) / max(1, t)), spike_fn)
+        global_path = v * global_gate.expand_as(v)
+        value_conv = self.value_conv(v.permute(1, 2, 0)).permute(2, 0, 1)
+        local_gate = self._lif(self.local_proj(value_conv + q), spike_fn)
+        # Per-head local correlation is restricted to a 41-frame neighborhood.
+        h, hd = self.heads, d // self.heads
+        qh = q.view(t, b, h, hd)
+        kh = k.view(t, b, h, hd)
+        vh = v.view(t, b, h, hd)
+        positions = torch.arange(t, device=x.device)
+        local_scores, local_values = [], []
+        for offset in range(-20, 21):
+            source = positions + offset
+            valid = (source >= 0) & (source < t)
+            source = source.clamp(0, t - 1)
+            key_at_offset = kh.index_select(0, source)
+            value_at_offset = vh.index_select(0, source)
+            score = (qh * key_at_offset).sum(dim=-1) / (hd ** 0.5)
+            local_scores.append(score.masked_fill(~valid[:, None, None], -1e4))
+            local_values.append(value_at_offset)
+        local_weights = torch.softmax(torch.stack(local_scores, dim=-1), dim=-1)
+        local_attn = (torch.stack(local_values, dim=-2) * local_weights[..., None]).sum(dim=-2).reshape(t, b, d)
+        attended = self._lif(self.attn_proj(global_path + local_gate * local_attn), spike_fn)
+        x = self._lif(x + attended, spike_fn)
+        expanded = self._lif(self.ff_in(self.norm2(x)), spike_fn)
+        context = self.ff_context(expanded.permute(1, 2, 0)).permute(2, 0, 1)
+        refined = self._lif(self.ff_out(self._lif(expanded + context, spike_fn)), spike_fn)
+        return self._lif(x + refined, spike_fn)
 
 
 def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.Tensor:
@@ -1111,7 +1256,8 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
         # public dataset name or tensor dimensions.
         "dataset_pipeline_version": (
             1 if str(dataset_name).lower() == "physionet_eeg_mi_csp_temporal"
-            else (4 if str(dataset_name).lower() == "physionet_eeg_mi_temporal" else 1)
+            else (4 if str(dataset_name).lower() == "physionet_eeg_mi_temporal"
+                  else (2 if str(dataset_name).lower() == "speech_commands_spikcommander" else 1))
         ),
         "conv_layers": canonical_conv,
         "hidden_layers": hidden_layers,
@@ -1138,12 +1284,21 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
         }
 
     architecture = str(model_cfg.get("architecture", "standard")).lower()
-    if architecture in ("spiking_transformer", "spikingtransformer"):
+    if architecture in ("spikcommander", "spik_commander"):
+        signature["spikcommander"] = {
+            "transformer": copy.deepcopy(model_cfg.get("transformer", {})),
+            "beta": float(model_cfg.get("beta", 0.9)),
+            "threshold": float(model_cfg.get("threshold", 1.0)),
+            "dropout_rate": float(model_cfg.get("dropout_rate", 0.1)),
+        }
+    elif architecture in ("spiking_transformer", "spikingtransformer"):
         signature["spiking_transformer"] = {
             "transformer": copy.deepcopy(model_cfg.get("transformer", {})),
             "num_steps": int(model_cfg.get("num_steps", 8)),
             "beta": float(model_cfg.get("beta", 0.5)),
             "threshold": float(model_cfg.get("threshold", 1.0)),
+            "input_scale": float(model_cfg.get("input_scale", 1.0)),
+            "distillation": copy.deepcopy(model_cfg.get("distillation", {})),
             "ann_checkpoint": model_cfg.get("ann_checkpoint"),
         }
     elif model_type == "snn":
@@ -1239,7 +1394,18 @@ def build_model_from_config(
     hidden_layers = model_cfg.get("hidden_layers", [64])
 
     architecture = str(model_cfg.get("architecture", "standard")).lower()
-    if architecture in ("spiking_transformer", "spikingtransformer"):
+    if architecture in ("spikcommander", "spik_commander"):
+        transformer_cfg = model_cfg.get("transformer", {})
+        model = SpikCommander(
+            input_size=input_size, output_size=output_size,
+            in_channels=in_channels, in_height=in_height, in_width=in_width,
+            embed_dim=int(transformer_cfg.get("embed_dim", 64)),
+            num_heads=int(transformer_cfg.get("num_heads", 4)),
+            beta=float(model_cfg.get("beta", 0.9)),
+            threshold=float(model_cfg.get("threshold", 1.0)),
+            dropout_rate=float(model_cfg.get("dropout_rate", 0.1)),
+        ).to(device)
+    elif architecture in ("spiking_transformer", "spikingtransformer"):
         transformer_cfg = model_cfg.get("transformer", {})
         model = CompactSpikingTransformer(
             input_size=input_size, output_size=output_size,
@@ -1251,6 +1417,7 @@ def build_model_from_config(
             num_steps=int(model_cfg.get("num_steps", 8)),
             beta=float(model_cfg.get("beta", 0.5)),
             threshold=float(model_cfg.get("threshold", 1.0)),
+            input_scale=float(model_cfg.get("input_scale", 1.0)),
         ).to(device)
     elif model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
@@ -1762,45 +1929,79 @@ def train_model(
     output_size = int(dataset_info.num_classes)
 
     signature, sig_hash = compute_model_signature(config, dataset_info)
-    model = build_model_from_config(config, dataset_info, device=device)
-
-    # Transfer Learning: denselben ANN-Transformer als Initialisierung für den
-    # Spiking-Transformer verwenden; LIF-Zustände selbst haben keine Gewichte.
-    if model_type == "snn" and getattr(model, "is_spiking_transformer", False):
+    # Ein SNN-Transformer hängt von den ANN-Startgewichten ab. Der Name des
+    # Checkpoints allein reicht für den Cache nicht: derselbe ANN-Checkpoint
+    # kann mit neuen Gewichten überschrieben worden sein.
+    if model_type == "snn" and str(model_cfg.get("architecture", "")).lower() in (
+        "spiking_transformer", "spikingtransformer"
+    ):
         ann_model_name = model_cfg.get(
             "ann_checkpoint", "ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer"
         )
         ann_checkpoint_path = os.path.join(resolved_save_dir, f"{ann_model_name}.pt")
         if os.path.isfile(ann_checkpoint_path):
-            try:
-                ann_checkpoint = torch.load(ann_checkpoint_path, map_location=device, weights_only=False)
-                ann_state = ann_checkpoint.get("state_dict", {})
-                target_state = model.state_dict()
-                compatible = {
-                    key: value for key, value in ann_state.items()
-                    if key in target_state and target_state[key].shape == value.shape
-                }
-                parameter_keys = dict(model.named_parameters())
-                copied_parameters = sum(
-                    parameter_keys[key].numel() for key in compatible if key in parameter_keys
-                )
-                total_parameters = sum(parameter.numel() for parameter in parameter_keys.values())
-                if copied_parameters < total_parameters * 0.9:
-                    raise ValueError(
-                        f"ANN-Checkpoint passt nur zu {copied_parameters}/{total_parameters} SNN-Parametern"
-                    )
-                model.load_state_dict(compatible, strict=False)
-                print(
-                    f"[Transfer] {copied_parameters:,}/{total_parameters:,} Parameter "
-                    f"vom ANN-Transformer '{ann_model_name}' auf den Spiking-Transformer übertragen.\n"
-                )
-            except Exception as exc:
-                print(f"[Transfer] Transformer-Gewichtstransfer fehlgeschlagen: {exc}\n")
+            digest = hashlib.sha256()
+            with open(ann_checkpoint_path, "rb") as checkpoint_file:
+                for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            signature["ann_checkpoint_sha256"] = digest.hexdigest()
         else:
-            print(
-                f"[Transfer] Kein ANN-Transformer-Checkpoint '{ann_checkpoint_path}' gefunden - "
-                "SNN startet mit zufälligen Gewichten.\n"
+            signature["ann_checkpoint_sha256"] = "missing"
+        sig_hash = hashlib.sha256(
+            json.dumps(signature, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    model = build_model_from_config(config, dataset_info, device=device)
+
+    # Transfer Learning: denselben ANN-Transformer als Initialisierung für den
+    # Spiking-Transformer verwenden; LIF-Zustände selbst haben keine Gewichte.
+    if model_type == "snn" and getattr(model, "is_spiking_transformer", False) and not getattr(model, "is_spikcommander", False):
+        ann_model_name = model_cfg.get(
+            "ann_checkpoint", "ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer"
+        )
+        ann_checkpoint_path = os.path.join(resolved_save_dir, f"{ann_model_name}.pt")
+        if not os.path.isfile(ann_checkpoint_path):
+            raise FileNotFoundError(
+                f"ANN-Transformer-Checkpoint '{ann_checkpoint_path}' fehlt; "
+                "der Spiking Transformer wird nicht zufällig initialisiert."
             )
+        ann_checkpoint = torch.load(ann_checkpoint_path, map_location=device, weights_only=False)
+        checkpoint_dataset = normalize_dataset_name(ann_checkpoint.get("dataset", ""))
+        if checkpoint_dataset != dataset_name:
+            raise ValueError(
+                f"ANN-Checkpoint-Datensatz '{checkpoint_dataset}' passt nicht zum SNN-Datensatz "
+                f"'{dataset_name}'."
+            )
+        checkpoint_model_type = str(ann_checkpoint.get("model_type", "ann")).lower()
+        if checkpoint_model_type != "ann":
+            raise ValueError(
+                f"Erwartet wird ein ANN-Checkpoint, gefunden wurde model_type='{checkpoint_model_type}'."
+            )
+        ann_state = ann_checkpoint.get("state_dict", {})
+        target_state = model.state_dict()
+        compatible = {
+            key: value for key, value in ann_state.items()
+            if key in target_state and target_state[key].shape == value.shape
+        }
+        parameter_keys = dict(model.named_parameters())
+        copied_parameters = sum(
+            parameter_keys[key].numel() for key in compatible if key in parameter_keys
+        )
+        total_parameters = sum(parameter.numel() for parameter in parameter_keys.values())
+        if copied_parameters != total_parameters:
+            missing_parameters = sorted(set(parameter_keys) - set(compatible))
+            raise ValueError(
+                "ANN-Transformer-Gewichtstransfer unvollständig: "
+                f"{copied_parameters:,}/{total_parameters:,} Parameter; "
+                f"fehlend oder inkompatibel: {missing_parameters}"
+            )
+        incompatible = model.load_state_dict(compatible, strict=False)
+        if incompatible.unexpected_keys:
+            raise ValueError(f"Unerwartete ANN-Checkpoint-Gewichte: {incompatible.unexpected_keys}")
+        print(
+            f"[Transfer] Vollständig: {copied_parameters:,}/{total_parameters:,} Parameter "
+            f"({len(compatible)} Tensoren) vom ANN-Transformer '{ann_model_name}' übertragen.\n"
+        )
 
     # Transfer Learning: ANN -> konventionelles SNN.
     elif model_type == "snn":
@@ -1873,6 +2074,40 @@ def train_model(
             print(f"\n[Cache] Hinweis: Gespeichertes Modell '{checkpoint_path}' konnte nicht geladen werden ({e}).")
             print(f"        -> Modell wird neu trainiert.")
 
+    teacher_model = None
+    distill_cfg = model_cfg.get("distillation", {})
+    distill_enabled = (
+        model_type == "snn"
+        and getattr(model, "is_spiking_transformer", False)
+        and not getattr(model, "is_spikcommander", False)
+        and bool(distill_cfg.get("enabled", False))
+    )
+    distill_alpha = float(distill_cfg.get("alpha", 0.5)) if distill_enabled else 0.0
+    distill_temperature = float(distill_cfg.get("temperature", 2.0)) if distill_enabled else 1.0
+    if distill_enabled:
+        if not 0.0 <= distill_alpha <= 1.0:
+            raise ValueError("model.distillation.alpha muss zwischen 0 und 1 liegen.")
+        if distill_temperature <= 0.0:
+            raise ValueError("model.distillation.temperature muss größer als 0 sein.")
+        transformer_cfg = model_cfg.get("transformer", {})
+        teacher_model = CompactTransformerANN(
+            input_size=input_size,
+            output_size=output_size,
+            in_channels=in_channels,
+            in_height=in_height,
+            in_width=in_width,
+            embed_dim=int(transformer_cfg.get("embed_dim", 32)),
+            num_heads=int(transformer_cfg.get("num_heads", 4)),
+            num_layers=int(transformer_cfg.get("num_layers", 2)),
+            feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
+            dropout_rate=float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.1))),
+        ).to(device)
+        teacher_checkpoint = torch.load(ann_checkpoint_path, map_location=device, weights_only=False)
+        teacher_model.load_state_dict(teacher_checkpoint["state_dict"], strict=True)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+
     # Early Stopping Konfiguration
     es_cfg = train_cfg.get("early_stopping", False)
     if isinstance(es_cfg, dict):
@@ -1912,6 +2147,11 @@ def train_model(
     print(f"  - Batch-Größe:         {batch_size}")
     print(f"  - Lernrate (LR):       {lr}")
     print(f"  - Optimierer:          {optimizer_name.upper()}")
+    if distill_enabled:
+        print(
+            f"  - ANN-Lehrermodell:    aktiv (α={distill_alpha:.2f}, "
+            f"Temperatur={distill_temperature:g})"
+        )
     if early_stopping_enabled:
         print(f"  - Early Stopping:      Aktiviert (Patience: {patience}, Min-Delta: {min_delta}, Metrik: {monitor}, Best-Weights: {restore_best_weights})")
     else:
@@ -1961,11 +2201,24 @@ def train_model(
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
             output = model(data)
-            loss = criterion(output, target)
+            hard_loss = criterion(output, target)
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_output = teacher_model(data)
+                soft_loss = F.kl_div(
+                    F.log_softmax(output / distill_temperature, dim=1),
+                    F.softmax(teacher_output / distill_temperature, dim=1),
+                    reduction="batchmean",
+                ) * (distill_temperature ** 2)
+                loss = (1.0 - distill_alpha) * hard_loss + distill_alpha * soft_loss
+            else:
+                loss = hard_loss
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+            # Train-Verlust als überwachten Cross-Entropy-Wert ausgeben; die
+            # optionale KD-Komponente wird separat zum Optimieren addiert.
+            running_loss += hard_loss.item()
             total_batches += 1
 
         # Validierung nach jeder Epoche
@@ -2560,7 +2813,7 @@ def export_c_files(
         f.write("    const float *norm1_w, *norm1_b, *ff1_w, *ff1_b;\n")
         f.write("    const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;\n")
         f.write("} transformer_layer_weights_t;\n\n")
-        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold; } transformer_config_t;\n\n")
+        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; } transformer_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
         f.write("// ANN-Spezifisch (TensorFlow Lite Micro FlatBuffer)\n")
@@ -2679,8 +2932,10 @@ def export_c_files(
             transformer_steps = int(getattr(model, "num_steps", 1)) if is_spiking_transformer else 1
             transformer_beta = float(getattr(model, "beta", 0.0)) if is_spiking_transformer else 0.0
             transformer_threshold = float(getattr(model, "threshold", 1.0)) if is_spiking_transformer else 1.0
+            transformer_input_scale = float(getattr(model, "input_scale", 1.0)) if is_spiking_transformer else 1.0
             f.write(f"{tokens}, {features}, {embed_dim}, {heads}, {layer_count}, {ffn_dim}, {output_size}, "
-                    f"{1 if is_spiking_transformer else 0}, {transformer_steps}, {transformer_beta:.6f}f, {transformer_threshold:.6f}f" + "};\n")
+                    f"{1 if is_spiking_transformer else 0}, {transformer_steps}, {transformer_beta:.6f}f, "
+                    f"{transformer_threshold:.6f}f, {transformer_input_scale:.6f}f" + "};\n")
             f.write("const float* const g_transformer_input_w = s_transformer_input_w;\n")
             f.write("const float* const g_transformer_input_b = s_transformer_input_b;\n")
             f.write("const float* const g_transformer_position = s_transformer_position;\n")
@@ -2979,11 +3234,13 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "output_size": output_size,
             }
             architecture = str(m.get("architecture", "standard"))
-            if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer"):
+            if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer", "spikcommander", "spik_commander"):
                 model_dict["architecture"] = architecture
                 model_dict["dropout_rate"] = float(m.get("dropout_rate", m.get("dropout", 0.0)))
                 if isinstance(m.get("transformer"), dict):
                     model_dict["transformer"] = copy.deepcopy(m["transformer"])
+                if isinstance(m.get("distillation"), dict):
+                    model_dict["distillation"] = copy.deepcopy(m["distillation"])
             if m_type == "snn":
                 model_dict["neuron_type"] = str(m.get("neuron_type", m.get("neuron", "lif"))).lower()
                 model_dict["encoding_type"] = str(m.get("encoding_type", m.get("encoding", "direct"))).lower()
@@ -3036,7 +3293,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                         model_evaluation[k] = m[k]
             if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
                 model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
-            if m_ds == "speech_commands":
+            if m_ds in ("speech_commands", "speech_commands_spikcommander"):
                 model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 100)
 
             model_optimization = copy.deepcopy(global_optimization)
@@ -3094,11 +3351,13 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         "output_size": output_size,
     }
     architecture = str(single_m.get("architecture", "standard"))
-    if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer"):
+    if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer", "spikcommander", "spik_commander"):
         model_dict["architecture"] = architecture
         model_dict["dropout_rate"] = float(single_m.get("dropout_rate", single_m.get("dropout", 0.0)))
         if isinstance(single_m.get("transformer"), dict):
             model_dict["transformer"] = copy.deepcopy(single_m["transformer"])
+        if isinstance(single_m.get("distillation"), dict):
+            model_dict["distillation"] = copy.deepcopy(single_m["distillation"])
     if m_type == "snn":
         model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
         model_dict["encoding_type"] = str(single_m.get("encoding_type", single_m.get("encoding", "direct"))).lower()
@@ -3148,7 +3407,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 model_evaluation[k] = single_m[k]
     if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
         model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
-    if single_ds == "speech_commands":
+    if single_ds in ("speech_commands", "speech_commands_spikcommander"):
         model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 100)
 
     model_optimization = copy.deepcopy(global_optimization)

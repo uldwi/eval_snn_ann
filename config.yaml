@@ -68,27 +68,26 @@ models:
       clustering:
         enabled: false
 
-  - name: SNN_KWS_SpeechCommandsV02_35Words_SpikingTransformer
-    architecture: spiking_transformer
-    ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
+  - name: SNN_KWS_SpeechCommandsV02_35Words_SpikCommander
+    architecture: spikcommander
     batch_size: 64
-    beta: 0.5
-    dataset: speech_commands
+    beta: 0.9
+    num_steps: 100
+    dataset: speech_commands_spikcommander
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 12
+      patience: 15
       min_delta: 0.001
       restore_best_weights: true
-    epochs: 80
+    epochs: 100
     learning_rate: 0.0005
-    num_steps: 8
     threshold: 1.0
+    dropout_rate: 0.1
     transformer:
-      embed_dim: 32
+      embed_dim: 64
       num_heads: 4
-      num_layers: 2
-      feedforward_dim: 64
+      num_layers: 1
     type: snn
     optimization:
       pruning:

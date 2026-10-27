@@ -234,7 +234,10 @@ static void transformer_layer_norm(const float *input, int rows,
 
 static inline float transformer_lif(float current, float &membrane,
                                     float beta, float threshold) {
-    membrane = beta * membrane + (1.0f - beta) * current;
+    // Match SpikingJelly LIFNode(decay_input=False):
+    // v[t] = beta * v[t-1] + current.  Scaling the input by (1-beta)
+    // changes the learned network's firing rates and breaks host parity.
+    membrane = beta * membrane + current;
     if (membrane >= threshold) {
         membrane = 0.0f;
         return 1.0f;
@@ -245,6 +248,8 @@ static inline float transformer_lif(float current, float &membrane,
 static int run_spiking_transformer(const float *mel) {
     const float beta = g_transformer_config.beta;
     const float threshold = g_transformer_config.threshold;
+    const float input_scale = g_transformer_config.input_scale > 0.0f
+                                  ? g_transformer_config.input_scale : 1.0f;
     const int steps = g_transformer_config.num_steps;
     memset(s_st_mem_input, 0, sizeof(s_st_mem_input));
     memset(s_st_mem_qkv, 0, sizeof(s_st_mem_qkv));
@@ -261,6 +266,7 @@ static int run_spiking_transformer(const float *mel) {
                 const float *w = g_transformer_input_w + d * KWS_FEATURES;
                 for (int f = 0; f < KWS_FEATURES; ++f) current += w[f] * mel[f * KWS_TOKENS + t];
                 current += g_transformer_position[t * KWS_EMBED + d];
+                current *= input_scale;
                 float &mem = s_st_mem_input[t * KWS_EMBED + d];
                 const float spike = transformer_lif(current, mem, beta, threshold);
                 s_tr_x[t * KWS_EMBED + d] = spike;

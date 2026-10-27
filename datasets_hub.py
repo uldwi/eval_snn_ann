@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from scipy.io import wavfile
-from scipy.signal import hilbert, resample, welch
+from scipy.signal import hilbert, resample, resample_poly, welch
 from torch.utils.data import Dataset, TensorDataset
 from torchvision import datasets, transforms
 
@@ -101,6 +101,16 @@ AVAILABLE_DATASETS: Dict[str, Dict[str, Union[str, int, List[str]]]] = {
         "in_channels": 1,
         "in_height": 16,
         "in_width": 16,
+        "num_classes": 35,
+        "class_names": ["backward", "bed", "bird", "cat", "dog", "down", "eight", "five", "follow", "forward", "four", "go", "happy", "house", "learn", "left", "marvin", "nine", "no", "off", "on", "one", "right", "seven", "sheila", "six", "stop", "three", "tree", "two", "up", "visual", "wow", "yes", "zero"],
+    },
+    "speech_commands_spikcommander": {
+        "domain": "Audio & Keyword Spotting (SpikCommander-Mel-Sequenz)",
+        "description": "Speech Commands v0.02 mit 8-kHz-Audio und 140 Mel-Bändern als Zeitsequenz",
+        "input_size": 14000,
+        "in_channels": 1,
+        "in_height": 140,
+        "in_width": 100,
         "num_classes": 35,
         "class_names": ["backward", "bed", "bird", "cat", "dog", "down", "eight", "five", "follow", "forward", "four", "go", "happy", "house", "learn", "left", "marvin", "nine", "no", "off", "on", "one", "right", "seven", "sheila", "six", "stop", "three", "tree", "two", "up", "visual", "wow", "yes", "zero"],
     },
@@ -260,7 +270,7 @@ def normalize_dataset_name(name: str) -> str:
 
 def list_available_datasets() -> List[DatasetInfo]:
     """Gibt eine Liste aller verfügbaren Datensätze und deren Metadaten zurück."""
-    unique_names = ["mnist", "fashion_mnist", "cifar10", "speech_commands", "har_time_series", "synthetic_time_series", "eeg_data", "eeg_eye_state", "physionet_eeg_mi", "ecg_data"]
+    unique_names = ["mnist", "fashion_mnist", "cifar10", "speech_commands", "speech_commands_spikcommander", "har_time_series", "synthetic_time_series", "eeg_data", "eeg_eye_state", "physionet_eeg_mi", "ecg_data"]
     results = []
     for name in unique_names:
         if name in AVAILABLE_DATASETS:
@@ -312,8 +322,10 @@ class SpeechCommandsDataset(Dataset):
     ausgelassen.
     """
 
-    def __init__(self, source: Dataset, torchaudio_module):
+    def __init__(self, source: Dataset, torchaudio_module, spikcommander: bool = False, augment: bool = False):
         self.source = source
+        self.spikcommander = bool(spikcommander)
+        self.augment = bool(augment)
         self.keyword_to_index = {word: i for i, word in enumerate(SPEECH_COMMANDS)}
         self.samples = []
         for i in range(len(source)):
@@ -323,14 +335,15 @@ class SpeechCommandsDataset(Dataset):
                 # while _path already includes the speech_commands_v0.02 subdirectory.
                 self.samples.append((os.path.join(source._archive, relative_path), sample_rate, label))
 
+        self.sample_rate = 8000 if self.spikcommander else 16000
         self.mel_transform = torchaudio_module.transforms.MelSpectrogram(
-            sample_rate=16000,
-            n_fft=400,
-            win_length=400,
-            hop_length=160,
-            n_mels=40,
+            sample_rate=self.sample_rate,
+            n_fft=256 if self.spikcommander else 400,
+            win_length=256 if self.spikcommander else 400,
+            hop_length=80 if self.spikcommander else 160,
+            n_mels=140 if self.spikcommander else 40,
             f_min=20.0,
-            f_max=7600.0,
+            f_max=4000.0 if self.spikcommander else 7600.0,
             power=2.0,
         )
         self.feature_cache = [None] * len(self.samples)
@@ -356,6 +369,10 @@ class SpeechCommandsDataset(Dataset):
             audio = audio.astype(np.float32)
         if audio.ndim > 1:
             audio = audio.mean(axis=1, dtype=np.float32)
+        if self.spikcommander:
+            # Properly anti-alias while converting the original 16-kHz GSC audio to 8 kHz.
+            audio = resample_poly(audio, up=1, down=2).astype(np.float32, copy=False)
+            sample_rate = 8000
         if audio.size < sample_rate:
             audio = np.pad(audio, (0, sample_rate - audio.size))
         else:
@@ -365,7 +382,19 @@ class SpeechCommandsDataset(Dataset):
     def __getitem__(self, index):
         cached = self.feature_cache[index]
         if cached is not None:
-            return cached
+            result = cached
+            if not (self.augment and self.spikcommander):
+                return result
+            features = result[0].clone()
+            freq_width = int(np.random.randint(0, 13))
+            if freq_width:
+                freq_start = int(np.random.randint(0, 141 - freq_width))
+                features[:, freq_start:freq_start + freq_width, :] = 0
+            time_width = int(np.random.randint(0, 11))
+            if time_width:
+                time_start = int(np.random.randint(0, 101 - time_width))
+                features[:, :, time_start:time_start + time_width] = 0
+            return features, result[1]
 
         _, sample_rate, label = self.samples[index]
         waveform = torch.from_numpy(self.load_normalized_audio(index).copy()).unsqueeze(0)
@@ -374,9 +403,22 @@ class SpeechCommandsDataset(Dataset):
         mel_db = 10.0 * torch.log10(mel.clamp_min(1e-10))
         mel_db = (mel_db - mel_db.max()).clamp(min=-80.0, max=0.0)
         mel = (mel_db + 80.0) / 80.0
-        features = torch.nn.functional.adaptive_avg_pool2d(mel.unsqueeze(0), (16, 16)).squeeze(0)
+        target_shape = (140, 100) if self.spikcommander else (16, 16)
+        features = torch.nn.functional.adaptive_avg_pool2d(mel.unsqueeze(0), target_shape).squeeze(0)
         result = (features.to(torch.float32), self.keyword_to_index[label])
         self.feature_cache[index] = result
+        if self.augment and self.spikcommander:
+            features = result[0].clone()
+            # Light SpecAugment: one frequency mask and one temporal mask.
+            freq_width = int(np.random.randint(0, 13))
+            if freq_width:
+                freq_start = int(np.random.randint(0, 141 - freq_width))
+                features[:, freq_start:freq_start + freq_width, :] = 0
+            time_width = int(np.random.randint(0, 11))
+            if time_width:
+                time_start = int(np.random.randint(0, 101 - time_width))
+                features[:, :, time_start:time_start + time_width] = 0
+            return features, result[1]
         return result
 
 
@@ -984,7 +1026,7 @@ def get_dataset(
         return train_ds, test_ds, info
 
     # 4. Audio: reales Speech Commands v0.02 (Keyword Spotting)
-    if key in ("speech_commands", "kws"):
+    if key in ("speech_commands", "speech_commands_spikcommander", "kws"):
         try:
             import torchaudio
         except (ImportError, OSError) as exc:
@@ -1005,10 +1047,11 @@ def get_dataset(
         test_source = torchaudio.datasets.SPEECHCOMMANDS(
             root=data_dir, download=download, subset="testing"
         )
-        info.validation_dataset = SpeechCommandsDataset(validation_source, torchaudio)
+        spikcommander = key == "speech_commands_spikcommander"
+        info.validation_dataset = SpeechCommandsDataset(validation_source, torchaudio, spikcommander=spikcommander)
         return (
-            SpeechCommandsDataset(train_source, torchaudio),
-            SpeechCommandsDataset(test_source, torchaudio),
+            SpeechCommandsDataset(train_source, torchaudio, spikcommander=spikcommander, augment=spikcommander),
+            SpeechCommandsDataset(test_source, torchaudio, spikcommander=spikcommander),
             info,
         )
 

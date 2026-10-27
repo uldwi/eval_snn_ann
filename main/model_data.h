@@ -67,7 +67,7 @@ typedef struct {
 typedef struct {
     int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size;
     int spiking, num_steps;
-    float beta, threshold;
+    float beta, threshold, input_scale;
 } transformer_config_t;
 
 extern const int g_model_type;
