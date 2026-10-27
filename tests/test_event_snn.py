@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit-Tests für die Event-basierte SNN-Implementierung (Host & C-Export).
+Unit tests for event-based SNN implementation (host and C export).
 """
 
 import sys

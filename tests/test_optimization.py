@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Testet die Post-Training Optimierung (Pruning, Quantisierung, Centroid-Clustering, Sparsity) in train_mnist.py.
+Test post-training optimization (pruning, quantization, centroid clustering, sparsity) through train_mnist.py.
 """
 import copy
 import json
@@ -102,7 +102,7 @@ class TestModelOptimization(unittest.TestCase):
         res = apply_pruning(model, prune_cfg)
         self.assertTrue(res["applied"])
 
-        # Prüfe, dass kein betragsmäßiges Gewicht zwischen 0 und threshold existiert
+        # Check that no weight magnitude lies between zero and the threshold.
         for _, module in model.named_modules():
             if hasattr(module, "weight") and module.weight is not None:
                 w_abs = module.weight.data.abs()
@@ -155,7 +155,7 @@ class TestModelOptimization(unittest.TestCase):
 
     def test_snn_optimization_and_export(self):
         if not HAS_SPIKINGJELLY:
-            self.skipTest("SpikingJelly nicht verfügbar")
+            self.skipTest("SpikingJelly is not available")
 
         snn_cfg = {
             "name": "TestSNN",

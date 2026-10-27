@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Testet das automatische Speichern und Caching der Modelle in train_mnist.py.
+Test automatic model saving and checkpoint caching through train_mnist.py.
 """
 import copy
 import json

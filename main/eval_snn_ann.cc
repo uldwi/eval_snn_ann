@@ -15,7 +15,7 @@
 #include "esp_heap_caps.h"
 
 #ifndef HOST_TEST
-// TensorFlow Lite Micro (für ANN)
+// TensorFlow Lite Micro (for ANN)
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -32,7 +32,7 @@
 
 static const char *TAG = "EVAL_SNN_ANN";
 
-// Tensor Arena für TensorFlow Lite Micro (nur bei ANN)
+// Tensor arena for TensorFlow Lite Micro (ANN only)
 constexpr size_t kTensorArenaSize = 192 * 1024;
 static uint8_t *tensor_arena = nullptr;
 
@@ -48,9 +48,9 @@ static int argmax_float(const float *arr, int len) {
     return max_idx;
 }
 
-// ESP32-S3 FP32-Inferenz fuer den in Python definierten kompakten Transformer.
-// Dimensionen sind im Export absichtlich fest begrenzt, damit der Workspace
-// statisch bleibt und keine grossen temporären Tensoren auf dem Task-Stack liegen.
+// ESP32-S3 FP32 inference for the compact Transformer defined in Python.
+// Export dimensions are intentionally fixed so the workspace
+// remains static and large temporary tensors do not use the task stack.
 static constexpr int KWS_TOKENS = 16;
 static constexpr int KWS_FEATURES = 16;
 static constexpr int KWS_EMBED = 32;
@@ -362,7 +362,7 @@ static int run_spiking_transformer(const float *mel) {
 
 static int run_transformer_inference(const float *mel) {
     if (g_transformer_config.spiking) return run_spiking_transformer(mel);
-    // Input ist (Frequenz, Zeit); der ANN-Forward nimmt Zeit als Tokenachse.
+    // Input is (frequency, time); the ANN forward pass uses time as the token axis.
     for (int t = 0; t < KWS_TOKENS; ++t) {
         float *token = s_tr_x + t * KWS_EMBED;
         for (int d = 0; d < KWS_EMBED; ++d) {
@@ -440,31 +440,31 @@ static int run_transformer_inference(const float *mel) {
 }
 
 // ---------------------------------------------------------------------
-// Kernel-Varianten
+// Kernel variants
 //
-//   SNN_SEL_LAYOUT_NHWC  0 = NCHW (Ebene-major, oc*plane)
-//                        1 = NHWC (Pixel-major, oc innermost -> contiguierliche
-//                            Schreibzugriffe im Scatter)
-//   SNN_SEL_INT8         0 = FP32-Gewichte, FP32-Akkumulation
-//                        1 = INT8-Gewichte (pro Output-Channel skaliert),
-//                            Conv zwingend mit INT32-Akkumulator (SNN_SEL_CONV_ACC32),
-//                            sonst ist die Dekquantisierung pro Gewicht auf
-//                            einem Kern ohne Vektorinstruktionen der Flaschenhals
-//   SNN_SEL_INT8_FC      INT8 nur fuer die FC-Gewichte (Vorteil: die Gewichte
-//                        liegen in SRAM statt im Flash-Cache)
-//   SNN_SEL_CONV_ACC32   nur mit INT8: zusaetzlicher INT32-Akkumulator pro
-//                        Conv-Neuron (4 Byte/Neuron zusaetzlicher RAM) statt
-//                        Dekquantisierung pro Gewicht im Scatter
-//   SNN_SEL_LAZY_DECAY   0 = expliziter Decay/Bias-Durchlauf je Zeitschritt
-//                        1 = Lazy Decay mit geschlossener Form, der Decay wird
-//                            erst beim Zugriff auf ein Neuron nachgezogen
-//   SNN_SEL_DENSE_REF    0 = aus, > 0 = Anzahl der Test-Samples, fuer die der
-//                        zusaetzliche dichte Referenzpfad gegen den optimierten
-//                        Pfad geprueft wird. Der Referenzpfad ist um ein
-//                        Vielfaches langsamer, deshalb nur als Selbsttest.
+//   SNN_SEL_LAYOUT_NHWC  0 = NCHW (channel-major, oc*plane)
+//                        1 = NHWC (pixel-major, oc innermost -> contiguous
+//                            scatter writes)
+//   SNN_SEL_INT8         0 = FP32 weights, FP32 accumulation
+//                        1 = INT8 weights (scaled per output channel),
+//                            convolution requires an INT32 accumulator (SNN_SEL_CONV_ACC32),
+//                            otherwise dequantization per weight on
+//                            a core without vector instructions becomes the bottleneck
+//   SNN_SEL_INT8_FC      INT8 for FC weights only (benefit: weights
+//                        reside in SRAM instead of the flash cache)
+//   SNN_SEL_CONV_ACC32   INT8 only: additional INT32 accumulator per
+//                        convolution neuron (4 extra bytes per neuron) instead of
+//                        dequantization per weight during scatter
+//   SNN_SEL_LAZY_DECAY   0 = explicit decay/bias pass at each time step
+//                        1 = lazy decay in closed form; decay is applied
+//                            when a neuron is accessed
+//   SNN_SEL_DENSE_REF    0 = disabled; > 0 = number of test samples for which
+//                        the additional dense reference path is checked against
+//                        the optimized path. The reference path is much
+//                        slower, so use it only for self-tests.
 //
-// Mit SNN_SEL_RUNTIME=1 werden alle Varianten uebersetzt und zur Laufzeit
-// ueber snn_select_variants() umschaltbar (Host-Verifikation).
+// With SNN_SEL_RUNTIME=1, all variants are compiled and selected at runtime.
+// selectable through snn_select_variants() (host verification).
 // ---------------------------------------------------------------------
 #ifndef SNN_SEL_LAYOUT_NHWC
 #define SNN_SEL_LAYOUT_NHWC 0
@@ -513,7 +513,7 @@ static int s_opt_lazy  = SNN_SEL_LAZY_DECAY;
 static int s_opt_fcq   = SNN_SEL_INT8_FC;
 #endif
 
-// Aktive Konfiguration als Konstanten (fuer den Produktiv-Build)
+// Active configuration as compile-time constants for production builds
 #define SNN_CFG_NHWC  SNN_SEL_LAYOUT_NHWC
 #define SNN_CFG_INT8  SNN_SEL_INT8
 #define SNN_CFG_INT8_FC SNN_SEL_INT8_FC
@@ -539,7 +539,7 @@ typedef struct {
 
 static snn_geom_t s_geom[SNN_MAX_CONV_LAYERS] = {};
 
-// Neuronenzustaende und Event-Listen
+// Neuron states and event lists
 static float    *s_snn_conv_mem[SNN_MAX_CONV_LAYERS] = {nullptr};
 static uint16_t *s_snn_conv_events[SNN_MAX_CONV_LAYERS] = {nullptr};
 static uint16_t *s_snn_conv_pool_events[SNN_MAX_CONV_LAYERS] = {nullptr};
@@ -547,23 +547,23 @@ static float *s_snn_conv_pool_scales[SNN_MAX_CONV_LAYERS] = {nullptr};
 static float    *s_snn_fc_mem[SNN_MAX_FC_LAYERS] = {nullptr};
 static uint16_t *s_snn_fc_events[SNN_MAX_FC_LAYERS] = {nullptr};
 
-// Sparsamkeits-Tabellen: pro (ic, kh, kw)-Gruppe werden nur die nicht
-// durch Prouting genullten Gewichte durchlaufen. Die Gewichte liegen
-// gruppenweise hintereinander, jeweils aufsteigend nach oc, damit die
-// oc-Dimension kontinuierlich adressiert wird. delta[] ist der vorberechnete
-// Offset im Membranzustand (oc * oc_plane fuer NCHW), oc[] der Output-Channel
-// fuer NHWC sowie fuer Bias- und Skalierungszugriffe.
+// Sparse tables: for each (ic, kh, kw) group, process only weights
+// not zeroed by pruning. Weights are stored
+// contiguously by group and sorted by oc so that the
+// oc dimension is addressed contiguously. delta[] is the precomputed
+// offset in membrane state (oc * oc_plane for NCHW); oc[] is the output channel
+// for NHWC and for bias and scale accesses.
 typedef struct {
     uint32_t *off;      // Gruppenanfang, Laenge groups + 1
-    uint8_t  *oc;       // Output-Channel des Eintrags
-    float    *wf;       // FP32-Gewichte
-    int8_t   *wq;       // INT8-Gewichte (pro Output-Channel skaliert)
+    uint8_t  *oc;       // output channel for this entry
+    float    *wf;       // FP32 weights
+    int8_t   *wq;       // INT8 weights (scaled per output channel)
     bool      is_dense; // Direkt aus Flash
 } sparse_tbl_t;
 
 static sparse_tbl_t s_tbl[SNN_MAX_CONV_LAYERS];
 
-// Quantisierte Gewichte: int8 mit Skalierung pro Output-Channel
+// Quantized weights: int8 with per-output-channel scaling
 static float   *s_wsc_conv[SNN_MAX_CONV_LAYERS] = {nullptr};
 static float   *s_wsc_conv_in[SNN_MAX_CONV_LAYERS] = {nullptr};
 static int8_t  *s_fc_wq[SNN_MAX_FC_LAYERS] = {nullptr};
@@ -573,42 +573,42 @@ static float   *s_wsc_fc_in[SNN_MAX_FC_LAYERS] = {nullptr};
 // INT32-Akkumulator (nur Conv, nur wenn SNN_CFG_ACC32)
 static int32_t *s_conv_acc[SNN_MAX_CONV_LAYERS] = {nullptr};
 
-// Lazy Decay: Zeitstempel des letzten Membranzugriffs und die Tabellen der
-// geschlossenen Form  mem(dt) = beta^dt * mem + bias * (1 - beta^dt)/(1 - beta)
+// Lazy decay: timestamp of the last membrane access and tables for
+// closed-form update: mem(dt) = beta^dt * mem + bias * (1 - beta^dt)/(1 - beta)
 static uint8_t *s_last_t[SNN_MAX_CONV_LAYERS] = {nullptr};
 static uint8_t *s_last_t_fc[SNN_MAX_FC_LAYERS] = {nullptr};
 static float   *s_pow_beta = nullptr;   // [dt] = beta^dt
 static float   *s_bias_sum = nullptr;   // [dt] = (1 - beta^dt) / (1 - beta)
 
-// NHWC -> NCHW Umindizierung fuer den FC-Input (Gewichte bleiben unberuehrt)
+// NHWC -> NCHW reindexing for FC input (weights remain unchanged)
 static uint16_t *s_nhwc2nchw[SNN_MAX_CONV_LAYERS] = {nullptr};
-// Pro Eingabeposition und Kernel-Tap der fertige Zielindex (0xFFFF = ausserhalb).
-// Damit entfallen im Scatter je Event 2*k*k Divisionen und Modulo-Operationen.
+// Precomputed destination index for each input position and kernel tap (0xFFFF = out of bounds).
+// This removes 2*k*k divisions and modulo operations per event during scatter.
 static uint16_t *s_tap_off[SNN_MAX_CONV_LAYERS] = {nullptr};
 
-// Output-stationaere Streuung: Die Events werden nach Eingangskanal
-// gebuendelt, dann laeuft die innerste Schleife ueber die Events eines
-// Kanals. Dadurch wandert der Zugriff auf mem[] monoton statt sprunghaft
-// und das Gewicht steht im Register.
+// Output-stationary scatter: events are grouped by input channel,
+// then the inner loop processes events for one
+// channel. This makes mem[] access sequential rather than scattered
+// and keeps the weight in a register.
 static uint16_t *s_ev_bucket = nullptr;   // nach Kanal sortierte Events
-static uint16_t *s_ev_row     = nullptr;   // Zeilenindex je Event in s_tap_off
-static uint16_t *s_ev_ofs     = nullptr;   // gueltige Zielindizes je (Kanal, Tap)
+static uint16_t *s_ev_row     = nullptr;   // row index per event in s_tap_off
+static uint16_t *s_ev_ofs     = nullptr;   // valid destination indices per (channel, tap)
 static uint32_t *s_ev_start  = nullptr;   // Startindex je Kanal
 static int      s_max_in_ev  = 0;
 
-// Nur die im Zeitschritt beruehrten Neuronen pruefen: startet ein Schritt mit
-// mem < thr (nach dem vorherigen immer der Fall, denn entweder gefeuert ->
-// mem = 0, oder nicht gefeuert -> mem < thr), dann erreicht ein Neuron ohne
-// synapseischen Input den Schwellwert nur, wenn bias > 0. Bei beta == 1 und
-// bias < 0 ist die Membran ohne Input monoton fallend, also feuern unberuehrte
-// Neuronen nicht und der Threshold-Durchlauf kann fuer diese Channels auf die
-// Streuliste (last[] == t) verkuerzt werden. Je Layer wird das pro
-// Output-Channel entschieden, weil die Bias gemischt vorzeichenbehaftet sind.
+// Check only neurons touched in this time step: if a step starts with
+// mem < thr (always true after the previous step: either it spiked ->
+// mem = 0, or it did not spike -> mem < thr), a neuron without
+// synaptic input reaches threshold only if bias > 0. With beta == 1 and
+// bias < 0, the membrane decreases without input, so untouched
+// neurons cannot spike and threshold checks for those channels can use the
+// sparse list (last[] == t). This is determined per output channel
+// in each layer because biases may have mixed signs.
 
-// Lazy Decay aktiv (im Host-Build zur Laufzeit umschaltbar)
+// Lazy decay active (can be toggled at runtime in host builds)
 static int s_lazy_active = SNN_CFG_LAZY;
-// s_last_t wird auch von der beta==1-Variante gebraucht: dort markiert es
-// die im Scatter beruehrten Neuronen (fuer die Channels mit Bias < 0).
+// s_last_t is also used by the beta==1 variant to mark
+// neurons touched during scatter (for channels with bias < 0).
 static bool need_stamp_tbl(void) {
     return (SNN_CFG_LAZY != 0);
 }
@@ -705,8 +705,8 @@ static bool quantize_row(const float *w, int n, int8_t *q, float *scale) {
     return true;
 }
 
-// Kompakte Nicht-Null-Gewichte pro (ic, kh, kw)-Gruppe aufbauen.
-// need_f/need_q steuern, welche Gewichtsvariante erzeugt wird.
+// Build compact nonzero weights for each (ic, kh, kw) group.
+// need_f/need_q select which weight variant to build.
 static bool build_sparse_tables(void) {
     const snn_config_t &cfg = g_snn_config;
     const bool need_f = !CONV_QUANT_ON;
@@ -726,7 +726,7 @@ static bool build_sparse_tables(void) {
         tb.is_dense = false;
 
         // Erstlauf: jede Output-Zeile quantisieren, damit durch Quantisierung
-        // exakt genullte Gewichte ebenfalls aus der Sparse-Liste fallen.
+        // Drop weights that are exactly zero from the sparse list as well.
         float *wsc = nullptr;
         int8_t *allq = nullptr;
         if (need_q) {
@@ -821,7 +821,7 @@ static bool build_sparse_tables(void) {
             s_wsc_conv_in[l] = wsc_in;
         }
 
-        // Zielindex je (Eingabeposition, Tap) vorberechnen
+        // Precompute the destination index for each input position and tap.
         {
             const snn_conv_layer_cfg_t &cl = g_snn_config.conv_layers[l];
             const size_t n_tabs = (size_t)g.in_h * g.in_w * g.k2;
@@ -875,12 +875,12 @@ static bool build_sparse_tables(void) {
     return true;
 }
 
-// INT8-Kopien der FC-Gewichte (pro Output-Zeile skaliert) und die Tabellen
-// der geschlossenen Form fuer den Lazy Decay aufbauen.
+// Build INT8 copies of FC weights (scaled per output row) and tables
+// for the lazy decay closed-form update.
 static bool build_quant_and_decay_tables(void) {
     const snn_config_t &cfg = g_snn_config;
 
-    // Gleiche Bedingung wie die Auswahl des FC-Kernels, damit der int8-Pfad
+    // Use the same condition as FC kernel selection so the INT8 path
     // niemals auf eine nicht allozierte Tabelle zugreift.
     if (FC_QUANT_ON) {
         const int num_fc = cfg.hidden_layers_count + 1;
@@ -921,11 +921,11 @@ static bool init_snn_buffers(void) {
     const snn_config_t &cfg = g_snn_config;
     init_geometry();
 
-    ESP_LOGI(TAG, "SNN-Init: input=%d, conv_layers=%d, flat=%d, fc=%d->%d->%d, steps=%d",
+    ESP_LOGI(TAG, "SNN init: input=%d, conv_layers=%d, flat=%d, fc=%d->%d->%d, steps=%d",
              cfg.input_size, cfg.num_conv_layers, cfg.flat_size,
              cfg.fc_layer_sizes[0], cfg.fc_layer_sizes[1], cfg.fc_layer_sizes[2],
              cfg.num_steps);
-    ESP_LOGI(TAG, "SNN-Init: freier Heap vor Allokation: %u Bytes (min: %u)",
+    ESP_LOGI(TAG, "SNN init: free heap before allocation: %u Bytes (min: %u)",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
 
@@ -939,7 +939,7 @@ static bool init_snn_buffers(void) {
 
     const int in_size = (cfg.input_size > 0) ? cfg.input_size : MNIST_IMAGE_SIZE;
     if (in_size > 65535) {
-        ESP_LOGE(TAG, "input_size %d ueberschreitet das 16-Bit-Eventformat!", in_size);
+        ESP_LOGE(TAG, "input_size %d exceeds the 16-bit event format!", in_size);
         return false;
     }
     s_snn_in_events = (uint16_t*)heap_caps_calloc(in_size, sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
@@ -952,7 +952,7 @@ static bool init_snn_buffers(void) {
         ESP_LOGI(TAG, "Conv%d: %dx%dx%d->%dx%dx%d, neurons=%d, pool=%d",
                  l, g.in_c, g.in_h, g.in_w, g.out_c, g.out_h, g.out_w, g.n_neurons, g.n_pool);
         if (g.n_neurons > 65535 || g.n_pool > 65535) {
-            ESP_LOGE(TAG, "Conv-Layer %d ueberschreitet das 16-Bit-Eventformat!", l);
+            ESP_LOGE(TAG, "Conv layer %d exceeds the 16-bit event format!", l);
             return false;
         }
         s_snn_conv_mem[l] = (float*)heap_caps_calloc(g.n_neurons, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
@@ -1052,7 +1052,7 @@ static bool init_snn_buffers(void) {
     for (int l = 0; l < num_fc; ++l) {
         const int out_dim = cfg.fc_layer_sizes[l + 1];
         if (out_dim > 65535) {
-            ESP_LOGE(TAG, "FC-Layer %d ueberschreitet das 16-Bit-Eventformat!", l);
+            ESP_LOGE(TAG, "FC layer %d exceeds the 16-bit event format!", l);
             return false;
         }
         s_snn_fc_mem[l] = (float*)heap_caps_calloc(out_dim, sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
@@ -1071,9 +1071,9 @@ static bool init_snn_buffers(void) {
 #if SNN_PROFILE
     snn_prof_reset();
 #endif
-    ESP_LOGI(TAG, "Freier Heap nach SNN-Init: %u Bytes",
+    ESP_LOGI(TAG, "Free heap after SNN init: %u Bytes",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
-    ESP_LOGI(TAG, "Kernel: Layout=%s, Conv-Gewichte=%s, FC-Gewichte=%s, Conv-Akkumulator=%s, Decay=%s (%s)",
+    ESP_LOGI(TAG, "Kernel: Layout=%s, Conv weights=%s, FC weights=%s, Conv accumulator=%s, decay=%s (%s)",
              (s_conv_variant & 1) ? "NHWC" : "NCHW",
              (s_conv_variant & 2) ? "INT8" : "FP32",
              FC_QUANT_ON ? "INT8" : "FP32",
@@ -1149,25 +1149,25 @@ static int build_input_events(const float *img, int t) {
 // ---------------------------------------------------------------------
 // Sparse Conv-Layer
 //
-//   1. Synaptische Akkumulation nur fuer aktive Eingangs-Events und nur
-//      ueber die nicht durch Pruning genullten Gewichte
-//   2. Schwellenwertpruefung (branch-los) und Event-Erzeugung
+//   1. Synaptic accumulation only for active input events and only
+//      over weights that were not zeroed by pruning
+//   2. Branchless threshold check and event generation
 //
-// Decay und Bias werden entweder explizit in einem eigenen Durchlauf
-// nachgezogen (LAZY = false) oder lazy in geschlossener Form beim ersten
-// Zugriff auf ein Neuron im Zeitschritt t:
+// Decay and bias are applied either explicitly in a separate pass
+// (LAZY = false) or lazily in closed form on the first
+// access to a neuron at time step t:
 //     mem(dt) = beta^dt * mem + bias * (1 - beta^dt) / (1 - beta)
 //
 // Template-Parameter:
 //   NHWC  false = Index oc*oc_plane + p (Pixel-minor, Ebene-major)
 //          true  = Index p*out_c + oc (Pixel-major, oc minor) -> die
 //                  Scatter-Schreibzugriffe liegen dann contiguierlich
-//   QUANT false = FP32-Gewichte im Scatter
-//          true  = INT8-Gewichte, INT32-Akkumulation im Register (true) oder
-//                  im separaten INT32-Akkumulator (ACC32, 4 Byte/Neuron)
-//   ACC32 INT32-Akkumulator pro Neuron verwenden statt Dekquantisierung
-//          pro Gewicht
-//   LAZY  Decay/Bias lazy in geschlossener Form nachziehen
+//   QUANT false = FP32 weights during scatter
+//          true  = INT8 weights, INT32 accumulation in a register (true) or
+//                  in a separate INT32 accumulator (ACC32, 4 bytes/neuron)
+//   ACC32 Use an INT32 accumulator per neuron instead of dequantizing
+//          each weight
+//   LAZY  Apply decay/bias lazily in closed form
 // ---------------------------------------------------------------------
 template <bool NHWC, bool QUANT, bool ACC32, bool LAZY, bool BETA1>
 static int conv_body(int l, const uint16_t *ev, int n_ev,
@@ -1183,8 +1183,8 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
     const int out_c = g.out_c;
     const bool unit_scale = (scale_src == nullptr);
 
-    // Skalierung je Output-Channel; bei skaliertem Eingang (DIRECT) wird
-    // der Eingang mit 1/127 quantisiert, daher die zweite Tabelle.
+    // Per-output-channel scaling; for scaled input (DIRECT),
+    // input is quantized by 1/127, hence the second table.
     const float *wsc = QUANT ? (unit_scale ? s_wsc_conv[l] : s_wsc_conv_in[l]) : nullptr;
     int32_t *acc = ACC32 ? s_conv_acc[l] : nullptr;
 
@@ -1193,10 +1193,10 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
     uint8_t *last = (LAZY || BETA1) ? s_last_t[l] : nullptr;
     const float *pb = track ? s_pow_beta : nullptr;
     const float *bs = track ? s_bias_sum : nullptr;
-    // Bei beta == 1 laesst sich der Bias aus dem Zustand herausziehen:
+    // With beta == 1, bias can be separated from the state:
     //   v = mem[i] + b*dt  und  mu[i] := mem[i] - b*last[i]  ergibt  v = mu[i] + b*stamp
-    // mu bleibt zwischen den Schritten unveraendert und wird nur beim Spike
-    // auf -b*stamp gesetzt. Damit entfaellt im Scatter jede Decay-Nachfuehrung.
+    // mu remains unchanged between time steps and is updated only on a spike
+    // to -b*stamp. This removes decay updates from the scatter.
     const bool MARK = BETA1 && g.has_neg_bias;
     const uint8_t stamp = (uint8_t)(t + 1);
 
@@ -1223,11 +1223,10 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
     #if SNN_PROFILE
     PROF_T(t_scatter);
 #endif
-    // Output-stationaere Streuung (nur NCHW, beta == 1, unskalierter Eingang):
-    // Events nach Eingangskanal buendeln, dann je (Kanal, Tap) die gueltigen
-    // Zielindizes einsammeln und darueber die Output-Channels laufen. Das
-    // Gewicht steht dabei im Register und die Guelligkeitspruefung faellt
-    // aus der inneren Schleife heraus.
+    // Output-stationary scatter (NCHW only, beta == 1, unscaled input):
+    // Group events by input channel, then collect valid destination indices
+    // for each (channel, tap) and iterate over output channels. The weight
+    // stays in a register, removing bounds checks from the inner loop.
     const bool OUTST = BETA1 && !NHWC && (scale_src == nullptr) && (g.in_c <= 63);
     if (OUTST && n_ev > 0) {
         const uint32_t *off = tb.off;
@@ -1269,7 +1268,7 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
             for (int tap = 0; tap < k2; ++tap) {
                 const uint32_t gi = (uint32_t)(ic * k2 + tap);
 
-                // Gueltige Zielindizes der Events dieses Kanals einsammeln
+                // Collect valid destination indices for this channel's events
                 int nv = 0;
                 for (int j = 0; j < nevic; ++j) {
                     const uint16_t tof = t0[(size_t)rowp[j] + tap];
@@ -1409,9 +1408,9 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
                         }
                         const int oc = (QUANT || LAZY) ? occ[n] : 0;
                         if (TRACK) {
-                            // dt == 0 ist der Normalfall: dasselbe Neuron wird
-                            // im Zeitschritt von mehreren Kernelpositionen
-                            // erreicht, der Decay darf nur einmal greifen.
+                            // dt == 0 is the normal case: the same neuron is
+                            // in the timestep for multiple kernel positions
+                            // reached, so decay must be applied only once.
                             const int dt = stamp - (int)last[idx];
                             if (dt) {
                                 mem[idx] = mem[idx] * pb[dt] + b[oc] * bs[dt];
@@ -1443,7 +1442,7 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
     uint16_t *out_ev = s_snn_conv_events[l];
     int n_out = 0;
 
-    // Ein Neuron auswerten. LAZY zieht Decay und Bias in geschlossener Form
+    // Evaluate one neuron. LAZY applies decay and bias in closed form
     // nach, ACC32 loest den INT32-Akkumulator auf.
     auto eval = [&](int i, int oc, float bv) {
         float v;
@@ -1464,8 +1463,8 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
         mem[i] = sp ? 0.0f : v;
     };
 
-    // Wie eval, aber fuer ein im Scatter bereits angefasstes Neuron: Decay und
-    // Bias sind dort schon verrechnet, es bleibt nur noch die Schwellwertpruefung.
+    // Like eval, but for a neuron already touched by scatter: decay and bias
+    // have already been applied, so only the threshold check remains.
     auto eval_touched = [&](int i, int oc) {
         float v = mem[i];
         if (ACC32) {
@@ -1486,7 +1485,7 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
             const int base = oc * plane;
             if (bv < 0.0f) {
                 // Ohne Spike kann die Membran den Wert mu unveraendert nur
-                // verkleinern: unberuehrte Neuronen koennen nicht feuern.
+                // reduce the scan: untouched neurons cannot spike.
                 for (int p = 0; p < plane; ++p) {
                     const int i = base + p;
                     if (last[i] != stamp) continue;
@@ -1496,7 +1495,7 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
                     if (ACC32) {
                         nu = m0 + (float)acc[i] * wsc[oc];
                         acc[i] = 0;
-                        mem[i] = nu;   // INT32-Beitrag muss in mu zurueck
+                        mem[i] = nu;   // Fold the INT32 contribution into mu.
                     }
                     if (nu + bvs >= thr) {
                         mem[i] = -bvs;
@@ -1527,7 +1526,7 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
     }
 
     if (NHWC) {
-        // Pixel-major: aufsteigender Index, sequentielle Membranzugriffe
+        // Pixel-major: ascending index, sequential membrane accesses
         for (int p = 0; p < plane; ++p) {
             for (int oc = 0; oc < out_c; ++oc) {
                 const int i = p * out_c + oc;
@@ -1540,7 +1539,7 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
             }
         }
     } else {
-        // Kanal-major: je Channel ein zusammenhaengender Bereich
+        // Channel-major: contiguous range for each channel
         for (int oc = 0; oc < out_c; ++oc) {
             const float bv = b ? b[oc] : 0.0f;
             const int base = oc * plane;
@@ -1565,9 +1564,9 @@ static int conv_body(int l, const uint16_t *ev, int n_ev,
 template <bool NHWC, bool QUANT, bool ACC32>
 static int conv_variant(int l, const uint16_t *ev, int n_ev,
                         const float *scale_src, int t, uint32_t *synops) {
-    // beta == 1 wird ueber BETA1 gesondert gefuehrt: dort steckt der Bias
-    // bereits im Zustand, der Scatter kommt ohne Decay-Nachfuehrung aus.
-    // Voraussetzung sind Lazy Decay (sonst rechnet der Vorbereitungspass den
+    // beta == 1 is handled separately by BETA1: bias is already
+    // included in the state, so scatter needs no decay update.
+    // This requires lazy decay (otherwise the preparation pass computes
     // Bias schon in die Membran ein) und das NCHW-Layout (die Variante in
     // conv_body indiziert kanalweise).
     const bool b1 = LAZY_ON && !NHWC && (g_snn_config.beta == 1.0f);
@@ -1662,8 +1661,8 @@ static int pool_dispatch(int l, const uint16_t *ev, int n_ev) {
 #endif
 
 // ---------------------------------------------------------------------
-// Sparse FC-Layer: Akkumulation ueber aktive Eingangs-Events mit
-// zeilenweiseem Zugriff auf die Gewichte (ein Zugriff auf mem je Output).
+// Sparse FC layer: accumulate over active input events with
+// row-wise weight access (one mem access per output).
 // Bei QUANT erfolgt die Akkumulation als INT8 x INT8 -> INT32 im Register.
 // ---------------------------------------------------------------------
 template <bool QUANT, bool LAZY>
@@ -1688,8 +1687,8 @@ static int fc_body(int l, const uint16_t *ev, int n_ev,
     uint16_t *out_ev = s_snn_fc_events[l];
     int n_out = 0;
 
-    // Kein Ueberspringen unbeteiligter Neuronen: im FC-Layer gibt es keinen
-    // Scatter, der last[] fuer den aktuellen Schritt setzen wuerde. last[i]
+    // Do not skip untouched neurons: the FC layer has no
+    // scatter operation to set last[] for the current step. last[i]
     // bezoge sich dann auf den vorherigen Schritt.
     for (int i = 0; i < out_dim; ++i) {
         const float bv = b ? b[i] : 0.0f;
@@ -1835,7 +1834,7 @@ static void reset_snn_state(void) {
     for (int l = 0; l < cfg.num_conv_layers; ++l) {
         memset(s_snn_conv_mem[l], 0, (size_t)s_geom[l].n_neurons * sizeof(float));
         if (need_stamp_tbl()) {
-            // last_t = 0 entspricht "virtualem Zeitschritt -1", damit das
+            // last_t = 0 corresponds to "virtual timestep -1", so that the
             // Neuron im ersten Schritt t = 0 den Bias genau einmal erhaelt.
             memset(s_last_t[l], 0, (size_t)s_geom[l].n_neurons * sizeof(uint8_t));
         }
@@ -1869,16 +1868,16 @@ static int snn_argmax(void) {
 
 #if SNN_SEL_DENSE_REF || SNN_SEL_RUNTIME
 // ---------------------------------------------------------------------
-// Dichter Referenzpfad: durchlaeuft jedes Gewicht eines Layers, benutzt
+// Dense reference path: visits every weight in a layer and uses
 // keine Sparse-Tabellen und keine Ereignislisten. Dient nur dem Abgleich
-// der optimierten Pfade (Indexarithmetik NHWC/NCHW, Pruning-Skip,
+// the same arithmetic as the optimized paths (NHWC/NCHW indexing, pruning skips,
 // Quantisierung, Lazy Decay).
 // ---------------------------------------------------------------------
 static float *s_ref_mem[SNN_MAX_CONV_LAYERS] = {nullptr};
 static float *s_ref_mem_fc[SNN_MAX_FC_LAYERS] = {nullptr};
 static uint8_t *s_ref_spike[SNN_MAX_CONV_LAYERS] = {nullptr};
 static uint8_t *s_ref_pool[SNN_MAX_CONV_LAYERS] = {nullptr};
-static float *s_ref_flat = nullptr;   // dichter Vektor fuer den naechsten Layer
+static float *s_ref_flat = nullptr;   // Dense vector for the next layer.
 static float *s_ref_in = nullptr;
 
 static bool init_dense_reference(void) {
@@ -2154,7 +2153,7 @@ extern "C" void app_main(void)
     const char *model_type_name = g_model_type == MODEL_TYPE_SNN ? "SNN" :
                                   (g_model_type == MODEL_TYPE_TRANSFORMER ?
                                    (g_transformer_config.spiking ? "Spiking-Transformer" : "Transformer-ANN") : "ANN");
-    ESP_LOGI(TAG, "=== Initialisiere ESP32 Inferenz: %s (%s, Datensatz: %s) ===",
+    ESP_LOGI(TAG, "=== Initializing ESP32 inference: %s (%s, dataset: %s) ===",
              g_model_name, model_type_name, DATASET_NAME);
 
     // 1. Trigger-GPIO konfigurieren
@@ -2177,17 +2176,17 @@ extern "C" void app_main(void)
     if (g_model_type == MODEL_TYPE_ANN) {
         tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
         if (!tensor_arena) {
-            ESP_LOGE(TAG, "Allokation der Tensor-Arena (%d Bytes) fehlgeschlagen!", (int)kTensorArenaSize);
+            ESP_LOGE(TAG, "Failed to allocate tensor arena (%d bytes)!", (int)kTensorArenaSize);
             return;
         }
 
         const tflite::Model *model = tflite::GetModel(g_model);
         if (model->version() != TFLITE_SCHEMA_VERSION) {
-            ESP_LOGE(TAG, "Modell Schema-Version %d stimmt nicht mit TFLM-Version %d ueberein!",
+            ESP_LOGE(TAG, "Model schema version %d does not match TFLM version %d!",
                      model->version(), TFLITE_SCHEMA_VERSION);
             return;
         }
-        ESP_LOGI(TAG, "TensorFlow Lite Micro Modell erfolgreich geladen (Groesse: %d Bytes, Typ: ANN).", g_model_len);
+        ESP_LOGI(TAG, "TensorFlow Lite Micro model loaded (size: %d bytes, type: ANN).", g_model_len);
 
         static tflite::MicroMutableOpResolver<8> resolver;
         resolver.AddFullyConnected();
@@ -2200,7 +2199,7 @@ extern "C" void app_main(void)
 
         static tflite::MicroInterpreter interp(model, resolver, tensor_arena, kTensorArenaSize);
         if (interp.AllocateTensors() != kTfLiteOk) {
-            ESP_LOGE(TAG, "Tensor-Allokation fehlgeschlagen! Arena-Groesse vergroessern?");
+            ESP_LOGE(TAG, "Tensor allocation failed! Increase the arena size?");
             return;
         }
         interpreter = &interp;
@@ -2211,14 +2210,14 @@ extern "C" void app_main(void)
             input_elements *= input->dims->data[d];
         }
         if (input_elements > MNIST_IMAGE_SIZE) input_elements = MNIST_IMAGE_SIZE;
-        ESP_LOGI(TAG, "TFLM Engine initialisiert. Input Dims: [%d, %d, %d, %d]",
+        ESP_LOGI(TAG, "TFLM engine initialized. Input dimensions: [%d, %d, %d, %d]",
                  input->dims->data[0],
                  (input->dims->size > 1) ? input->dims->data[1] : 1,
                  (input->dims->size > 2) ? input->dims->data[2] : 1,
                  (input->dims->size > 3) ? input->dims->data[3] : 1);
     } else if (g_model_type == MODEL_TYPE_SNN) {
         if (!init_snn_buffers()) {
-            ESP_LOGE(TAG, "Allokation der SNN-Puffer fehlgeschlagen!");
+            ESP_LOGE(TAG, "Failed to allocate SNN buffers!");
             return;
         }
 
@@ -2230,7 +2229,7 @@ extern "C" void app_main(void)
 
         const char *exec_str = (g_snn_config.execution_mode == EXECUTION_MODE_EVENT_BASED) ? "EVENT-BASED" : "DENSE";
 
-        ESP_LOGI(TAG, "SNN SpikingJelly Parameter: Neuron=%s, Encoding=%s, Mode=%s, Conv=%d, FC=%d, %d Steps, Beta=%.2f, Thresh=%.2f",
+        ESP_LOGI(TAG, "SNN parameters: Neuron=%s, Encoding=%s, Mode=%s, Conv=%d, FC=%d, %d Steps, Beta=%.2f, Thresh=%.2f",
                  ntype_str, enc_str, exec_str, g_snn_config.num_conv_layers, g_snn_config.hidden_layers_count + 1,
                  g_snn_config.num_steps, g_snn_config.beta, g_snn_config.threshold);
     } else if (g_model_type == MODEL_TYPE_TRANSFORMER) {
@@ -2243,18 +2242,18 @@ extern "C" void app_main(void)
             g_transformer_config.output_size != KWS_CLASSES ||
             DATASET_INPUT_SIZE != KWS_TOKENS * KWS_FEATURES ||
             DATASET_NUM_CLASSES != KWS_CLASSES) {
-            ESP_LOGE(TAG, "Transformer-Konfiguration passt nicht zum ESP32-Kernel.");
+            ESP_LOGE(TAG, "Transformer configuration does not match the ESP32 kernel.");
             return;
         }
         if (g_transformer_config.spiking &&
             (g_transformer_config.num_steps < 1 || g_transformer_config.num_steps > 32 ||
              g_transformer_config.beta < 0.0f || g_transformer_config.beta >= 1.0f ||
              g_transformer_config.threshold <= 0.0f)) {
-            ESP_LOGE(TAG, "Spiking-Transformer-Neuronenparameter sind ungueltig.");
+            ESP_LOGE(TAG, "Spiking Transformer neuron parameters are invalid.");
             return;
         }
         input_elements = DATASET_INPUT_SIZE;
-        ESP_LOGI(TAG, "Kompakter Speech-Transformer initialisiert: %d Tokens, D=%d, Heads=%d, Layer=%d, Klassen=%d",
+        ESP_LOGI(TAG, "Compact speech Transformer initialized: %d tokens, D=%d, heads=%d, layers=%d, classes=%d",
                  g_transformer_config.tokens, g_transformer_config.embed_dim,
                  g_transformer_config.num_heads, g_transformer_config.num_layers,
                  g_transformer_config.output_size);
@@ -2262,11 +2261,11 @@ extern "C" void app_main(void)
 
 #if HAS_SPEECH_AUDIO
     if (!g_speech_mel_filterbank) {
-        ESP_LOGE(TAG, "Speech-Commands-Mel-Filterbank fehlt im Modell-Export.");
+        ESP_LOGE(TAG, "Speech Commands Mel filter bank is missing from the model export.");
         return;
     }
     init_speech_frontend();
-    ESP_LOGI(TAG, "Speech-Commands-Frontend initialisiert (16 kHz, FFT=%d, Mel=%d, Features=%dx%d).",
+    ESP_LOGI(TAG, "Speech Commands frontend initialized (16 kHz, FFT=%d, Mel=%d, Features=%dx%d).",
              SPEECH_NFFT, SPEECH_MELS, KWS_FEATURES, KWS_TOKENS);
 #endif
 
@@ -2288,23 +2287,23 @@ extern "C" void app_main(void)
                     if (d < 0 ? -d : d > max_delta) max_delta = d < 0 ? -d : d;
                 }
             }
-            ESP_LOGI(TAG, "Selbsttest dichter Referenzpfad (%d Samples): %d Vorhersagen abweichend, "
-                         "%d Spike-Zahlen abweichend (max %d Spikes)",
+            ESP_LOGI(TAG, "Dense reference path self-test (%d samples): %d predictions differ, "
+                         "%d spike counts differ (max %d spikes)",
                      n_check, mism_pred, mism_spk, max_delta);
         } else {
-            ESP_LOGE(TAG, "Dichter Referenzpfad konnte nicht alloziert werden!");
+            ESP_LOGE(TAG, "Failed to allocate dense reference path!");
         }
 #endif
 
-    ESP_LOGI(TAG, "Anzahl Test-Samples: %d", MNIST_TEST_SUBSET);
-    ESP_LOGI(TAG, "Trigger-Pin GPIO %d (mit Joulescope IN1 verbunden) bereit.\n", TRIGGER_GPIO);
+    ESP_LOGI(TAG, "Number of test samples: %d", MNIST_TEST_SUBSET);
+    ESP_LOGI(TAG, "Trigger GPIO %d (connected to Joulescope IN1) is ready.\n", TRIGGER_GPIO);
 
     while (1) {
-        ESP_LOGI(TAG, "Warte 2 Sekunden vor Start des Inferenz-Messzyklus...");
+        ESP_LOGI(TAG, "Waiting 2 seconds before starting the inference measurement cycle...");
         vTaskDelay(pdMS_TO_TICKS(2000));
 
-        // GPIO-Start-Muster: 3x HIGH(200ms) mit LOW(100ms) dazwischen -> Messung(HIGH)
-        // Drei Impulse unterscheiden sich klar vom Ende-Muster (2 Impulse) und von Rauschen.
+        // GPIO start pattern: 3x HIGH (200 ms), separated by LOW (100 ms) -> measurement (HIGH)
+        // Three pulses clearly distinguish it from the 2-pulse end pattern and noise.
         gpio_set_level(TRIGGER_GPIO, 1);
         vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(TRIGGER_GPIO, 0);
@@ -2317,11 +2316,11 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(TRIGGER_GPIO, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
-        ESP_LOGI(TAG, "Start-Muster (3 Impulse) gesendet, warte 1 Sekunde vor Inferenz...");
+        ESP_LOGI(TAG, "Start pattern (3 pulses) sent; waiting 1 second before inference...");
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        // Start der Messung: Trigger-Pin auf HIGH
-        ESP_LOGI(TAG, ">>> START: Setze GPIO %d auf HIGH (Inferenz laeuft) <<<", TRIGGER_GPIO);
+        // Start measurement by setting the trigger pin HIGH
+        ESP_LOGI(TAG, ">>> START: Set GPIO %d HIGH (inference running) <<<", TRIGGER_GPIO);
         gpio_set_level(TRIGGER_GPIO, 1);
 
         int64_t start_time = esp_timer_get_time();
@@ -2335,8 +2334,8 @@ extern "C" void app_main(void)
 
         for (int i = 0; i < MNIST_TEST_SUBSET; ++i) {
 #if HAS_SPEECH_AUDIO
-            // PCM bleibt im Flash; Mel-Spektrogramm wird je Sample innerhalb
-            // des Trigger-Fensters auf dem ESP32 berechnet und mitgemessen.
+            // PCM remains in flash; the Mel spectrogram is computed for each sample
+            // on the ESP32 during the trigger window and included in the measurement.
             speech_audio_to_mel(speech_test_audio[i], s_speech_features);
             const float *model_input = s_speech_features;
 #else
@@ -2373,8 +2372,8 @@ extern "C" void app_main(void)
 
         int64_t end_time = esp_timer_get_time();
 
-        // Ende-Muster: LOW(100ms) -> HIGH(200ms) -> LOW(100ms) -> HIGH(200ms) -> LOW(500ms)
-        // Zwei Impulse unterscheiden sich klar vom Start-Muster (3 Impulse).
+        // End pattern: LOW (100 ms) -> HIGH (200 ms) -> LOW (100 ms) -> HIGH (200 ms) -> LOW (500 ms)
+        // Two pulses clearly distinguish it from the 3-pulse start pattern.
         gpio_set_level(TRIGGER_GPIO, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
         gpio_set_level(TRIGGER_GPIO, 1);
@@ -2385,7 +2384,7 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(TRIGGER_GPIO, 0);
         vTaskDelay(pdMS_TO_TICKS(500));
-        ESP_LOGI(TAG, ">>> ENDE: Ende-Muster (2 Impulse) gesendet (Inferenz beendet) <<<", TRIGGER_GPIO);
+        ESP_LOGI(TAG, ">>> END: End pattern (2 pulses) sent (inference complete) <<<", TRIGGER_GPIO);
 
         int64_t elapsed_us = end_time - start_time;
 #if SNN_PROFILE
@@ -2398,38 +2397,38 @@ extern "C" void app_main(void)
         float time_per_inf_ms = elapsed_ms / (float)MNIST_TEST_SUBSET;
         float accuracy_pct = (100.0f * (float)correct_count) / (float)MNIST_TEST_SUBSET;
 
-        ESP_LOGI(TAG, "Inferenz-Messung abgeschlossen:");
-        ESP_LOGI(TAG, "  - Modell:             %s (%s)", g_model_name, model_type_name);
-        ESP_LOGI(TAG, "  - Samples evaluiert:  %d", MNIST_TEST_SUBSET);
-        ESP_LOGI(TAG, "  - Korrekte Samples:   %d / %d", correct_count, MNIST_TEST_SUBSET);
-        ESP_LOGI(TAG, "  - Test-Genauigkeit:   %.2f %%", accuracy_pct);
-        ESP_LOGI(TAG, "  - Gesamtdauer:        %.3f ms", elapsed_ms);
-        ESP_LOGI(TAG, "  - Zeit pro Inferenz:  %.3f ms (%.1f Infs/s)",
+        ESP_LOGI(TAG, "Inference measurement complete:");
+        ESP_LOGI(TAG, "  - Model:              %s (%s)", g_model_name, model_type_name);
+        ESP_LOGI(TAG, "  - Samples evaluated: %d", MNIST_TEST_SUBSET);
+        ESP_LOGI(TAG, "  - Correct samples:   %d / %d", correct_count, MNIST_TEST_SUBSET);
+        ESP_LOGI(TAG, "  - Test accuracy:     %.2f %%", accuracy_pct);
+        ESP_LOGI(TAG, "  - Total duration:    %.3f ms", elapsed_ms);
+        ESP_LOGI(TAG, "  - Time per inference:%.3f ms (%.1f Infs/s)",
                  time_per_inf_ms, (time_per_inf_ms > 0) ? (1000.0f / time_per_inf_ms) : 0.0f);
 
         if (g_model_type == MODEL_TYPE_SNN ||
             (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking)) {
             float avg_spk_per_inf = (float)total_all_spikes / (float)MNIST_TEST_SUBSET;
             float avg_synops_per_inf = (float)total_all_synops / (float)MNIST_TEST_SUBSET;
-            ESP_LOGI(TAG, "  - Spikes gesamt:      %" PRIu64 " (Ø %.1f Spikes/Inferenz)",
+            ESP_LOGI(TAG, "  - Total spikes:      %" PRIu64 " (avg %.1f spikes/inference)",
                      total_all_spikes, avg_spk_per_inf);
-            ESP_LOGI(TAG, "  - SynOps gesamt:      %" PRIu64 " (Ø %.1f SynOps/Inferenz)",
+            ESP_LOGI(TAG, "  - Total SynOps:      %" PRIu64 " (avg %.1f SynOps/inference)",
                      total_all_synops, avg_synops_per_inf);
     #if SNN_PROFILE
         {
             uint64_t c = 0, p = 0, f = 0, cs = 0, ce = 0;
             snn_prof_get(&c, &p, &f);
             snn_prof_get_split(&cs, &ce);
-            ESP_LOGI(TAG, "  - Conv gesamt:       %.3f ms (%.1f %%)", (double)c / 1000.0, 100.0 * (double)c / (double)elapsed_us);
-            ESP_LOGI(TAG, "    davon Scatter:     %.3f ms (%.1f %%)", (double)cs / 1000.0, 100.0 * (double)cs / (double)elapsed_us);
-            ESP_LOGI(TAG, "    davon Schwellen:   %.3f ms (%.1f %%)", (double)ce / 1000.0, 100.0 * (double)ce / (double)elapsed_us);
-            ESP_LOGI(TAG, "  - Zeit Pool:          %.3f ms (%.1f %%)", (double)p / 1000.0, 100.0 * (double)p / (double)elapsed_us);
-            ESP_LOGI(TAG, "  - Zeit FC:            %.3f ms (%.1f %%)", (double)f / 1000.0, 100.0 * (double)f / (double)elapsed_us);
+            ESP_LOGI(TAG, "  - Conv total:        %.3f ms (%.1f %%)", (double)c / 1000.0, 100.0 * (double)c / (double)elapsed_us);
+            ESP_LOGI(TAG, "    Scatter:           %.3f ms (%.1f %%)", (double)cs / 1000.0, 100.0 * (double)cs / (double)elapsed_us);
+            ESP_LOGI(TAG, "    Thresholding:      %.3f ms (%.1f %%)", (double)ce / 1000.0, 100.0 * (double)ce / (double)elapsed_us);
+            ESP_LOGI(TAG, "  - Pool time:         %.3f ms (%.1f %%)", (double)p / 1000.0, 100.0 * (double)p / (double)elapsed_us);
+            ESP_LOGI(TAG, "  - FC time:           %.3f ms (%.1f %%)", (double)f / 1000.0, 100.0 * (double)f / (double)elapsed_us);
             uint64_t nev = 0, nmac = 0;
             snn_prof_get_counts(&nev, &nmac);
-            ESP_LOGI(TAG, "  - Events/MACs je Inf: %.1f / %.0f", (double)nev / MNIST_TEST_SUBSET, (double)nmac / MNIST_TEST_SUBSET);
+            ESP_LOGI(TAG, "  - Events/MACs per inf: %.1f / %.0f", (double)nev / MNIST_TEST_SUBSET, (double)nmac / MNIST_TEST_SUBSET);
             if (elapsed_us > 0) {
-                ESP_LOGI(TAG, "  - Takt (mcycle):      %.1f MHz",
+                ESP_LOGI(TAG, "  - Clock (mcycle):    %.1f MHz",
                          (double)s_cycle_delta * 1e6 / (double)elapsed_us / 1e6);
             }
         }

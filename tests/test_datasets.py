@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit-Tests und Validierung für den Datensatz-Hub und die Trainings-/Export-Pipeline.
+Unit tests and validation for the dataset hub and training/export pipeline.
 """
 
 import sys

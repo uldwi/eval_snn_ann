@@ -14,8 +14,8 @@ def transfer_ann_to_snn(
     snn_model: ConfigurableSpikingJellySNN,
 ) -> bool:
     """
-    Übertragt die Gewichte eines ANN auf ein SNN mit identischer Architektur.
-    Die Conv- und FC-Gewichte sowie Bias-Werte werden kopiert.
+    Transfer weights from an ANN to an SNN with the same architecture.
+    Copy convolutional and fully connected weights and biases.
     """
     try:
         # Conv Layers: ANN conv_modules[i][0] -> SNN conv_layers_list[i]
@@ -28,7 +28,7 @@ def transfer_ann_to_snn(
                     if ann_conv.bias is not None and snn_conv.bias is not None:
                         snn_conv.bias.data.copy_(ann_conv.bias.data)
                 else:
-                    print(f"[Transfer] Warnung: Conv-Layer {i} Form unvereinbar: ANN {ann_conv.weight.shape} vs SNN {snn_conv.weight.shape}")
+                    print(f"[Transfer] Warning: incompatible Conv layer {i} shapes: ANN {ann_conv.weight.shape} vs SNN {snn_conv.weight.shape}")
                     return False
 
         # FC Layers: ANN fc_layers[i] -> SNN fcs[i]
@@ -40,13 +40,13 @@ def transfer_ann_to_snn(
                 if ann_fc.bias is not None and snn_fc.bias is not None:
                     snn_fc.bias.data.copy_(ann_fc.bias.data)
             else:
-                print(f"[Transfer] Warnung: FC-Layer {i} Form unvereinbar: ANN {ann_fc.weight.shape} vs SNN {snn_fc.weight.shape}")
+                print(f"[Transfer] Warning: incompatible FC layer {i} shapes: ANN {ann_fc.weight.shape} vs SNN {snn_fc.weight.shape}")
                 return False
 
-        print("[Transfer] Alle Gewichte erfolgreich von ANN auf SNN übertragen.")
+        print("[Transfer] Successfully transferred all weights from ANN to SNN.")
         return True
     except Exception as e:
-        print(f"[Transfer] Fehler: {e}")
+        print(f"[Transfer] Error: {e}")
         return False
 
 def build_model_from_config(
@@ -55,7 +55,7 @@ def build_model_from_config(
     device: str = "cpu",
 ) -> Union[ConfigurableANN, ConfigurableSpikingJellySNN]:
     """
-    Erzeugt ein ConfigurableANN- oder ConfigurableSpikingJellySNN-Modell anhand der Konfiguration.
+    Build a ConfigurableANN or ConfigurableSpikingJellySNN from its configuration.
     """
     model_cfg = config.get("model", {})
     model_type = str(model_cfg.get("type", config.get("type", "ann"))).lower()

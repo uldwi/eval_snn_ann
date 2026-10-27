@@ -15,8 +15,8 @@ from .models.snn import functional, sj_layer
 
 def get_model_optimization_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Extrahiert und normalisiert die Optimierungskonfiguration für ein Modell.
-    Kombiniert globale 'optimization'-Einstellungen mit modellindividuellen Einstellungen.
+    Extract and normalize a model optimization configuration.
+    Combine global optimization settings with model-specific settings.
     """
     model_cfg = config.get("model", {})
     global_opt = config.get("optimization", {})
@@ -33,7 +33,7 @@ def get_model_optimization_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "clustering": copy.deepcopy(global_opt.get("clustering", {})),
     }
 
-    # Modell-spezifische Übersteuerungen
+    # Model-specific overrides
     if "pruning" in model_opt:
         if isinstance(model_opt["pruning"], dict):
             merged["pruning"].update(model_opt["pruning"])
@@ -65,7 +65,7 @@ def get_model_optimization_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def compute_model_sparsity(model: nn.Module) -> Dict[str, Any]:
     """
-    Berechnet detaillierte Sparsity-Metriken (Nullstellen in Gewichten) für alle Schichten.
+    Compute detailed sparsity metrics (zero weights) for all layers.
     """
     total_weights = 0
     zero_weights = 0
@@ -103,7 +103,7 @@ def evaluate_model(
     device: str = "cpu",
 ) -> Tuple[float, float]:
     """
-    Evaluiert ein Modell auf dem gesamten Testdatensatz und gibt (test_acc, test_loss) zurück.
+    Evaluate a model on the full test dataset and return (test_acc, test_loss).
     """
     model.eval()
     loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
@@ -134,8 +134,8 @@ def apply_pruning(
     device: str = "cpu",
 ) -> Dict[str, Any]:
     """
-    Wendet Post-Training Pruning (L1-/Magnitude-Unstructured, Structured, Random oder Threshold)
-    auf Schichten (Conv und/oder FC) eines Modells an.
+    Apply post-training pruning (L1/magnitude unstructured, structured, random, or threshold)
+    to model layers (convolutional and/or fully connected).
     """
     enabled = bool(prune_cfg.get("enabled", True))
     if not enabled:
@@ -221,7 +221,7 @@ def apply_quantization(
     device: str = "cpu",
 ) -> Dict[str, Any]:
     """
-    Wendet Post-Training Quantisierung (INT8, INT4, FP16) auf die Gewichte an.
+    Apply post-training quantization (INT8, INT4, FP16) to weights.
     """
     enabled = bool(quant_cfg.get("enabled", True))
     if not enabled:
@@ -320,7 +320,7 @@ def apply_weight_clustering(
     cluster_cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Clustert Modellgewichte in k diskrete Centroids (Weight-Sharing / Codebook).
+    Cluster model weights into k discrete centroids (weight sharing/codebook).
     """
     enabled = bool(cluster_cfg.get("enabled", True))
     if not enabled:
@@ -359,8 +359,8 @@ def optimize_model(
     device: str = "cpu",
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], Dict[str, Any]]:
     """
-    Führt konfigurierte Post-Training-Optimierungen (Pruning, Quantisierung, Weight Clustering)
-    auf einem trainierten ANN- oder SNN-Modell durch und misst die resultierende Sparsity & Genauigkeit.
+    Apply configured post-training optimizations (pruning, quantization, and weight clustering)
+    to a trained ANN or SNN and measure the resulting sparsity and accuracy.
     """
     opt_cfg = get_model_optimization_config(config)
     prune_cfg = opt_cfg.get("pruning", {})
@@ -374,7 +374,7 @@ def optimize_model(
     if not (prune_enabled or quant_enabled or clust_enabled):
         return model, {"applied": False}
 
-    model_name = str(config.get("name", config.get("model", {}).get("name", "Modell")))
+    model_name = str(config.get("name", config.get("model", {}).get("name", "model")))
     model_type = str(config.get("type", config.get("model", {}).get("type", "ann"))).upper()
 
     pre_acc, pre_loss = (0.0, 0.0)
@@ -403,7 +403,7 @@ def optimize_model(
 
     acc_diff = post_acc - pre_acc
 
-    # Schätzung des Kompressionsfaktors
+    # Estimate the compression ratio
     bits_per_param = 32.0
     if quant_enabled:
         qtype = str(quant_cfg.get("type", "int8")).lower()
@@ -419,17 +419,17 @@ def optimize_model(
     compression_ratio = 32.0 / bits_per_param
 
     print("\n" + "=" * 65)
-    print(f">>> [Post-Training Optimierung] Modell: '{model_name}' ({model_type}) <<<")
-    print(f"  - Vor Optimierung:     Genauigkeit: {pre_acc:.2f}%, Verlust: {pre_loss:.4f}")
+    print(f">>> [Post-training optimization] Model: '{model_name}' ({model_type}) <<<")
+    print(f"  - Before optimization: Accuracy: {pre_acc:.2f}%, loss: {pre_loss:.4f}")
     if prune_enabled:
-        print(f"  - Pruning:             {prune_res.get('method', 'l1')} (Ziel: {prune_res.get('amount')}) -> {len(prune_res.get('pruned_modules', []))} Schichten")
+        print(f"  - Pruning:             {prune_res.get('method', 'l1')} (target: {prune_res.get('amount')}) -> {len(prune_res.get('pruned_modules', []))} layers")
     if clust_enabled:
-        print(f"  - Weight Clustering:   {clust_res.get('num_clusters')} Centroids -> {len(clust_res.get('clustered_modules', []))} Schichten")
+        print(f"  - Weight clustering:   {clust_res.get('num_clusters')} centroids -> {len(clust_res.get('clustered_modules', []))} layers")
     if quant_enabled:
-        print(f"  - Quantisierung:       {quant_res.get('type', 'int8').upper()} ({quant_res.get('mode', 'symmetric')}) -> {len(quant_res.get('quantized_modules', []))} Schichten")
-    print(f"  - Nach Optimierung:    Genauigkeit: {post_acc:.2f}% (Delta: {acc_diff:+.2f}%), Verlust: {post_loss:.4f}")
-    print(f"  - Modell-Sparsity:     {post_sparsity['sparsity_pct']:.2f}% Nullen ({post_sparsity['zero_weights']:,} von {post_sparsity['total_weights']:,} Gewichten)")
-    print(f"  - Geschätzte Kompr.:   ca. {compression_ratio:.1f}x Speicherreduktion")
+        print(f"  - Quantization:        {quant_res.get('type', 'int8').upper()} ({quant_res.get('mode', 'symmetric')}) -> {len(quant_res.get('quantized_modules', []))} layers")
+    print(f"  - After optimization:  Accuracy: {post_acc:.2f}% (delta: {acc_diff:+.2f}%), loss: {post_loss:.4f}")
+    print(f"  - Model sparsity:      {post_sparsity['sparsity_pct']:.2f}% zeros ({post_sparsity['zero_weights']:,} of {post_sparsity['total_weights']:,} weights)")
+    print(f"  - Estimated compression: about {compression_ratio:.1f}x memory reduction")
     print("=" * 65 + "\n")
 
     summary = {

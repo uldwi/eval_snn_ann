@@ -1,20 +1,20 @@
 #!/bin/bash
-# set_target.sh - Wechselt den ESP32-Mikrocontroller-Target und baut das Projekt neu
+# set_target.sh - Select an ESP32 target and rebuild the project
 #
-# Verwendung:
-#   ./set_target.sh esp32c6    # Wechselt zu ESP32-C6
-#   ./set_target.sh esp32s3    # Wechselt zu ESP32-S3
-#   ./set_target.sh            # Zeigt aktuellen Target und Hilfe an
+# Usage:
+#   ./set_target.sh esp32c6    # Select ESP32-C6
+#   ./set_target.sh esp32s3    # Select ESP32-S3
+#   ./set_target.sh            # Show the current target and help
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Verfügbare Targets
+# Supported targets
 VALID_TARGETS=("esp32c6" "esp32s3")
 
-# Lese den aktuellen Target aus der config.yaml
+# Read the current target from config.yaml
 get_config_target() {
     python3 -c "
 import yaml
@@ -24,7 +24,7 @@ print(config.get('microcontroller', {}).get('target', 'esp32c6'))
 " 2>/dev/null || echo "esp32c6"
 }
 
-# Setze den Target in der config.yaml
+# Update the target in config.yaml
 set_config_target() {
     local target="$1"
     python3 -c "
@@ -37,7 +37,7 @@ with open('config.yaml', 'w') as f:
 "
 }
 
-# Hole Board-Info aus config.yaml
+# Read board details from config.yaml
 get_board_info() {
     local target="$1"
     python3 -c "
@@ -54,12 +54,12 @@ print(board.get('trigger_gpio', '?'))
 " 2>/dev/null
 }
 
-# Zeige Hilfe
+# Display help
 show_help() {
     echo ""
-    echo "Verwendung: ./set_target.sh <target>"
+    echo "Usage: ./set_target.sh <target>"
     echo ""
-    echo "Verfügbare Targets:"
+    echo "Supported targets:"
     for t in "${VALID_TARGETS[@]}"; do
         info=$(get_board_info "$t")
         name=$(echo "$info" | sed -n '1p')
@@ -69,14 +69,14 @@ show_help() {
         echo "  $t  -  $name ($board, $arch, ${freq} MHz)"
     done
     echo ""
-    echo "Aktueller Target in config.yaml: $(get_config_target)"
+    echo "Current target in config.yaml: $(get_config_target)"
     echo ""
-    echo "Beispiel:"
-    echo "  ./set_target.sh esp32s3    # Wechselt zu ESP32-S3"
+    echo "Example:"
+    echo "  ./set_target.sh esp32s3    # Select ESP32-S3"
     echo ""
 }
 
-# Prüfe Argumente
+# Check arguments
 if [ $# -eq 0 ]; then
     show_help
     exit 0
@@ -84,14 +84,14 @@ fi
 
 TARGET="$1"
 
-# Prüfe, ob Target gültig ist
+# Check that the target is valid
 if ! printf "%s\n" "${VALID_TARGETS[@]}" | grep -qw "$TARGET"; then
-    echo "Fehler: Unbekanntes Target '$TARGET'"
-    echo "Verfügbare Targets: ${VALID_TARGETS[*]}"
+    echo "Error: Unknown target '$TARGET'"
+    echo "Supported targets: ${VALID_TARGETS[*]}"
     exit 1
 fi
 
-# Hole Board-Info
+# Read board details
 info=$(get_board_info "$TARGET")
 name=$(echo "$info" | sed -n '1p')
 board=$(echo "$info" | sed -n '2p')
@@ -101,43 +101,43 @@ gpio=$(echo "$info" | sed -n '5p')
 
 echo ""
 echo "================================================================"
-echo "  Mikrocontroller-Target wechseln"
+echo "  Select microcontroller target"
 echo "================================================================"
 echo ""
 echo "  Target:      $TARGET"
 echo "  Board:       $name ($board)"
-echo "  Architektur: $arch (${freq} MHz)"
+echo "  Architecture: $arch (${freq} MHz)"
 echo "  Trigger-GPIO: $gpio"
 echo ""
 
-# 1. config.yaml aktualisieren
-echo "[1/4] Aktualisiere config.yaml..."
+# 1. Update config.yaml
+echo "[1/4] Updating config.yaml..."
 set_config_target "$TARGET"
 echo "       config.yaml: microcontroller.target = $TARGET"
 
-# 2. CMake-Cache löschen
-echo "[2/4] Lösche CMake-Cache (build/)..."
+# 2. Clear the CMake cache
+echo "[2/4] Removing CMake cache (build/)..."
 if [ -d "build" ]; then
     rm -rf build
-    echo "       build/ gelöscht"
+    echo "       build/ removed"
 else
-    echo "       build/ existiert nicht (sauberer Start)"
+    echo "       build/ does not exist (clean start)"
 fi
 
-# 3. ESP-IDF Target setzen
-echo "[3/4] Setze ESP-IDF Target auf $TARGET..."
+# 3. Set the ESP-IDF target
+echo "[3/4] Setting ESP-IDF target to $TARGET..."
 . "$HOME/esp/esp-idf/export.sh" 2>/dev/null
 idf.py set-target "$TARGET"
 
-# 4. Projekt bauen
-echo "[4/4] Baue Projekt..."
+# 4. Build the project
+echo "[4/4] Building project..."
 idf.py build
 
 echo ""
 echo "================================================================"
-echo "  Fertig! Target ist jetzt: $TARGET ($name)"
+echo "  Done! Current target: $TARGET ($name)"
 echo "================================================================"
 echo ""
-echo "Zum Flashen auf das Board:"
+echo "To flash the board:"
 echo "  idf.py flash monitor"
 echo ""

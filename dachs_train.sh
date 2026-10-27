@@ -19,13 +19,13 @@ python3 -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --inde
 
 python3 -m pip install -r $HOME/code/eval_snn_ann/requirements.txt
 
-# Datenverzeichnis von $HOME nach $TMPDIR rsyncen.
-# WICHTIG: Vorher sollte auf dem Login-Node einmal
-#   sbatch dachs_setup.sh (oder manuell python run) ausgeführt werden,
-#   damit die Daten in $HOME/code/eval_snn_ann/data/ liegen.
+# Copy the dataset directory from $HOME to $TMPDIR.
+# IMPORTANT: Run dachs_setup.sh on the login node first
+# (or run the dataset loader manually) so data is present in $HOME.
+
 rsync -avz $HOME/code/eval_snn_ann/data/ $TMPDIR/data/
 
-# Training: Konfiguration nutzen, Evaluation überspringen (kein Joulescope/ESP32)
+# Train from the configuration and skip evaluation (no Joulescope/ESP32 on the cluster).
 python3 $HOME/code/eval_snn_ann/train_mnist.py \
     --config $HOME/code/eval_snn_ann/config.yaml \
     --save-dir $HOME/code/eval_snn_ann/saved_models \

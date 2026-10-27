@@ -8,8 +8,8 @@ from ..config import compute_conv_layer_dims, parse_conv_layers, parse_hidden_la
 
 class ConfigurableANN(nn.Module):
     """
-    Flexibles Neural Network (MLP oder CNN), dessen Faltungs- und Fully-Connected-Schichten,
-    Eingangs-/Ausgangsgrößen und Aktivierungsfunktionen konfigurierbar sind.
+    Flexible neural network (MLP or CNN) with configurable convolutional and fully connected
+    layers, input/output sizes, and activation functions.
     """
     def __init__(
         self,
@@ -99,7 +99,7 @@ class ConfigurableANN(nn.Module):
                 elif self.activation_name in ("none", "linear", "identity"):
                     pass
                 else:
-                    raise ValueError(f"Nicht unterstützte Aktivierungsfunktion: {self.activation_name}")
+                    raise ValueError(f"Unsupported activation function: {self.activation_name}")
                 if self.dropouts is not None:
                     out = self.dropouts[i](out)
         return out
@@ -118,18 +118,18 @@ class ConfigurableANN(nn.Module):
             parts.append(str(h))
         parts.append(str(self.output_size))
 
-        act_str = f" mit {self.activation_name.upper()}" if (self.hidden_layers or self.has_conv) else ""
+        act_str = f" with {self.activation_name.upper()}" if (self.hidden_layers or self.has_conv) else ""
         return f"ANN [{' -> '.join(parts)}]{act_str}"
 
 class CompactTransformerANN(nn.Module):
-    """Kleiner Transformer für 16x16-Mel-Spektrogramme (Zeitfenster als Tokens)."""
+    """Compact Transformer for 16x16 Mel spectrograms (time frames as tokens)."""
     def __init__(self, input_size: int, output_size: int, in_channels: int,
                  in_height: int, in_width: int, embed_dim: int = 32,
                  num_heads: int = 4, num_layers: int = 2,
                  feedforward_dim: int = 64, dropout_rate: float = 0.1):
         super().__init__()
         if embed_dim % num_heads:
-            raise ValueError("transformer.embed_dim muss durch num_heads teilbar sein")
+            raise ValueError("transformer.embed_dim must be divisible by num_heads")
         self.input_size = int(input_size)
         self.in_channels = int(in_channels)
         self.in_height = int(in_height)
@@ -164,14 +164,14 @@ class CompactTransformerANN(nn.Module):
         if x.dim() == 4:
             x = x.mean(dim=1)
         if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
-            raise ValueError(f"Transformer erwartet (Batch, {self.in_height}, {self.in_width}), erhalten: {tuple(x.shape)}")
-        # Mel-Spektrogramm: Achse 0 = Frequenzbänder, Achse 1 = Zeitfenster.
+            raise ValueError(f"Transformer expected (batch, {self.in_height}, {self.in_width}), got: {tuple(x.shape)}")
+        # Mel spectrogram: axis 0 contains frequency bands; axis 1 contains time frames.
         tokens = self.input_projection(x.transpose(1, 2)) + self.position_embedding
         encoded = self.encoder(tokens)
         pooled = self.norm(encoded.mean(dim=1))
         return self.classifier(pooled)
 
     def get_structure_summary(self) -> str:
-        return (f"ANN CompactTransformer [{self.in_width} Zeit-Tokens -> "
+        return (f"ANN CompactTransformer [{self.in_width} time tokens -> "
                 f"{self.input_projection.out_features} Embedding -> "
-                f"{len(self.encoder.layers)} Encoder-Blöcke -> {self.output_size}]")
+                f"{len(self.encoder.layers)} encoder blocks -> {self.output_size}]")

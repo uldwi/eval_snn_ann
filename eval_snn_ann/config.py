@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
         "epochs": 5,
         "batch_size": 64,
         "learning_rate": 0.001,
-        # Optimierer: "adam", "sgd", "adamw", "adagrad", "rmsprop" (pro Modell konfigurierbar)
+        # Optimizers: "adam", "sgd", "adamw", "adagrad", "rmsprop" (configurable per model)
         "optimizer": "adam",
         "early_stopping": False,
         "patience": 3,
@@ -95,7 +95,7 @@ DEFAULT_CONFIG = {
 
 def load_config(config_path: Union[str, Path] = None) -> Dict[str, Any]:
     """
-    Lädt eine Konfigurationsdatei (YAML oder JSON).
+    Load a YAML or JSON configuration file.
     """
     if config_path is None:
         candidates = ["config.yaml", "config.yml", "config.json"]
@@ -107,12 +107,12 @@ def load_config(config_path: Union[str, Path] = None) -> Dict[str, Any]:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
 
     if config_path and os.path.isfile(config_path):
-        print(f"[Config] Lade Konfiguration aus '{config_path}'...")
+        print(f"[Config] Loading configuration from '{config_path}'...")
         path_str = str(config_path)
         with open(path_str, "r", encoding="utf-8") as f:
             if path_str.endswith((".yaml", ".yml")):
                 if not HAS_YAML:
-                    raise ImportError("PyYAML ist nicht installiert. Bitte 'pip install pyyaml' ausführen.")
+                    raise ImportError("PyYAML is not installed. Install it with 'pip install pyyaml'.")
                 loaded = yaml.safe_load(f)
             else:
                 loaded = json.load(f)
@@ -125,15 +125,15 @@ def load_config(config_path: Union[str, Path] = None) -> Dict[str, Any]:
                     cfg[section] = values
     else:
         if config_path:
-            print(f"[Config] Hinweis: Konfigurationsdatei '{config_path}' nicht gefunden. Verwende Standardwerte.")
+            print(f"[Config] Configuration file '{config_path}' not found; using defaults.")
         else:
-            print("[Config] Keine Konfigurationsdatei angegeben. Verwende Standardwerte.")
+            print("[Config] No configuration file specified; using defaults.")
 
     return cfg
 
 def parse_hidden_layers(val: Any) -> List[int]:
     """
-    Parst und normalisiert die Konfiguration der verborgenen Schichten flexibel.
+    Parse and normalize hidden-layer configuration in multiple formats.
     """
     if val is None:
         return []
@@ -168,8 +168,8 @@ def parse_hidden_layers(val: Any) -> List[int]:
 
 def parse_conv_layers(val: Any) -> List[Dict[str, Any]]:
     """
-    Parst und normalisiert die Konfiguration der Convolutional Layers flexibel.
-    Unterstützt verschiedene Formate wie:
+    Parse and normalize convolutional-layer configuration in multiple formats.
+    Supported formats include:
       - [{'out_channels': 8, 'kernel_size': 3, 'stride': 1, 'padding': 1, 'pool_size': 2}]
       - [{'channels': 8, 'kernel': 3, 'pool': 2}]
       - [[8, 3, 1, 1, 2]] (out_channels, kernel_size, stride, padding, pool_size)
@@ -268,7 +268,7 @@ def parse_conv_layers(val: Any) -> List[Dict[str, Any]]:
 
 def compute_conv_layer_dims(conv_layers: List[Dict[str, Any]], in_c: int = 1, in_h: int = 28, in_w: int = 28) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Berechnet die Ein- und Ausgangsdimensionen für jeden Convolutional Layer und den resultierenden Flat-Tensor.
+    Compute input/output dimensions for each convolutional layer and the resulting flattened tensor.
     """
     cur_c, cur_h, cur_w = in_c, in_h, in_w
     resolved_layers = []

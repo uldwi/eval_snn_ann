@@ -7,109 +7,109 @@ from .workflow import train_and_export
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Neuronale Netze (ANN & SNN) Training, Datensatzauswahl, Post-Training-Optimierung & TFLite/C-Export")
+    parser = argparse.ArgumentParser(description="Train ANN/SNN models, select datasets, optimize models, and export to TFLite/C")
     parser.add_argument(
         "-c", "--config",
         type=str,
         default="config.yaml",
-        help="Pfad zur YAML- oder JSON-Konfigurationsdatei (Standard: 'config.yaml')",
+        help="Path to a YAML or JSON configuration file (default: config.yaml)",
     )
     parser.add_argument(
         "-d", "--dataset",
         type=str,
         default=None,
-        help="Wählt den Datensatz (z.B. 'mnist', 'fashion_mnist', 'cifar10', 'speech_commands', 'physionet_eeg_mi'/'eeg_mi', 'har_time_series', 'eeg_data', 'ecg_data', 'synthetic_time_series')",
+        help="Select a dataset (e.g. mnist, fashion_mnist, cifar10, speech_commands, physionet_eeg_mi, har_time_series, eeg_data, ecg_data)",
     )
     parser.add_argument(
         "--list-datasets",
         action="store_true",
-        help="Zeigt alle verfügbaren Datensätze und Domänen in einer Tabelle an",
+        help="List available datasets and domains",
     )
     parser.add_argument(
         "-e", "--epochs",
         type=int,
         default=None,
-        help="Überschreibt die Anzahl der Trainingsepochen",
+        help="Override the number of training epochs",
     )
     parser.add_argument(
         "-b", "--batch-size",
         type=int,
         default=None,
-        help="Überschreibt die Batch-Größe für das Training",
+        help="Override the training batch size",
     )
     parser.add_argument(
         "--lr", "--learning-rate",
         type=float,
         default=None,
         dest="learning_rate",
-        help="Überschreibt die Lernrate für das Training",
+        help="Override the training learning rate",
     )
     parser.add_argument(
         "--early-stopping",
         action="store_true",
         default=None,
-        help="Aktiviert Early Stopping für das Training",
+        help="Enable early stopping",
     )
     parser.add_argument(
         "--no-early-stopping",
         action="store_false",
         dest="early_stopping",
-        help="Deaktiviert Early Stopping für das Training",
+        help="Disable early stopping",
     )
     parser.add_argument(
         "--patience",
         type=int,
         default=None,
-        help="Anzahl an Epochen ohne Verbesserung vor vorzeitigem Abbruch",
+        help="Number of epochs without improvement before stopping",
     )
     parser.add_argument(
         "--min-delta",
         type=float,
         default=None,
-        help="Mindestverbesserung der Metrik für Early Stopping",
+        help="Minimum metric improvement required for early stopping",
     )
     parser.add_argument(
         "--monitor",
         type=str,
         default=None,
         choices=["test_acc", "test_loss"],
-        help="Zu überwachende Metrik: 'test_acc' (Standard) oder 'test_loss'",
+        help="Metric to monitor: test_acc (default) or test_loss",
     )
     parser.add_argument(
         "-n", "--test-samples",
         type=int,
         default=None,
         dest="test_samples",
-        help="Überschreibt die Anzahl der zu exportierenden Test-Samples",
+        help="Override the number of test samples to export",
     )
     parser.add_argument(
         "--force-train", "--force-retrain",
         dest="force_retrain",
         action="store_true",
         default=False,
-        help="Erzwingt ein erneutes Training aller Modelle, auch wenn gespeicherte Checkpoints unverändert vorliegen",
+        help="Retrain all models even when matching checkpoints exist",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
         default=None,
-        help="Verzeichnis zum automatischen Speichern und Laden trainierter Modell-Checkpoints (Standard: './saved_models')",
+        help="Directory for saving and loading model checkpoints (default: ./saved_models)",
     )
 
-    # Post-Training Optimierungs-Optionen
+    # Post-training optimization options
     parser.add_argument(
         "--prune", "--prune-amount",
         type=float,
         default=None,
         dest="prune_amount",
-        help="Aktiviert Post-Training Pruning und setzt den Zielanteil entfernter Gewichte (z. B. 0.3 für 30%% Sparsity)",
+        help="Enable post-training pruning and set the target fraction of removed weights (e.g. 0.3 for 30%% sparsity)",
     )
     parser.add_argument(
         "--prune-method",
         type=str,
         default=None,
         choices=["l1_unstructured", "random_unstructured", "structured", "threshold"],
-        help="Pruning-Methode: 'l1_unstructured' (Standard), 'random_unstructured', 'structured' oder 'threshold'",
+        help="Pruning method: l1_unstructured (default), random_unstructured, structured, or threshold",
     )
     parser.add_argument(
         "--quantize", "--quantize-type",
@@ -117,32 +117,32 @@ def main() -> None:
         default=None,
         dest="quantize_type",
         choices=["int8", "int4", "fp16", "dynamic"],
-        help="Aktiviert Post-Training Quantisierung der Gewichte ('int8', 'int4', 'fp16', 'dynamic')",
+        help="Enable post-training weight quantization (int8, int4, fp16, or dynamic)",
     )
     parser.add_argument(
         "--clustering", "--num-clusters",
         type=int,
         default=None,
         dest="num_clusters",
-        help="Aktiviert Weight-Clustering mit k Centroids (z. B. 16 für 4-Bit Codebook)",
+        help="Enable weight clustering with k centroids (e.g. 16 for a 4-bit codebook)",
     )
     parser.add_argument(
         "--fine-tune-epochs",
         type=int,
         default=None,
-        help="Anzahl an Fine-Tuning Epochen nach dem Pruning zur Genauigkeitswiederherstellung",
+        help="Number of fine-tuning epochs after pruning to recover accuracy",
     )
     parser.add_argument(
         "--device",
         type=str,
         default=None,
-        help="Gerät für das Training ('cpu', 'cuda' oder 'mps', Standard: 'cpu'). Auf DACHS GPU-Cluster wird 'cuda' verwendet.",
+        help="Training device (cpu, cuda, or mps; default: cpu). Use cuda on DACHS GPU nodes.",
     )
     parser.add_argument(
         "--skip-evaluation",
         action="store_true",
         default=False,
-        help="Host-Evaluation und TFLite-Export nach dem Training überspringen (z. B. ohne Joulescope/ESP32 auf DACHS).",
+        help="Skip host evaluation and TFLite export after training (e.g. when no ESP32/Joulescope is available).",
     )
 
     args = parser.parse_args()

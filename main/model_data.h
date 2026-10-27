@@ -77,7 +77,7 @@ extern const char* const g_model_name;
 extern const unsigned char g_model[];
 extern const int g_model_len;
 
-// SNN-Spezifisch (LIF/IF Neuronen Parameter & Gewichte)
+// SNN-specific LIF/IF neuron parameters and weights
 extern const snn_config_t g_snn_config;
 extern const float* const g_snn_conv_weights[];
 extern const float* const g_snn_conv_biases[];

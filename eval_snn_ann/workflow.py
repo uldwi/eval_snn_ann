@@ -14,8 +14,8 @@ from .training import evaluate_subset, train_model
 
 def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Extrahiert alle konfigurierten Modelle aus der Konfiguration.
-    Optional kann nach einem spezifischen Datensatz gefiltert werden.
+    Extract all configured models.
+    Optionally filter the models by dataset.
     """
     models_list = config.get("models")
     resolved_models = []
@@ -26,12 +26,12 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
     global_microcontroller = dict(config.get("microcontroller", {}))
     global_joulescope = dict(config.get("joulescope", {}))
     
-    # Hole die Board-spezifischen Einstellungen für das ausgewählte Target
+    # Get board-specific settings for the selected target
     mcu_target = global_microcontroller.get("target", "esp32c6")
     mcu_boards = global_microcontroller.get("boards", {})
     mcu_board = mcu_boards.get(mcu_target, {})
     if not mcu_board:
-        # Fallback: alter esp32-Block (rückwärtskompatibel)
+        # Fall back to the legacy esp32 block for backward compatibility
         mcu_board = dict(config.get("esp32", {}))
 
     target_ds_filter = normalize_dataset_name(dataset_filter) if dataset_filter else None
@@ -62,7 +62,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 m_ds = m_ds.get("name", global_dataset)
             m_ds = normalize_dataset_name(m_ds)
 
-            # Wenn nach einem Datensatz gefiltert wird und passende Modelle existieren, nur diese wählen
+            # When filtering by dataset, use matching models if any exist
             if target_ds_filter and has_specific_matches and m_ds != target_ds_filter:
                 continue
 
@@ -121,7 +121,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
             else:
                 model_dict["activation"] = str(m.get("activation", config.get("model", {}).get("activation", "relu")))
 
-            # Globale Trainingsparameter als Basis
+            # Start with global training parameters
             model_training = dict(global_training)
             model_training["dataset"] = m_ds
             if isinstance(m.get("training"), dict):
@@ -318,8 +318,8 @@ def train_all_models(
     skip_evaluation: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Trainiert ALLE in der Konfiguration definierten Modelle nacheinander (Batch-Training Phase 1)
-    oder lädt unveränderte Modelle aus dem Checkpoint-Cache und führt ggf. Post-Training Optimierungen durch.
+    Train all models defined in the configuration sequentially (batch training, phase 1)
+    or load unchanged models from the checkpoint cache and apply any configured post-training optimizations.
     """
     if isinstance(config_or_path, dict):
         config = config_or_path
@@ -333,7 +333,7 @@ def train_all_models(
     model_configs = get_model_configs(config, dataset_filter=target_dataset)
     total_models = len(model_configs)
     print(f"\n=================================================================")
-    print(f"=== BATCH-TRAINING: {total_models} Modell(e) konfiguriert ===")
+    print(f"=== BATCH TRAINING: {total_models} model(s) configured ===")
     print(f"=================================================================")
 
     trained_models = []
@@ -403,7 +403,7 @@ def train_all_models(
         bs = m_cfg["training"].get("batch_size", "?")
         lr = m_cfg["training"].get("learning_rate", "?")
         ds = m_cfg.get("dataset", m_cfg["model"].get("dataset", "mnist"))
-        print(f"\n--- [{idx}/{total_models}] Modell ({m_type.upper()} mit {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Datensatz: {ds}, Epochen: {ep}, Batch: {bs}, LR: {lr}] ---")
+        print(f"\n--- [{idx}/{total_models}] Model ({m_type.upper()} with {'SpikingJelly' if m_type == 'snn' else 'PyTorch'}): '{m_cfg['name']}' [Dataset: {ds}, Epochs: {ep}, Batch: {bs}, LR: {lr}] ---")
         model, test_dataset, test_acc, test_loss = train_model(
             m_cfg,
             device=device,
@@ -419,13 +419,13 @@ def train_all_models(
                 num_samples=samples_cnt,
                 device=device,
             )
-            print(f"[Evaluation] Host-Genauigkeit auf ESP32-Testset ({subset_total} Samples): {subset_acc:.2f}% ({subset_correct}/{subset_total} korrekt).")
+            print(f"[Evaluation] Host accuracy on ESP32 test set ({subset_total} samples): {subset_acc:.2f}% ({subset_correct}/{subset_total} correct).")
 
             deployable = bool(getattr(model, "deployable", True))
             is_transformer = bool(getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False))
             tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" and deployable and not is_transformer else b""
 
-            # Parameteranzahl, Sparsity & Modellgröße
+            # Parameter count, sparsity, and model size
             total_params = sum(p.numel() for p in model.parameters())
             sparsity_info = compute_model_sparsity(model)
             model_size_bytes = (total_params * 4) if m_type == "snn" or not tflite_bytes else len(tflite_bytes)
@@ -454,10 +454,10 @@ def train_all_models(
             }
             trained_models.append(trained_entry)
         else:
-            print("[Evaluation] Übersprungen (--skip-evaluation).\n")
+            print("[Evaluation] Skipped (--skip-evaluation).\n")
 
     print("\n=================================================================")
-    print(f"=== BATCH-TRAINING ABGESCHLOSSEN: {len(trained_models)} Modell(e) bereit ===")
+    print(f"=== BATCH TRAINING COMPLETE: {len(trained_models)} model(s) ready ===")
     print(f"=================================================================\n")
     return trained_models
 
@@ -484,7 +484,7 @@ def train_and_export(
     skip_evaluation: bool = False,
 ) -> Tuple[Union[ConfigurableANN, ConfigurableSpikingJellySNN], bytes]:
     """
-    Trainiert alle Modelle und exportiert das erste Modell nach output_dir.
+    Train all models and export the first model to output_dir.
     """
     trained_models = train_all_models(
         config_or_path=config_path,

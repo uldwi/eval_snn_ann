@@ -13,8 +13,8 @@ from .models import ConfigurableANN, ConfigurableSpikingJellySNN
 
 def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJellySNN]) -> bytes:
     """
-    Erstellt dynamisch einen standardkonformen TFLite FlatBuffer für ein
-    beliebiges Convolutional- oder Fully-Connected-Netzwerk (ANN).
+    Dynamically create a standards-compliant TFLite FlatBuffer for an
+    arbitrary convolutional or fully connected ANN.
     """
     model.eval()
     bld = flatbuffers.Builder(2 * 1024 * 1024)
@@ -360,8 +360,8 @@ def export_c_files(
     output_dir: str = "main",
 ):
     """
-    Erzeugt model_data.h/cc und mnist_test_data.h im Zielverzeichnis für den ESP32.
-    Unterstützt sowohl ANN (TFLM FlatBuffer) als auch SNN (LIF Parametrierung & Gewichte).
+    Generate model_data.h/cc and mnist_test_data.h in the target directory for ESP32.
+    Supports ANNs (TFLM FlatBuffer) and SNNs (LIF parameters and weights).
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -370,7 +370,7 @@ def export_c_files(
     model = model_entry["model"]
     test_dataset = model_entry["test_dataset"]
     model_type = model_entry.get("type", "ann").lower()
-    model_name = model_entry.get("name", "Modell")
+    model_name = model_entry.get("name", "model")
 
     model_cfg = config.get("model", {})
     eval_cfg = config.get("evaluation", {})
@@ -451,10 +451,10 @@ def export_c_files(
         f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; } transformer_config_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
-        f.write("// ANN-Spezifisch (TensorFlow Lite Micro FlatBuffer)\n")
+        f.write("// ANN-specific TensorFlow Lite Micro FlatBuffer\n")
         f.write("extern const unsigned char g_model[];\n")
         f.write("extern const int g_model_len;\n\n")
-        f.write("// SNN-Spezifisch (LIF/IF Neuronen Parameter & Gewichte)\n")
+        f.write("// SNN-specific LIF/IF neuron parameters and weights\n")
         f.write("extern const snn_config_t g_snn_config;\n")
         f.write("extern const float* const g_snn_conv_weights[];\n")
         f.write("extern const float* const g_snn_conv_biases[];\n")
@@ -561,7 +561,7 @@ def export_c_files(
             layer_count = len(model.encoder.layers)
             ffn_dim = model.encoder.layers[0].linear1.out_features
             if (tokens, features, embed_dim, heads, layer_count, ffn_dim, output_size) != (16, 16, 32, 4, 2, 64, 35):
-                raise ValueError("ESP32-Transformer-Export unterstützt aktuell 16x16, D=32, 4 Heads, 2 Layer, FFN=64 und 35 Klassen")
+                raise ValueError("ESP32 Transformer export currently supports 16x16 input, D=32, 4 heads, 2 layers, FFN=64, and 35 classes")
             f.write("\nconst transformer_config_t g_transformer_config = {")
             is_spiking_transformer = bool(getattr(model, "is_spiking_transformer", False))
             transformer_steps = int(getattr(model, "num_steps", 1)) if is_spiking_transformer else 1
@@ -624,14 +624,14 @@ def export_c_files(
                 f.write("const float* const g_snn_conv_weights[] = {0};\n")
                 f.write("const float* const g_snn_conv_biases[] = {0};\n\n")
 
-            # FC Schichten
+            # FC layers
             fcs = model.fcs
             num_fc = len(fcs)
             for l_idx, fc in enumerate(fcs):
                 w = fc.weight.detach().cpu().numpy().astype(np.float32)
                 b = fc.bias.detach().cpu().numpy().astype(np.float32)
 
-                f.write(f"// SNN FC Schicht {l_idx}: {w.shape[1]} -> {w.shape[0]}\n")
+                f.write(f"// SNN FC layer {l_idx}: {w.shape[1]} -> {w.shape[0]}\n")
                 f.write(f"static const float s_snn_fc_w{l_idx}[{w.size}] = {{\n")
                 w_flat = w.flatten()
                 for i, val in enumerate(w_flat):
@@ -744,7 +744,7 @@ def export_c_files(
 
         if dataset_name in ("speech_commands", "kws"):
             if not hasattr(test_dataset, "load_normalized_audio"):
-                raise TypeError("Speech-Commands-ESP32-Export benötigt load_normalized_audio() im Dataset")
+                raise TypeError("Speech Commands ESP32 export requires load_normalized_audio() on the dataset")
             f.write("static const int16_t speech_test_audio[MNIST_TEST_SUBSET][SPEECH_AUDIO_SAMPLES] = {\n")
             for sample_idx in range(num_test_samples):
                 pcm = np.rint(test_dataset.load_normalized_audio(sample_idx) * 32768.0)
@@ -759,8 +759,8 @@ def export_c_files(
         for i in range(num_test_samples):
             img_tensor, _ = test_dataset[i]
             if temporal_input:
-                # Speichere temporal SNN Eingaben time-major, damit jeder
-                # Firmware-Schritt einen zusammenhängenden Feature-Vektor liest.
+                # Store temporal SNN inputs in time-major order so each
+                # firmware step reads a contiguous feature vector.
                 img_np = img_tensor.reshape(1, model.in_channels * model.in_height, model.in_width)
                 img_np = img_np.permute(2, 1, 0).reshape(-1).numpy()
             else:
@@ -773,16 +773,16 @@ def export_c_files(
         f.write("};\n")
 
     if getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False):
-        size_desc = f"{model_entry.get('model_size_bytes', 0):,} Bytes (FP32 Gewichte)"
+        size_desc = f"{model_entry.get('model_size_bytes', 0):,} bytes (FP32 weights)"
     else:
         size_desc = f"{len(model_entry.get('tflite_bytes', b'')):,} Bytes" if model_type == "ann" else f"{model_entry.get('model_size_bytes', 0):,} Bytes"
-    print(f"[Export] Modell '{model_name}' ({model_type.upper()}, {size_desc}) und {num_test_samples} Testsamples nach '{output_dir}/' exportiert:")
+    print(f"[Export] Exported model '{model_name}' ({model_type.upper()}, {size_desc}) and {num_test_samples} test samples to '{output_dir}/':")
     print(f"  - {header_path}")
     print(f"  - {cc_path}")
     print(f"  - {test_header_path}\n")
 
 def export_model_entry_to_main(model_entry: Dict[str, Any], output_dir: str = "main"):
     """
-    Exportiert ein einzelnes bereits trainiertes Modell nach 'main/model_data.h/cc'.
+    Export a single trained model to 'main/model_data.h/cc'.
     """
     export_c_files(model_entry, output_dir=output_dir)

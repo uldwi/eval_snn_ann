@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""
-Messung des Energieverbrauchs und der Leistungsaufnahme für neuronale Netze auf dem ESP32-C6.
+"""Train, export, flash, and measure ANN/SNN inference on ESP32 with Joulescope.
 
-Ablauf:
-  1. Trainiert ein einfaches PyTorch-Modell (MLP) auf dem MNIST-Datensatz auf dem Rechner.
-  2. Konvertiert das PyTorch-Modell in einen TensorFlow Lite FlatBuffer und C++ Source/Header.
-  3. Baut und flasht die ESP32-Firmware (TensorFlow Lite Micro Inferenz).
-  4. Misst mit dem angeschlossenen Joulescope (Trigger an IN1 / Pin 4) hochgenau den
-     Energieverbrauch und die Leistungsaufnahme während der Inferenz auf dem ESP32.
+The workflow can train configured PyTorch models, export supported models to
+TFLite/C, build and flash the ESP-IDF firmware, and measure device power.
 
-Voraussetzungen: joulescope, numpy, torch, torchvision, flatbuffers, tflite
-Installation:    pip install -r requirements.txt
+Requirements: joulescope, numpy, torch, torchvision, flatbuffers, tflite
+Install project dependencies with: pip install -r requirements.txt
 """
 
 import argparse
@@ -21,12 +16,12 @@ import sys
 import time
 from pathlib import Path
 
-# Logging für Joulescope/jsdrv komplett deaktivieren (OFF), um Mutex-Deadlocks im C-Backend (posix.c) zu verhindern
+# Disable Joulescope/jsdrv logging completely (OFF) to prevent mutex deadlocks in the C backend (posix.c)
 logging.getLogger("jsdrv").setLevel(logging.CRITICAL)
 logging.getLogger("pyjoulescope_driver").setLevel(logging.CRITICAL)
 logging.getLogger("joulescope").setLevel(logging.CRITICAL)
 
-# Fallback für virtuelle Umgebungen
+# Fallback for virtual environments
 try:
     import joulescope
     import numpy as np
@@ -38,11 +33,11 @@ except ImportError:
         import joulescope
         import numpy as np
     except ImportError:
-        print("Fehler: Das 'joulescope'- oder 'numpy'-Paket wurde nicht gefunden.", file=sys.stderr)
-        print("Bitte installieren mit: pip install -r requirements.txt", file=sys.stderr)
+        print("Error: The 'joulescope' or 'numpy' package was not found.", file=sys.stderr)
+        print("Install it with: pip install -r requirements.txt", file=sys.stderr)
         sys.exit(1)
 
-# Treiber-Level des Joulescope C-Backends vollständig stummschalten (OFF)
+# Silence the Joulescope C backend at the driver level (OFF)
 try:
     from joulescope.v1.driver import DriverWrapper
     _wrapper = DriverWrapper()
@@ -69,7 +64,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def find_esp_idf_export() -> str:
     """
-    Sucht nach dem 'export.sh' Skript von ESP-IDF im System.
+    Find the ESP-IDF 'export.sh' script on the system.
     """
     if "IDF_PATH" in os.environ:
         export_sh = os.path.join(os.environ["IDF_PATH"], "export.sh")
@@ -90,37 +85,37 @@ def find_esp_idf_export() -> str:
 
 def flash_esp32(port: str = None, project_dir: str = None, build: bool = True) -> bool:
     """
-    Kompiliert das ESP-IDF Projekt und flasht es auf den ESP32.
+    Build the ESP-IDF project and flash it to the ESP32.
     """
     if project_dir is None:
         project_dir = str(PROJECT_ROOT)
 
     export_sh = find_esp_idf_export()
     if not export_sh:
-        print("[ESP-IDF] Warnung: 'export.sh' für ESP-IDF nicht gefunden. Flashen übersprungen.", file=sys.stderr)
+        print("[ESP-IDF] Warning: ESP-IDF 'export.sh' not found. Skipping flash.", file=sys.stderr)
         return False
 
     port_opt = f"-p {port} " if port else ""
     cmd_action = f"idf.py {port_opt}build flash" if build else f"idf.py {port_opt}flash"
     full_cmd = f". {export_sh} && cd {project_dir} && {cmd_action}"
 
-    print(f"\n[ESP-IDF] Baue und schreibe Programm auf ESP32 ({cmd_action})...")
+    print(f"\n[ESP-IDF] Building and flashing firmware to ESP32 ({cmd_action})...")
     res = subprocess.run(["bash", "-c", full_cmd])
     if res.returncode != 0:
-        print(f"\n[ESP-IDF] Fehler: Flashen des ESP32 fehlgeschlagen (Exit-Code {res.returncode}).", file=sys.stderr)
+        print(f"\n[ESP-IDF] Failed to flash ESP32 (exit code {res.returncode}).", file=sys.stderr)
         return False
 
-    print("[ESP-IDF] Programm erfolgreich auf ESP32 geschrieben. Starte Messung...\n")
+    print("[ESP-IDF] Firmware flashed successfully. Starting measurement...\n")
     return True
 
 
 class StreamingMetricsAccumulator:
     """
-    Sammelt elektrische Messwerte (Strom, Spannung, Leistung) im Streaming-Verfahren (Online-Berechnung),
-    ohne Rohdatenarrays unbegrenzt im Arbeitsspeicher abzulegen (O(1) RAM-Verbrauch).
-    Verhindert Systemüberlastung und OOM-Abstürze bei langen Inferenzreihen.
+    Accumulate electrical measurements (current, voltage, power) as a stream,
+    without keeping unbounded raw-data arrays in memory (O(1) RAM usage).
+    This avoids excessive memory use during long inference runs.
     """
-    def __init__(self, sampling_freq: float, num_inferences: int = None, title: str = "MESSERGEBNISSE"):
+    def __init__(self, sampling_freq: float, num_inferences: int = None, title: str = "MEASUREMENT RESULTS"):
         self.sampling_freq = float(sampling_freq)
         self.num_inferences = num_inferences
         self.title = title
@@ -171,19 +166,19 @@ class StreamingMetricsAccumulator:
 
     def compute_and_display(self) -> dict:
         if self.num_samples == 0:
-            print("Keine Messwerte erfasst.", file=sys.stderr)
+            print("No measurement samples were collected.", file=sys.stderr)
             return {}
 
         dt = 1.0 / self.sampling_freq
         duration = self.num_samples * dt
 
-        # Energie in Joule (Ws), mJ, uJ und mWh
+        # Energy in joules (W·s), mJ, uJ, and mWh
         energy_j = self.sum_power * dt
         energy_mj = energy_j * 1000.0
         energy_uj = energy_j * 1e6
         energy_mwh = (energy_j / 3600.0) * 1000.0
 
-        # Ladung in Coulomb (As), mAh und uAh
+        # Charge in coulombs (A·s), mAh, and uAh
         charge_c = self.sum_current * dt
         charge_mah = (charge_c / 3600.0) * 1000.0
         charge_uah = charge_mah * 1000.0
@@ -204,19 +199,19 @@ class StreamingMetricsAccumulator:
         print(f"             {self.title}")
         print("=" * 65)
         if duration < 1.0:
-            print(f"Dauer der Inferenzphase: {duration * 1000:.2f} ms ({duration:.6f} s)")
+            print(f"Inference duration: {duration * 1000:.2f} ms ({duration:.6f} s)")
         else:
-            print(f"Dauer der Inferenzphase: {duration:.4f} s")
-        print(f"Abtastrate:              {self.sampling_freq / 1e6:.2f} MSPS ({self.num_samples:,} Samples)")
+            print(f"Inference duration: {duration:.4f} s")
+        print(f"Sample rate:              {self.sampling_freq / 1e6:.2f} MSPS ({self.num_samples:,} samples)")
         print("-" * 65)
-        print(f"Spannung (Durchschnitt): {avg_voltage:.4f} V   [min: {min_voltage:.4f} V, max: {max_voltage:.4f} V]")
-        print(f"Strom    (Durchschnitt): {avg_current * 1000:.3f} mA ({avg_current:.6f} A)")
+        print(f"Voltage (average): {avg_voltage:.4f} V   [min: {min_voltage:.4f} V, max: {max_voltage:.4f} V]")
+        print(f"Current (average): {avg_current * 1000:.3f} mA ({avg_current:.6f} A)")
         print(f"         [min: {min_current * 1000:.3f} mA, max: {max_current * 1000:.3f} mA]")
-        print(f"Leistung (Durchschnitt): {avg_power * 1000:.3f} mW ({avg_power:.6f} W)")
+        print(f"Power (average): {avg_power * 1000:.3f} mW ({avg_power:.6f} W)")
         print(f"         [min: {min_power * 1000:.3f} mW, max: {max_power * 1000:.3f} mW]")
         print("-" * 65)
-        print(f"Elektrische Ladung:      {charge_mah:.4f} mAh ({charge_uah:.2f} µAh / {charge_c:.6f} C)")
-        print(f"Energieverbrauch gesamt: {energy_j:.6f} J ({energy_mj:.3f} mJ / {energy_mwh:.6f} mWh)")
+        print(f"Electric charge:      {charge_mah:.4f} mAh ({charge_uah:.2f} µAh / {charge_c:.6f} C)")
+        print(f"Total energy: {energy_j:.6f} J ({energy_mj:.3f} mJ / {energy_mwh:.6f} mWh)")
 
         energy_per_inf_mj = None
         energy_per_inf_uj = None
@@ -224,7 +219,7 @@ class StreamingMetricsAccumulator:
         inferences_per_sec = None
         charge_per_inf_uah = None
 
-        # Zusätzliche Metriken pro Inferenz, falls bekannt
+        # Additional per-inference metrics, when available
         if self.num_inferences and self.num_inferences > 0:
             energy_per_inf_mj = energy_mj / self.num_inferences
             energy_per_inf_uj = energy_uj / self.num_inferences
@@ -233,12 +228,12 @@ class StreamingMetricsAccumulator:
             charge_per_inf_uah = charge_uah / self.num_inferences
 
             print("-" * 65)
-            print("          INFERENZ-METRIKEN (TensorFlow Lite Micro)")
+            print("          INFERENCE METRICS (TensorFlow Lite Micro)")
             print("-" * 65)
-            print(f"Anzahl Inferenzen:       {self.num_inferences}")
-            print(f"Zeit pro Inferenz:       {time_per_inf_ms:.3f} ms ({inferences_per_sec:.1f} Inferenzen/s)")
-            print(f"Energie pro Inferenz:    {energy_per_inf_mj:.4f} mJ ({energy_per_inf_uj:.2f} µJ)")
-            print(f"Ladung pro Inferenz:     {charge_per_inf_uah:.4f} µAh")
+            print(f"Number of inferences:       {self.num_inferences}")
+            print(f"Time per inference:       {time_per_inf_ms:.3f} ms ({inferences_per_sec:.1f} inferences/s)")
+            print(f"Energy per inference:    {energy_per_inf_mj:.4f} mJ ({energy_per_inf_uj:.2f} µJ)")
+            print(f"Charge per inference:     {charge_per_inf_uah:.4f} µAh")
         print("=" * 65 + "\n")
 
         return {
@@ -277,11 +272,10 @@ def display_results(
     voltage: np.ndarray,
     sampling_freq: float,
     num_inferences: int = None,
-    title: str = "MESSERGEBNISSE",
+    title: str = "MEASUREMENT RESULTS",
 ) -> dict:
     """
-    Berechnet alle elektrischen Messgrößen, gibt sie formatiert auf stdout aus
-    und gibt ein Dictionary mit allen berechneten Metriken zurück.
+    Compute electrical metrics, print them to stdout, and return them as a dictionary.
     """
     accumulator = StreamingMetricsAccumulator(
         sampling_freq=sampling_freq,
@@ -294,10 +288,9 @@ def display_results(
 
 def capture_esp32_serial_metrics(port: str = None, timeout: float = 60.0, baudrate: int = 115200) -> dict:
     """
-    Versucht, über die serielle Schnittstelle die Genauigkeit und Inferenz-Metriken
-    direkt aus den Log-Ausgaben des ESP32 zu lesen.
-    Timeout 60.0 s: Bei 500 Samples und langen Inferenzzeiten (SNN: ~1.3s/Inferenz)
-    kann der METRICS-String erst nach mehreren Minuten erscheinen.
+    Read accuracy and inference metrics from ESP32 serial output.
+    With 500 samples and long inference times, the metrics line may appear
+    several minutes after the process starts.
     """
     try:
         import serial
@@ -356,24 +349,23 @@ def capture_esp32_serial_metrics(port: str = None, timeout: float = 60.0, baudra
 
 def print_comparison_summary(all_results: list):
     """
-    Gibt eine übersichtliche tabellarische Zusammenfassung und den Vergleich
-    aller gemessenen Modelle (ANN und SNN) auf stdout aus.
+    Print a summary table comparing all measured ANN and SNN models.
     """
     if not all_results:
         return
 
     print("\n" + "=" * 184)
-    print("                                GESAMTVERGLEICH ALLER GEMESSENEN MODELLE (ANN vs. SNN)")
+    print("                                SUMMARY OF ALL MEASURED MODELS (ANN vs. SNN)")
     print("=" * 184)
 
-    header = f"{'Modell-Name':<20} | {'Typ':<5} | {'Netzwerk-Architektur':<38} | {'Host Acc (10k)':<14} | {'ESP32 Acc (Test)':<18} | {'Größe':<9} | {'Zeit/Inf':<10} | {'Energie/Inf':<12} | {'Mittl. Leist.':<14} | {'Spikes gesamt (Ø/Inf)':<24} | {'SynOps gesamt (Ø/Inf)'}"
-    sub_hdr = f"{'':<20} | {'':<5} | {'':<38} | {'(%)':<14} | {'(% [korrekt])':<18} | {'(Bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)':<14} | {'(Anzahl)':<24} | {'(Anzahl)'}"
+    header = f"{'Model name':<20} | {'Type':<5} | {'Network architecture':<38} | {'Host accuracy (10k)':<14} | {'ESP32 accuracy (test)':<18} | {'Size':<9} | {'Time/inf':<10} | {'Energy/inf':<12} | {'Avg. power':<14} | {'Total spikes (avg/inf)':<24} | {'Total SynOps (avg/inf)'}"
+    sub_hdr = f"{'':<20} | {'':<5} | {'':<38} | {'(%)':<14} | {'(% [correct])':<18} | {'(bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)':<14} | {'(count)':<24} | {'(count)'}"
     print(header)
     print(sub_hdr)
     print("-" * 184)
 
     for res in all_results:
-        name = res.get("name", "Modell")[:20]
+        name = res.get("name", "model")[:20]
         m_type = str(res.get("type", "ANN")).upper()[:5]
         structure = res.get("structure", "-")[:38]
         host_acc = f"{res['test_acc']:.2f} %" if res.get("test_acc") is not None else "N/A"
@@ -401,14 +393,14 @@ def print_comparison_summary(all_results: list):
             esp32_time_us = m.get("esp32_time_us")
             energy_per_inf_uj = m.get("energy_per_inf_uj")
 
-            # Prüfe, ob der GPIO-Trigger verpasst wurde: Energie nahe 0 aber esp32_time_us vorhanden
+            # Check whether the GPIO trigger was missed: near-zero energy but esp32_time_us is present
             gpio_missed = (energy_per_inf_uj is not None and energy_per_inf_uj < 0.1 and
                           esp32_time_us is not None and esp32_time_us > 0 and num_inf)
 
             if esp32_time_us is not None and num_inf:
                 t_inf_val = esp32_time_us / 1000.0 / num_inf  # ms pro Inferenz
                 t_inf = f"{t_inf_val:.2f} ms"
-                # Wenn GPIO-Trigger verpasst, verwende die Durchschnittsleistung aus der gesamten Messdauer
+                # If the GPIO trigger was missed, use average power across the full measurement duration
                 if gpio_missed:
                     avg_power_mw = m.get("avg_power_mw_total", m.get("avg_power_mw"))
                 else:
@@ -423,7 +415,7 @@ def print_comparison_summary(all_results: list):
                 e_inf = f"{m['energy_per_inf_uj']:.2f} µJ" if m.get("energy_per_inf_uj") is not None else (f"{m['energy_uj']:.1f} µJ" if m.get("energy_uj") is not None else "N/A")
             p_avg = f"{m['avg_power_mw']:.2f} mW" if m.get("avg_power_mw") is not None else "N/A"
         else:
-            t_inf, e_inf, p_avg = "Keine Daten", "Keine Daten", "Keine Daten"
+            t_inf, e_inf, p_avg = "N/A", "N/A", "N/A"
 
         spike_str = "-"
         synops_str = "-"
@@ -456,21 +448,20 @@ def measure_triggered(
     max_duration: float = None,
 ) -> dict:
     """
-    Misst den Energieverbrauch synchron zu einem muster-basierten Triggersignal an IN1 (oder IN0).
+    Measure energy in sync with a pattern-based trigger signal on IN1 (or IN0).
 
-    Protokoll (ESP32 sendet diese Muster):
-      Start-Muster:  3x HIGH(200ms) mit LOW(100ms) dazwischen -> Messung(HIGH)
-      Messung:       HIGH waehrend der gesamten Inferenz (>= 100ms)
-      Ende-Muster:   2x HIGH(200ms) mit LOW(100ms) dazwischen -> LOW(500ms)
+    Protocol sent by the ESP32:
+      Start pattern: 3x HIGH (200 ms), separated by LOW (100 ms) -> measurement (HIGH)
+      Measurement:   HIGH for the duration of inference (>= 100 ms)
+      End pattern:   2x HIGH (200 ms), separated by LOW (100 ms) -> LOW (500 ms)
     
-    Start- und Ende-Muster sind durch die Anzahl der Impulse (3 vs. 2) eindeutig unterscheidbar.
+    The start and end patterns are distinguished by their pulse counts (3 vs. 2).
 
-    Ein zustandsbasierter Parser erkennt die Muster auch bei verpassten Samples oder
-    Chunk-Grenzen. Der ESP32 laeuft in einer Endlosschleife, also stehen mehrere Zyklen
-    zur Verfuegung.
+    A state-based parser recognizes patterns even when samples are missed or
+    they cross chunk boundaries. The ESP32 runs continuously, allowing retries.
     """
     gpi_field = "gpi1" if pin.lower() in ("in1", "gpi1", "1") else "gpi0"
-    # Lese den Mikrocontroller aus der config.yaml, um das Board-Label korrekt anzuzeigen
+    # Read the microcontroller from config.yaml to display the correct board label
     try:
         import yaml as yaml_mod
         config_path = str(PROJECT_ROOT / "config.yaml")
@@ -490,23 +481,23 @@ def measure_triggered(
         trigger_gpio = 4
     channel_label = f"IN1 ({board_name} Pin {trigger_gpio})" if gpi_field == "gpi1" else "IN0"
 
-    # Muster-Toleranzen (in ms) — der ESP32 sendet exakte Zeiten, aber wir erlauben Spielraum
-    # Ein Impuls im Muster: HIGH ~200ms (Toleranz 150-300ms), LOW zwischen Impulsen ~100ms (Toleranz 50-200ms)
+    # Pattern timing tolerances (ms); allow some margin around the ESP32 pulse durations
+    # Pattern pulse: HIGH ~200 ms (150-300 ms tolerance); LOW between pulses ~100 ms (50-200 ms tolerance)
     PULSE_HIGH_MIN_MS = 150.0
     PULSE_HIGH_MAX_MS = 300.0
     GAP_LOW_MIN_MS = 50.0
     GAP_LOW_MAX_MS = 200.0
-    # Die eigentliche Messung dauert mindestens 100ms (Inferenz ist immer laenger)
+    # The measurement itself must last at least 100 ms (inference always takes longer)
     MIN_MEASURE_MS = 100.0
-    # Nach dem Start-Muster: LOW-Phase vor Messung ~1100ms (100ms Gap + 1000ms Wartezeit)
-    # Wir warten auf HIGH nach >= 300ms LOW (um das Start-Muster von der Messung zu trennen)
+    # After the start pattern: ~1100 ms LOW before measurement (100 ms gap + 1000 ms delay)
+    # Wait for HIGH after >= 300 ms LOW to distinguish measurement from the start pattern
     START_TO_MEASURE_GAP_MIN_MS = 300.0
 
-    # Berechne maximal zulässige Messdauer (dynamisch nach Anzahl Samples)
+    # Compute the maximum allowed measurement duration based on sample count
     if max_duration is None:
         max_duration = max(60.0, (num_inferences or 50) * 2.0)
 
-    # Puffergröße im Joulescope-Treiber auf 10s begrenzen, um RAM-Verbrauch minimal zu halten
+    # Limit the Joulescope driver buffer to 10 s to keep memory use low
     try:
         device.parameter_set("buffer_duration", 10)
     except Exception:
@@ -515,22 +506,22 @@ def measure_triggered(
     sampling_freq = device.output_sampling_frequency
     samples_per_ms = sampling_freq / 1000.0
 
-    print(f"Abtastrate Joulescope:   {sampling_freq / 1e6:.2f} MSPS")
-    print(f"Warte auf Startmuster an {channel_label}...")
-    print(f"  Protokoll: Start-Muster (3x Impuls) -> Messung(HIGH) -> Ende-Muster (2x Impuls)")
+    print(f"Joulescope sample rate:   {sampling_freq / 1e6:.2f} MSPS")
+    print(f"Waiting for start pattern on {channel_label}...")
+    print(f"  Protocol: start pattern (3 pulses) -> measurement (HIGH) -> end pattern (2 pulses)")
     if timeout > 0:
-        print(f"Trigger-Timeout:         {timeout:.1f} Sekunden (gesamt)")
+        print(f"Trigger timeout:         {timeout:.1f} seconds (total)")
     if max_duration > 0:
-        print(f"Max. Messdauer:          {max_duration:.1f} Sekunden (pro Zyklus)")
+        print(f"Maximum measurement duration: {max_duration:.1f} seconds (per cycle)")
 
     device.start()
 
     accumulator = StreamingMetricsAccumulator(
         sampling_freq=sampling_freq,
         num_inferences=num_inferences,
-        title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
+        title=f"MEASUREMENT RESULTS MNIST INFERENZ (Trigger {channel_label})",
     )
-    # Zweiter Accumulator für die gesamte Messdauer (inklusive Wartezeit)
+    # Second accumulator for the full duration, including wait time
     total_accumulator = StreamingMetricsAccumulator(
         sampling_freq=sampling_freq,
         num_inferences=num_inferences,
@@ -538,21 +529,21 @@ def measure_triggered(
     )
     last_processed_id = None
 
-    # Zustandsmaschine fuer Muster-Erkennung
-    # Start-Muster: 3 Impulse (unterscheidbar vom Ende-Muster mit 2 Impulsen)
-    # Staende:
-    #   IDLE           - Wartet auf den ersten HIGH-Impuls (Start-Muster Puls 1)
-    #   START_PULSE1   - Erster HIGH-Impuls des Start-Musters
-    #   START_GAP1     - LOW zwischen Puls 1 und Puls 2 des Start-Musters
-    #   START_PULSE2   - Zweiter HIGH-Impuls des Start-Musters
-    #   START_GAP2     - LOW zwischen Puls 2 und Puls 3 des Start-Musters
-    #   START_PULSE3   - Dritter HIGH-Impuls des Start-Musters
-    #   START_WAIT     - LOW nach Start-Muster, wartet auf Messung (HIGH)
-    #   MEASURING      - Messung laeuft (HIGH)
-    #   END_GAP1       - LOW nach Messung, vor Ende-Muster Puls 1
-    #   END_PULSE1     - Erster HIGH-Impuls des Ende-Musters
-    #   END_GAP2       - LOW zwischen Puls 1 und Puls 2 des Ende-Musters
-    #   END_PULSE2     - Zweiter HIGH-Impuls des Ende-Musters (nach diesem ist die Messung fertig)
+    # State machine for pattern recognition
+    # Start pattern: 3 pulses (distinct from the 2-pulse end pattern)
+    # States:
+    #   IDLE           - Wait for the first HIGH pulse (start pattern pulse 1)
+    #   START_PULSE1   - First HIGH pulse of the start pattern
+    #   START_GAP1     - LOW between start pattern pulses 1 and 2
+    #   START_PULSE2   - Second HIGH pulse of the start pattern
+    #   START_GAP2     - LOW between start pattern pulses 2 and 3
+    #   START_PULSE3   - Third HIGH pulse of the start pattern
+    #   START_WAIT     - LOW after the start pattern; wait for measurement (HIGH)
+    #   MEASURING      - Measurement active (HIGH)
+    #   END_GAP1       - LOW after measurement, before end pattern pulse 1
+    #   END_PULSE1     - First HIGH pulse of the end pattern
+    #   END_GAP2       - LOW between end pattern pulses 1 and 2
+    #   END_PULSE2     - Second HIGH pulse of the end pattern (measurement ends after this)
     STATE_IDLE = 0
     STATE_START_PULSE1 = 1
     STATE_START_GAP1 = 2
@@ -567,16 +558,16 @@ def measure_triggered(
     STATE_END_PULSE2 = 11
 
     state = STATE_IDLE
-    state_start_samples = 0  # Sample-Index, an dem der aktuelle Zustand begonnen hat
+    state_start_samples = 0  # Sample index where the current state began
     last_gpi_value = 0
     t_wait_start = time.time()
     t_measure_start = None
     t_last_progress = 0.0
     retry_count = 0
-    pattern_start_idx = 0  # Sample-Index, ab dem das Start-Muster begonnen hat (für Accumulator-Slice)
+    pattern_start_idx = 0  # Sample index where the start pattern began (for accumulator slicing)
 
     def reset_for_retry():
-        """Zustand und Accumulator zuruecksetzen fuer einen neuen Versuch."""
+        """Reset state and accumulators for a new attempt."""
         nonlocal state, last_gpi_value, t_measure_start, t_last_progress, accumulator
         state = STATE_IDLE
         last_gpi_value = 0
@@ -585,7 +576,7 @@ def measure_triggered(
         accumulator = StreamingMetricsAccumulator(
             sampling_freq=sampling_freq,
             num_inferences=num_inferences,
-            title=f"MESSERGEBNISSE MNIST INFERENZ (Trigger {channel_label})",
+            title=f"MEASUREMENT RESULTS MNIST INFERENZ (Trigger {channel_label})",
         )
 
     def ms_to_samples(ms):
@@ -602,18 +593,18 @@ def measure_triggered(
             if state != STATE_MEASURING:
                 if timeout > 0 and (now - t_wait_start) > timeout:
                     raise TimeoutError(
-                        f"Zeitueberschreitung: Kein gueltiges Startmuster an {channel_label} innerhalb von {timeout:.1f} s empfangen."
+                        f"Timeout: no valid start pattern received on {channel_label} within {timeout:.1f} s."
                     )
             else:
                 elapsed = now - t_measure_start
                 if elapsed - t_last_progress >= 5.0:
                     t_last_progress = elapsed
-                    print(f"  [Messung aktiv] {elapsed:.1f} s vergangen ({accumulator.num_samples:,} Samples erfasst)...", flush=True)
+                    print(f"  [Measurement active] {elapsed:.1f} s elapsed ({accumulator.num_samples:,} samples collected)...", flush=True)
 
                 if max_duration > 0 and elapsed > max_duration:
-                    print(f"\n[Trigger] >>> Timeout: Messung dauerte laenger als {max_duration:.1f} s. <<<")
+                    print(f"\n[Trigger] >>> Timeout: measurement exceeded {max_duration:.1f} s. <<<")
                     retry_count += 1
-                    print(f"[Trigger] Versuch #{retry_count}, warte auf naechstes Startmuster...")
+                    print(f"[Trigger] Attempt #{retry_count}; waiting for the next start pattern...")
                     reset_for_retry()
 
             time.sleep(0.01)  # 10 ms Polling-Intervall
@@ -628,7 +619,7 @@ def measure_triggered(
             if s2 <= last_processed_id:
                 continue
 
-            # Datenchunk abrufen
+            # Get the next data chunk
             try:
                 data = device.stream_buffer.samples_get(
                     last_processed_id, s2, fields=["current", "voltage", gpi_field]
@@ -642,13 +633,13 @@ def measure_triggered(
             chunk_len = len(gpi_chunk)
             last_processed_id = s2
 
-            # Total-Accumulator immer mit allen Daten füttern
+            # Always feed all data to the total accumulator
             total_accumulator.update(cur_chunk, vol_chunk)
 
-            # Zustandsmaschine: Verarbeite den Chunk Sample-fuer-Sample
+            # State machine: process the chunk sample by sample
             chunk_start_global = last_processed_id - chunk_len
             
-            # Fuer MEASURING-Zustand: sammle die Indices der Mess-Samples in diesem Chunk
+            # In MEASURING state, collect measurement sample indices from this chunk
             measure_start_in_chunk = None
             measure_end_in_chunk = None
 
@@ -658,9 +649,9 @@ def measure_triggered(
                 samples_in_state = global_idx - state_start_samples
 
                 if state == STATE_IDLE:
-                    # In IDLE: Jeder HIGH-Wert startet die Mustererkennung.
-                    # Ein Rising-Edge-Check (last_gpi_value == 0) wuerde den Start verpassen,
-                    # wenn der erste Chunk bereits HIGH zeigt oder der Edge ueber Chunk-Grenzen liegt.
+                    # In IDLE, any HIGH value begins pattern recognition.
+                    # A rising-edge check (last_gpi_value == 0) could miss the start
+                    # if the first chunk is already HIGH or the edge crosses chunk boundaries.
                     if gpi_val == 1:
                         state = STATE_START_PULSE1
                         state_start_samples = global_idx
@@ -708,36 +699,36 @@ def measure_triggered(
                         if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
                             state = STATE_IDLE
                         else:
-                            print(f"\n[Trigger] >>> Start-Muster (3 Impulse) erkannt! Warte auf Messung... <<<")
+                            print(f"\n[Trigger] >>> Start pattern (3 pulses) detected. Waiting for measurement... <<<")
                             state = STATE_START_WAIT
                             state_start_samples = global_idx
 
                 elif state == STATE_START_WAIT:
-                    # Nach dem Start-Muster: Jeder HIGH-Wert nach ausreichender LOW-Wartezeit
-                    # startet die Messung — kein Rising-Edge-Check, da der Edge verpasst werden koennte.
+                    # After the start pattern, any HIGH value after a sufficient LOW interval
+                    # starts measurement; no rising-edge check is used because an edge could be missed.
                     if gpi_val == 1:
                         wait_ms = samples_to_ms(samples_in_state)
                         if wait_ms < START_TO_MEASURE_GAP_MIN_MS:
                             state = STATE_IDLE
                         else:
-                            print(f"[Trigger] >>> Messung gestartet (nach {wait_ms:.0f} ms Wartezeit). <<<")
+                            print(f"[Trigger] >>> Measurement started (after {wait_ms:.0f} ms delay). <<<")
                             state = STATE_MEASURING
                             state_start_samples = global_idx
                             t_measure_start = time.time()
                             t_last_progress = 0.0
-                            measure_start_in_chunk = i  # Messung beginnt bei diesem Sample
+                            measure_start_in_chunk = i  # Measurement starts at this sample
 
                 elif state == STATE_MEASURING:
                     if gpi_val == 0:
-                        measure_end_in_chunk = i  # Messung endet bei diesem Sample
+                        measure_end_in_chunk = i  # Measurement ends at this sample
                         measure_ms = samples_to_ms(samples_in_state)
                         if measure_ms < MIN_MEASURE_MS:
                             retry_count += 1
-                            print(f"[Trigger] >>> Messung zu kurz ({measure_ms:.0f} ms), retry... <<<")
+                            print(f"[Trigger] >>> Measurement too short ({measure_ms:.0f} ms); retrying... <<<")
                             reset_for_retry()
                             break
                         else:
-                            print(f"[Trigger] >>> Messung beendet ({measure_ms:.0f} ms), warte auf Ende-Muster... <<<")
+                            print(f"[Trigger] >>> Measurement ended ({measure_ms:.0f} ms); waiting for end pattern... <<<")
                             state = STATE_END_GAP1
                             state_start_samples = global_idx
 
@@ -746,7 +737,7 @@ def measure_triggered(
                         gap_ms = samples_to_ms(samples_in_state)
                         if gap_ms < GAP_LOW_MIN_MS or gap_ms > GAP_LOW_MAX_MS:
                             retry_count += 1
-                            print(f"[Trigger] >>> Ende-Muster nicht erkannt, retry... <<<")
+                            print(f"[Trigger] >>> End pattern not detected; retrying... <<<")
                             reset_for_retry()
                             break
                         else:
@@ -758,7 +749,7 @@ def measure_triggered(
                         pulse_ms = samples_to_ms(samples_in_state)
                         if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
                             retry_count += 1
-                            print(f"[Trigger] >>> Ende-Muster fehlerhaft, retry... <<<")
+                            print(f"[Trigger] >>> Invalid end pattern; retrying... <<<")
                             reset_for_retry()
                             break
                         else:
@@ -770,7 +761,7 @@ def measure_triggered(
                         gap_ms = samples_to_ms(samples_in_state)
                         if gap_ms < GAP_LOW_MIN_MS or gap_ms > GAP_LOW_MAX_MS:
                             retry_count += 1
-                            print(f"[Trigger] >>> Ende-Muster fehlerhaft, retry... <<<")
+                            print(f"[Trigger] >>> Invalid end pattern; retrying... <<<")
                             reset_for_retry()
                             break
                         else:
@@ -782,30 +773,30 @@ def measure_triggered(
                         pulse_ms = samples_to_ms(samples_in_state)
                         if pulse_ms < PULSE_HIGH_MIN_MS or pulse_ms > PULSE_HIGH_MAX_MS:
                             retry_count += 1
-                            print(f"[Trigger] >>> Ende-Muster unvollstaendig, retry... <<<")
+                            print(f"[Trigger] >>> Incomplete end pattern; retrying... <<<")
                             reset_for_retry()
                             break
                         else:
-                            print(f"[Trigger] >>> Ende-Muster erkannt! Messung abgeschlossen. <<<")
+                            print(f"[Trigger] >>> End pattern detected. Measurement complete. <<<")
                             raise SystemExit(0)
 
                 last_gpi_value = gpi_val
 
-            # Nach der Sample-fuer-Sample-Verarbeitung: Accumulator mit den Mess-Samples fuettern
+            # After processing each sample, feed measurement samples to the accumulator
             if measure_start_in_chunk is not None:
                 if measure_end_in_chunk is not None:
-                    # Messung hat in diesem Chunk begonnen UND geendet
+                    # Measurement both started and ended in this chunk
                     accumulator.update(cur_chunk[measure_start_in_chunk:measure_end_in_chunk],
                                        vol_chunk[measure_start_in_chunk:measure_end_in_chunk])
                 else:
-                    # Messung beginnt in diesem Chunk und laeuft weiter
+                    # Measurement starts in this chunk and continues
                     accumulator.update(cur_chunk[measure_start_in_chunk:],
                                        vol_chunk[measure_start_in_chunk:])
             elif measure_end_in_chunk is not None:
-                # Messung lief bereits vor diesem Chunk und endet in diesem Chunk
+                # Measurement started before this chunk and ends in this chunk
                 accumulator.update(cur_chunk[:measure_end_in_chunk], vol_chunk[:measure_end_in_chunk])
             elif state == STATE_MEASURING:
-                # Messung lief bereits vor diesem Chunk und laeuft weiter (kein Ende in diesem Chunk)
+                # Measurement started before this chunk and continues (no end in this chunk)
                 accumulator.update(cur_chunk, vol_chunk)
 
     except SystemExit as e:
@@ -820,26 +811,26 @@ def measure_triggered(
 
     # Zusammenfassung
     if retry_count > 0:
-        print(f"\n[Trigger] {retry_count} fehlerhafte(r) Zyklus(se) wiederholt.")
+        print(f"\n[Trigger] Retried {retry_count} invalid cycle(s).")
 
-    # GPIO-Trigger-Messung anzeigen
+    # Display GPIO-triggered measurement
     metrics = accumulator.compute_and_display()
 
-    # Durchschnittsleistung aus der gesamten Messdauer hinzufügen
+    # Add average power over the full measurement duration
     if total_accumulator.num_samples > 0:
         total_dt = 1.0 / sampling_freq
         total_duration = total_accumulator.num_samples * total_dt
         total_avg_power = total_accumulator.sum_power / total_accumulator.num_samples
         metrics["avg_power_mw_total"] = total_avg_power * 1000.0  # mW
         metrics["duration_total_s"] = total_duration
-        print(f"[Messung] Durchschnittsleistung (gesamte Dauer): {total_avg_power * 1000:.2f} mW ({total_duration:.2f} s)")
+        print(f"[Measurement] Average power (total duration): {total_avg_power * 1000:.2f} mW ({total_duration:.2f} s)")
 
     return metrics
 
 
 def measure_duration(device, duration: float = 10.0, num_inferences: int = None) -> dict:
     """
-    Misst den Energieverbrauch über eine feste Dauer in Sekunden.
+    Measure energy consumption for a fixed duration in seconds.
     """
     buffer_duration = max(30, int(duration * 2))
     try:
@@ -847,7 +838,7 @@ def measure_duration(device, duration: float = 10.0, num_inferences: int = None)
     except Exception:
         pass
 
-    print(f"Messung ueber {duration:.1f} Sekunden gestartet...")
+    print(f"Starting measurement for {duration:.1f} seconds...")
     data = device.read(contiguous_duration=duration)
 
     current = data[:, 0]
@@ -859,131 +850,131 @@ def measure_duration(device, duration: float = 10.0, num_inferences: int = None)
         voltage,
         sampling_freq,
         num_inferences=num_inferences,
-        title=f"MESSERGEBNISSE ({duration:.1f}s Dauer)",
+        title=f"MEASUREMENT RESULTS ({duration:.1f}s Duration)",
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MNIST PyTorch-Training, TFLite-Export, ESP32-Flashing und Joulescope Energiemessung."
+        description="Train and export models, flash ESP32 firmware, and measure power with a Joulescope."
     )
-    # Konfigurationsdatei
+    # Configuration file
     parser.add_argument(
         "-c", "--config",
         type=str,
         default=None,
-        help="Pfad zur Konfigurationsdatei (YAML oder JSON, Standard: config.yaml / config.json)",
+        help="Path to the configuration file (YAML or JSON; default: config.yaml / config.json)",
     )
 
-    # Trainings-Optionen
+    # Training options
     parser.add_argument(
         "-D", "--dataset",
         type=str,
         default=None,
-        help="Waehlt den Datensatz (z.B. 'mnist', 'fashion_mnist', 'cifar10', 'speech_commands', 'har_time_series', 'eeg_data', 'ecg_data', 'synthetic_time_series')",
+        help="Select a dataset (e.g. mnist, fashion_mnist, cifar10, speech_commands, har_time_series, eeg_data, ecg_data)",
     )
     parser.add_argument(
         "--list-datasets",
         action="store_true",
-        help="Zeigt alle verfuegbaren Datensaetze und Domaenen in einer Tabelle an",
+        help="List available datasets and domains",
     )
     parser.add_argument(
         "--train",
         dest="train",
         action="store_true",
         default=True,
-        help="PyTorch-Modelle vor dem Flashen trainieren und exportieren (Standard: aktiviert)",
+        help="Train and export PyTorch models before flashing (enabled by default)",
     )
     parser.add_argument(
         "--no-train",
         dest="train",
         action="store_false",
-        help="Training ueberspringen und vorhandenes exportiertes Modell verwenden",
+        help="Skip training and use existing exported model files",
     )
     parser.add_argument(
         "-e", "--epochs",
         type=int,
         default=None,
-        help="Anzahl der Trainingsepochen fuer PyTorch (ueberschreibt Konfigurationsdatei)",
+        help="Number of PyTorch training epochs (overrides the config file)",
     )
     parser.add_argument(
         "-b", "--batch-size",
         type=int,
         default=None,
-        help="Batch-Groesse fuer das Training (ueberschreibt Konfigurationsdatei)",
+        help="Training batch size (overrides the config file)",
     )
     parser.add_argument(
         "--lr", "--learning-rate",
         type=float,
         default=None,
         dest="learning_rate",
-        help="Lernrate fuer das Training (ueberschreibt Konfigurationsdatei)",
+        help="Training learning rate (overrides the config file)",
     )
     parser.add_argument(
         "--early-stopping",
         dest="early_stopping",
         action="store_true",
         default=None,
-        help="Aktiviert Early Stopping bei stagnierender Genauigkeit",
+        help="Enable early stopping when accuracy stops improving",
     )
     parser.add_argument(
         "--no-early-stopping",
         dest="early_stopping",
         action="store_false",
-        help="Deaktiviert Early Stopping",
+        help="Disable early stopping",
     )
     parser.add_argument(
         "--patience",
         type=int,
         default=None,
-        help="Anzahl der Epochen ohne Verbesserung vor vorzeitigem Trainingsabbruch",
+        help="Number of epochs without improvement before stopping",
     )
     parser.add_argument(
         "--min-delta",
         type=float,
         default=None,
-        help="Mindestverbesserung der Metrik fuer Early Stopping",
+        help="Minimum metric improvement required for early stopping",
     )
     parser.add_argument(
         "--monitor",
         type=str,
         default=None,
-        help="Zu ueberwachende Metrik fuer Early Stopping ('test_acc' oder 'test_loss')",
+        help="Metric to monitor for early stopping (test_acc or test_loss)",
     )
     parser.add_argument(
         "--test-samples",
         type=int,
         default=None,
-        help="Anzahl der MNIST Testbilder fuer die Inferenz auf dem ESP32 (ueberschreibt Konfigurationsdatei)",
+        help="Number of test samples for ESP32 inference (overrides the config file)",
     )
     parser.add_argument(
         "--force-train", "--force-retrain",
         dest="force_train",
         action="store_true",
         default=False,
-        help="Erzwingt ein erneutes Training aller Modelle, auch wenn gespeicherte Checkpoints unverändert vorliegen",
+        help="Retrain all models even when matching checkpoints exist",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
         default=None,
-        help="Verzeichnis zum automatischen Speichern und Laden trainierter Modell-Checkpoints (Standard: './saved_models')",
+        help="Directory for saving and loading model checkpoints (default: ./saved_models)",
     )
 
-    # Post-Training Optimierungs-Optionen
+    # Post-training optimization options
     parser.add_argument(
         "--prune", "--prune-amount",
         type=float,
         default=None,
         dest="prune_amount",
-        help="Aktiviert Post-Training Pruning und setzt den Zielanteil entfernter Gewichte (z. B. 0.3 für 30%% Sparsity)",
+        help="Enable post-training pruning and set the target fraction of removed weights (e.g. 0.3 for 30%% sparsity)",
     )
     parser.add_argument(
         "--prune-method",
         type=str,
         default=None,
         choices=["l1_unstructured", "random_unstructured", "structured", "threshold"],
-        help="Pruning-Methode: 'l1_unstructured' (Standard), 'random_unstructured', 'structured' oder 'threshold'",
+        help="Pruning method: l1_unstructured (default), random_unstructured, structured, or threshold",
     )
     parser.add_argument(
         "--quantize", "--quantize-type",
@@ -991,86 +982,86 @@ def main():
         default=None,
         dest="quantize_type",
         choices=["int8", "int4", "fp16", "dynamic"],
-        help="Aktiviert Post-Training Quantisierung der Gewichte ('int8', 'int4', 'fp16', 'dynamic')",
+        help="Enable post-training weight quantization (int8, int4, fp16, or dynamic)",
     )
     parser.add_argument(
         "--clustering", "--num-clusters",
         type=int,
         default=None,
         dest="num_clusters",
-        help="Aktiviert Weight-Clustering mit k Centroids (z. B. 16 für 4-Bit Codebook)",
+        help="Enable weight clustering with k centroids (e.g. 16 for a 4-bit codebook)",
     )
     parser.add_argument(
         "--fine-tune-epochs",
         type=int,
         default=None,
-        help="Anzahl an Fine-Tuning Epochen nach dem Pruning zur Genauigkeitswiederherstellung",
+        help="Number of fine-tuning epochs after pruning to recover accuracy",
     )
 
-    # Mess- und Trigger-Optionen
+    # Measurement and trigger options
     parser.add_argument(
         "-p", "--pin",
         type=str,
         default=None,
-        help="Joulescope Trigger-Eingangspins: 'in1' (Standard) oder 'in0' (ueberschreibt Konfiguration)",
+        help="Joulescope trigger input pin: in1 (default) or in0 (overrides the config file)",
     )
     parser.add_argument(
         "-t", "--timeout",
         type=float,
         default=None,
-        help="Timeout in Sekunden beim Warten auf das Startsignal (0 für unendlich, ueberschreibt Konfiguration)",
+        help="Timeout in seconds while waiting for the trigger (0 means unlimited; overrides the config file)",
     )
     parser.add_argument(
         "--max-duration",
         type=float,
         default=None,
-        help="Maximale Messdauer in Sekunden waehrend der Inferenz (0 für unendlich, ueberschreibt Konfiguration)",
+        help="Maximum measurement duration in seconds (0 means unlimited; overrides the config file)",
     )
     parser.add_argument(
         "-d", "--duration",
         type=float,
         default=None,
-        help="Dauer-Modus: Feste Messdauer in Sekunden (ueberschreibt Trigger-Modus, z. B. -d 10.0)",
+        help="Fixed-duration mode in seconds (overrides trigger mode; e.g. -d 10.0)",
     )
 
-    # ESP32 Flash-Optionen
+    # ESP32 flashing options
     parser.add_argument(
         "--flash",
         dest="flash",
         action="store_true",
         default=True,
-        help="ESP32-Programm vor der Messung automatisch bauen und flashen (Standard: aktiviert)",
+        help="Build and flash the ESP32 firmware before measuring (enabled by default)",
     )
     parser.add_argument(
         "--no-flash",
         dest="flash",
         action="store_false",
-        help="Automatisches Flashen des ESP32 vor der Messung deaktivieren",
+        help="Disable automatic ESP32 flashing before measurement",
     )
     parser.add_argument(
         "-P", "--port",
         type=str,
         default=None,
-        help="Serieller Port des ESP32 (z. B. /dev/ttyACM0 oder /dev/ttyUSB0, Standard: automatische Erkennung)",
+        help="ESP32 serial port (e.g. /dev/ttyACM0 or /dev/ttyUSB0; default: auto-detect)",
     )
     parser.add_argument(
         "--skip-build",
         action="store_true",
         default=False,
-        help="Nur flashen ohne vorheriges 'idf.py build'",
+        help="Flash without running 'idf.py build' first",
     )
     parser.add_argument(
         "--wait",
         dest="wait_unplug",
         action="store_true",
         default=True,
-        help="Nach dem Flashen auf [Enter] warten, um das USB-Kabel abziehen zu koennen (Standard: aktiviert)",
+        help="Wait for Enter after flashing so the USB cable can be disconnected (enabled by default)",
     )
     parser.add_argument(
         "--no-wait",
         dest="wait_unplug",
         action="store_false",
-        help="Nicht auf Tastendruck nach dem Flashen warten",
+        help="Do not wait for a key press after flashing",
     )
 
     args = parser.parse_args()
@@ -1079,7 +1070,7 @@ def main():
         print_available_datasets_table()
         sys.exit(0)
 
-    # Konfiguration laden
+    # Load configuration
     config = load_config(args.config)
     if args.dataset:
         config["dataset"] = args.dataset
@@ -1106,7 +1097,7 @@ def main():
     )
 
     # -------------------------------------------------------------
-    # PHASE 1: Training aller Modelle
+    # PHASE 1: Train all models
     # -------------------------------------------------------------
     if args.train:
         trained_models = train_all_models(
@@ -1143,21 +1134,21 @@ def main():
             })
 
     if not trained_models:
-        print("Keine Modelle zum Messen vorhanden.", file=sys.stderr)
+        print("No models available for measurement.", file=sys.stderr)
         sys.exit(1)
 
     total_models = len(trained_models)
 
     # -------------------------------------------------------------
-    # PHASE 2: Nacheinander auf ESP32 flashen und messen
+    # PHASE 2: Flash and measure each model on ESP32
     # -------------------------------------------------------------
     print("\n" + "=" * 70)
-    print(f">>> PHASE 2: SEQUENTIELLES FLASHEN & JOULESCOPE-MESSUNG ({total_models} Modell{'e' if total_models > 1 else ''}) <<<")
+    print(f">>> PHASE 2: SEQUENTIAL FLASHING & JOULESCOPE MEASUREMENT ({total_models} model{'s' if total_models != 1 else ''}) <<<")
     print("=" * 70)
 
     devices = joulescope.scan()
     if not devices:
-        print("Kein Joulescope-Gerät gefunden. Bitte USB-Verbindung prüfen.", file=sys.stderr)
+        print("No Joulescope device found. Check the USB connection.", file=sys.stderr)
         sys.exit(1)
 
     device = devices[0]
@@ -1166,7 +1157,7 @@ def main():
             device._driver.log_level = "OFF"
         except Exception:
             pass
-    print(f"Verbunden mit Joulescope: {device.device_serial_number or device}\n")
+    print(f"Connected to Joulescope: {device.device_serial_number or device}\n")
 
     all_results = []
 
@@ -1178,7 +1169,7 @@ def main():
             model_samples = model_entry.get("num_test_samples", num_test_samples)
 
             if not model_entry.get("deployable", True):
-                print(f"[ESP32/Joulescope] Modell '{model_name}' ist Host-only; Export und Gerätemessung werden übersprungen.")
+                print(f"[ESP32/Joulescope] Model '{model_name}' is host-only; skipping export and device measurement.")
                 all_results.append({
                     "name": model_name,
                     "type": model_entry.get("type", "ann"),
@@ -1199,38 +1190,38 @@ def main():
                 continue
 
             print("\n" + "#" * 70)
-            print(f"### [Modell {idx}/{total_models}]: '{model_name}' ({model_entry.get('structure', '')}) ###")
+            print(f"### [Model {idx}/{total_models}]: '{model_name}' ({model_entry.get('structure', '')}) ###")
             print("#" * 70 + "\n")
 
-            # 1. C/C++ Header für dieses Modell nach main/ schreiben
+            # 1. Write this model's C/C++ headers to main/
             if "tflite_bytes" in model_entry and "test_dataset" in model_entry:
                 export_model_entry_to_main(model_entry, output_dir="main")
 
-            # 2. ESP32 bei Bedarf bauen und flashen
+            # 2. Build and flash the ESP32 if needed
             flash_failed = False
             if args.flash and args.duration is None:
                 flash_ok = flash_esp32(port=args.port, build=not args.skip_build)
                 if not flash_ok:
-                    print(f"[ESP-IDF] Warnung: Flashen für Modell '{model_name}' war nicht erfolgreich. Messung wird übersprungen.", file=sys.stderr)
+                    print(f"[ESP-IDF] Warning: Failed to flash model '{model_name}'. Skipping measurement.", file=sys.stderr)
                     flash_failed = True
                 else:
                     if args.wait_unplug:
                         print("\n" + "=" * 65)
-                        print(f">>> ESP32 erfolgreich für Modell '{model_name}' geflasht! <<<")
-                        print("Sie können jetzt das USB-Kabel vom ESP32 abziehen, damit die")
-                        print("USB-Versorgung das Messergebnis nicht beeinflusst.")
-                        print("(Hinweis: ESP32 muss weiterhin über Joulescope/3.3V versorgt sein).")
+                        print(f">>> ESP32 flashed successfully for model '{model_name}'! <<<")
+                        print("You can now disconnect the USB cable from the ESP32 so that")
+                        print("USB power does not affect the measurement.")
+                        print("(Note: The ESP32 must remain powered by the Joulescope/3.3 V supply.)")
                         print("=" * 65)
                         try:
-                            input(f"\nDrücken Sie [Enter], um die Joulescope-Messung für '{model_name}' zu starten...")
+                            input(f"\nPress [Enter] to start the Joulescope measurement for '{model_name}'...")
                         except (KeyboardInterrupt, EOFError):
-                            print("\nMessung durch Benutzer abgebrochen.")
+                            print("\nMeasurement cancelled by user.")
                             break
 
             if flash_failed:
                 continue
 
-            # 3. Joulescope-Messung durchführen
+            # 3. Run the Joulescope measurement
             metrics = {}
             try:
                 if args.duration is not None and args.duration > 0:
@@ -1238,29 +1229,29 @@ def main():
                 else:
                     metrics = measure_triggered(device, pin=trigger_pin, timeout=timeout, num_inferences=model_samples, max_duration=max_duration)
             except TimeoutError as te:
-                print(f"\n[Messung fehlgeschlagen] {te}", file=sys.stderr)
+                print(f"\n[Measurement failed] {te}", file=sys.stderr)
             except KeyboardInterrupt:
-                print("\nMessung durch Benutzer abgebrochen.", file=sys.stderr)
+                print("\nMeasurement cancelled by user.", file=sys.stderr)
                 break
             except Exception as e:
-                print(f"\n[Messung fehlgeschlagen] Unerwarteter Fehler bei Modell '{model_name}': {e}", file=sys.stderr)
+                print(f"\n[Measurement failed] Unexpected error for model '{model_name}': {e}", file=sys.stderr)
 
-            # 4. Serielle Logs NACH der Messung lesen (USB muss wieder angeschlossen sein)
+            # 4. Read serial logs after measurement (USB must be reconnected)
             serial_metrics = {}
             if args.flash and args.duration is None:
                 if args.wait_unplug:
                     print("\n" + "=" * 65)
-                    print(f"Bitte schließen Sie das USB-Kabel wieder an den ESP32 an, um")
-                    print(f"die Serielle Logs auszulesen.")
+                    print(f"Reconnect the USB cable to the ESP32 to")
+                    print(f"read the serial logs.")
                     print("=" * 65)
                     try:
-                        input("Drücken Sie [Enter], sobald das USB-Kabel wieder angeschlossen ist...")
+                        input("Press [Enter] once the USB cable is reconnected...")
                     except (KeyboardInterrupt, EOFError):
-                        print("\nMessung durch Benutzer abgebrochen.")
+                        print("\nMeasurement cancelled by user.")
                         break
                 serial_metrics = capture_esp32_serial_metrics(port=args.port, timeout=60.0)
                 if serial_metrics and "esp32_acc" in serial_metrics:
-                    print(f"[ESP32] Ermittelte Test-Genauigkeit (über UART): {serial_metrics['esp32_acc']:.2f}% ({serial_metrics.get('esp32_correct')}/{serial_metrics.get('esp32_total')} korrekt)")
+                    print(f"[ESP32] Test accuracy read over UART: {serial_metrics['esp32_acc']:.2f}% ({serial_metrics.get('esp32_correct')}/{serial_metrics.get('esp32_total')} correct)")
 
             esp32_acc = model_entry.get("subset_acc", model_entry.get("subset_test_acc"))
             esp32_corr = model_entry.get("subset_correct")
@@ -1270,12 +1261,12 @@ def main():
                 esp32_corr = serial_metrics.get("esp32_correct", esp32_corr)
                 esp32_tot = serial_metrics.get("esp32_total", esp32_tot)
 
-            # ESP32-Serien-Metriken in die Joulescope-Metriken übernehmen
+            # Merge ESP32 serial metrics into the Joulescope metrics
             if serial_metrics:
                 metrics.update({k: v for k, v in serial_metrics.items() if k.startswith("esp32_")})
 
             if esp32_acc is not None:
-                print(f"[ESP32 Test-Accuracy] Modell '{model_name}': {esp32_acc:.2f}% ({esp32_corr}/{esp32_tot} Samples korrekt klassifiziert)")
+                print(f"[ESP32 test accuracy] Model '{model_name}': {esp32_acc:.2f}% ({esp32_corr}/{esp32_tot} samples classified correctly)")
 
             all_results.append({
                 "name": model_name,
@@ -1295,35 +1286,35 @@ def main():
                 "deployment_supported": model_entry.get("deployable", True),
             })
 
-            # Wenn weitere Modelle folgen und wait_unplug aktiv ist:
+            # If more models follow and wait_unplug is enabled:
             if idx < total_models and args.flash and args.wait_unplug and args.duration is None:
                 next_model_name = trained_models[idx]["name"]
                 print("\n" + "-" * 65)
-                print(f"Messung für '{model_name}' abgeschlossen.")
-                print(f"Bitte schließen Sie das USB-Kabel wieder an den ESP32 an, um")
-                print(f"das nächste Modell ('{next_model_name}') zu flashen.")
+                print(f"Measurement for '{model_name}' complete.")
+                print(f"Reconnect the USB cable to the ESP32 to")
+                print(f"flash the next model ('{next_model_name}').")
                 print("-" * 65)
                 try:
-                    input("Drücken Sie [Enter], sobald das USB-Kabel wieder angeschlossen ist...")
+                    input("Press [Enter] once the USB cable is reconnected...")
                 except (KeyboardInterrupt, EOFError):
-                    print("\nMessreihe durch Benutzer beendet.")
+                    print("\nMeasurement sequence stopped by user.")
                     break
 
     except KeyboardInterrupt:
-        print("\nMessung durch Benutzer abgebrochen.", file=sys.stderr)
+        print("\nMeasurement cancelled by user.", file=sys.stderr)
     except TimeoutError as te:
         print(f"\n{te}", file=sys.stderr)
     except Exception as e:
-        print(f"\nFehler bei der Messung: {e}", file=sys.stderr)
+        print(f"\nMeasurement error: {e}", file=sys.stderr)
     finally:
         try:
             device.close()
-            print("Joulescope-Verbindung getrennt.")
+            print("Joulescope disconnected.")
         except Exception:
             pass
 
     # -------------------------------------------------------------
-    # PHASE 3: Gesamtvergleich ausgeben
+    # PHASE 3: Print the comparison summary
     # -------------------------------------------------------------
     if all_results:
         print_comparison_summary(all_results)

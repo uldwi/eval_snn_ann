@@ -15,10 +15,10 @@ except ImportError:
     neuron = sj_layer = functional = surrogate = None
 
 class CompactSpikingTransformer(nn.Module):
-    """Kleiner spiking Transformer für 16x16-Mel-Spektrogramme.
+    """Compact spiking Transformer for 16x16 Mel spectrograms.
 
-    Die Zeitachse bildet Tokens. Projektion, Q/K/V, Attention-Residual und
-    MLP-Residual verwenden LIF-Neuronen; die Vorhersage mittelt Spike-Raten.
+    The time axis forms tokens. Projection, Q/K/V, attention residual, and
+    MLP residual use LIF neurons; predictions average spike rates.
     """
     def __init__(self, input_size: int, output_size: int, in_channels: int,
                  in_height: int, in_width: int, embed_dim: int = 32,
@@ -28,9 +28,9 @@ class CompactSpikingTransformer(nn.Module):
                  input_scale: float = 1.0):
         super().__init__()
         if not HAS_SPIKINGJELLY:
-            raise ImportError("SpikingTransformer benötigt spikingjelly")
+            raise ImportError("SpikingTransformer requires spikingjelly")
         if embed_dim % num_heads:
-            raise ValueError("transformer.embed_dim muss durch num_heads teilbar sein")
+            raise ValueError("transformer.embed_dim must be divisible by num_heads")
         self.input_size = int(input_size)
         self.in_channels = int(in_channels)
         self.in_height = int(in_height)
@@ -78,7 +78,7 @@ class CompactSpikingTransformer(nn.Module):
         if x.dim() == 4:
             x = x.mean(dim=1)
         if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
-            raise ValueError(f"SpikingTransformer erwartet (Batch, {self.in_height}, {self.in_width})")
+            raise ValueError(f"SpikingTransformer expected (batch, {self.in_height}, {self.in_width})")
 
         functional.reset_net(self)
         tokens = (self.input_projection(x.transpose(1, 2)) + self.position_embedding) * self.input_scale
@@ -111,9 +111,9 @@ class CompactSpikingTransformer(nn.Module):
             functional.reset_net(self)
 
     def get_structure_summary(self) -> str:
-        return (f"SNN-SpikingTransformer [{self.in_width} Zeit-Tokens -> "
-                f"{self.input_projection.out_features} LIF-Embedding -> "
-                f"{len(self.encoder.layers)} spikende Attention/MLP-Blöcke] "
+        return (f"SNN-SpikingTransformer [{self.in_width} time tokens -> "
+                f"{self.input_projection.out_features} LIF embedding -> "
+                f"{len(self.encoder.layers)} spiking attention/MLP blocks] "
                 f"(T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.2f}, "
                 f"Input×{self.input_scale:g})")
 
@@ -130,9 +130,9 @@ class SpikCommander(nn.Module):
                  threshold: float = 1.0, dropout_rate: float = 0.1):
         super().__init__()
         if not HAS_SPIKINGJELLY:
-            raise ImportError("SpikCommander benötigt spikingjelly für Surrogate Gradients")
+            raise ImportError("SpikCommander requires spikingjelly for surrogate gradients")
         if embed_dim % num_heads:
-            raise ValueError("transformer.embed_dim muss durch num_heads teilbar sein")
+            raise ValueError("transformer.embed_dim must be divisible by num_heads")
         self.input_size = int(input_size)
         self.in_channels = int(in_channels)
         self.in_height = int(in_height)
@@ -181,7 +181,7 @@ class SpikCommander(nn.Module):
         if x.dim() == 4:
             x = x.mean(dim=1)
         if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
-            raise ValueError(f"SpikCommander erwartet (Batch, {self.in_height}, {self.in_width}), erhalten: {tuple(x.shape)}")
+            raise ValueError(f"SpikCommander expected (batch, {self.in_height}, {self.in_width}), got: {tuple(x.shape)}")
         seq = self.input_projection(x.transpose(1, 2))  # B,T,D
         z = seq.transpose(1, 2)
         z = self._lif_sequence(self.embed_bn1(self.embed_pw(z)).permute(2, 0, 1)).permute(1, 2, 0)
@@ -193,8 +193,8 @@ class SpikCommander(nn.Module):
         return self.classifier(self.norm(self.dropout(z).mean(dim=0)))
 
     def get_structure_summary(self) -> str:
-        return (f"SNN-SpikCommander [Mel-Sequenz {self.in_width}×{self.in_height} -> "
-                f"spikendes Embedding {self.embed_dim} -> 1 Multi-view-Block -> {self.output_size}] "
+        return (f"SNN-SpikCommander [Mel sequence {self.in_width}×{self.in_height} -> "
+                f"spiking embedding {self.embed_dim} -> 1 multi-view block -> {self.output_size}] "
                 f"(β={self.beta:.2f}, θ={self.threshold:.2f})")
 
 class _SpikCommanderBlock(nn.Module):
@@ -259,12 +259,12 @@ class _SpikCommanderBlock(nn.Module):
 
 def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.Tensor:
     """
-    Kodiert Eingabedaten x (Batch, Features) oder (Batch, C, H, W) über num_steps Zeitschritte.
-    Unterstützte Encoding-Typen:
-      - 'direct' (Standard): Konstanter Eingangswert über alle Zeitschritte (T, Batch, ...)
+    Encode input x (batch, features) or (batch, C, H, W) over num_steps time steps.
+    Supported encoding types:
+      - 'direct' (default): constant input value across all time steps (T, batch, ...)
       - 'ttfs' / 'latency': Time-To-First-Spike / Latency Coding.
-      - 'poisson' / 'rate': Stochastisches Poisson-Rate-Coding mit Wahrscheinlichkeit proportional zu x.
-      - 'periodic' / 'rate_periodic': Deterministisches Rate-Coding (k = round(x * T) Spikes).
+      - 'poisson' / 'rate': stochastic Poisson rate coding with probability proportional to x.
+      - 'periodic' / 'rate_periodic': deterministic rate coding (k = round(x * T) spikes).
     """
     enc = str(encoding_type).lower().strip()
     if enc in ("direct", "constant", "raw"):
@@ -290,7 +290,7 @@ def encode_input(x: torch.Tensor, encoding_type: str, num_steps: int) -> torch.T
         return (t_indices < k.unsqueeze(0)).to(x.dtype)
 
     else:
-        raise ValueError(f"Unbekannter Encoding-Algorithmus: '{encoding_type}'. Unterstützt: 'direct', 'ttfs', 'poisson', 'periodic'")
+        raise ValueError(f"Unknown encoding algorithm: '{encoding_type}'. Supported: 'direct', 'ttfs', 'poisson', 'periodic'")
 
 def get_encoding_code(encoding_name: str) -> int:
     enc = str(encoding_name).lower().strip()
@@ -305,9 +305,9 @@ def get_encoding_code(encoding_name: str) -> int:
 
 class ConfigurableSpikingJellySNN(nn.Module):
     """
-    Spiking Neural Network (SNN / CSNN) trainiert mit SpikingJelly.
-    Unterstützt LIFNode (Leaky-Integrate-and-Fire) und IFNode (Integrate-and-Fire) Neuronen,
-    Convolutional Layers, MaxPool2D, Flatten, Fully-Connected Layers und frei wählbare Encodings.
+    Spiking neural network (SNN / CSNN) implemented with SpikingJelly.
+    Supports LIFNode (Leaky-Integrate-and-Fire) and IFNode (Integrate-and-Fire) neurons,
+    convolutional layers, MaxPool2D, Flatten, fully connected layers, and configurable encodings.
     """
     def __init__(
         self,
@@ -353,16 +353,16 @@ class ConfigurableSpikingJellySNN(nn.Module):
         self.input_scale = float(input_scale)
         self.output_readout = str(output_readout).lower().strip()
         if self.output_readout not in ("spike", "analog"):
-            raise ValueError("output_readout muss 'spike' oder 'analog' sein.")
+            raise ValueError("output_readout must be 'spike' or 'analog'.")
         if self.input_scale <= 0.0:
-            raise ValueError("input_scale muss groesser als 0 sein.")
+            raise ValueError("input_scale must be greater than 0.")
         if self.temporal_input and conv_layers:
-            raise ValueError("temporal_input benötigt derzeit ein SNN ohne Conv-Layer.")
+            raise ValueError("temporal_input currently requires an SNN without convolutional layers.")
         if self.temporal_input:
             if self.encoding_type != "direct":
-                raise ValueError("temporal_input benötigt encoding_type: direct.")
-            # Dataset-Tensor liegt als [Kanal, Merkmal, Zeit] vor. Jeder
-            # Zeitschritt wird als eigener Vektor in die FC-Schichten gegeben.
+                raise ValueError("temporal_input requires encoding_type: direct.")
+            # Dataset tensors have shape [channel, feature, time]. Each
+            # time step is passed to the fully connected layers as a separate vector.
             self.num_steps = int(in_width)
         self.threshold = float(threshold)
         self.dropout_rate = float(dropout_rate) if dropout_rate is not None else 0.0
@@ -491,8 +491,8 @@ class ConfigurableSpikingJellySNN(nn.Module):
 
     def simulate_event_based(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Simuliert die SNN-Inferenz ereignisgesteuert (Event-by-Event) Zeitschritt für Zeitschritt
-        und ermittelt Spike-Events, synaptische Operationen (SynOps) und Sparsity.
+        Simulate SNN inference in an event-driven, step-by-step manner
+        and compute spike events, synaptic operations (SynOps), and sparsity.
         """
         self.eval()
         with torch.no_grad():
@@ -519,7 +519,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
             total_synops = 0
             total_possible_ops = 0
 
-            # Forward über Schritte
+            # Forward pass over time steps
             if self.has_conv:
                 cur = x_seq
                 for conv, lif, pool in zip(self.conv_layers_list, self.conv_lif_list, self.conv_pool_list):
