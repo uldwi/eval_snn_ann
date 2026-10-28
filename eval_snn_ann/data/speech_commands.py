@@ -50,6 +50,24 @@ class SpeechCommandsDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    @staticmethod
+    def _apply_spec_augment(features: torch.Tensor) -> torch.Tensor:
+        """Apply one time and one frequency mask to a cached Mel feature map."""
+        augmented = features.clone()
+        mel_bins, frames = augmented.shape[-2:]
+        # Preserve the original large-model masks while scaling them to smaller maps.
+        max_freq_width = min(12, mel_bins) if mel_bins == 140 else max(1, int(mel_bins * 0.1))
+        max_time_width = min(10, frames) if frames == 100 else max(1, int(frames * 0.1))
+        freq_width = int(np.random.randint(0, max_freq_width + 1))
+        if freq_width:
+            freq_start = int(np.random.randint(0, mel_bins - freq_width + 1))
+            augmented[:, freq_start:freq_start + freq_width, :] = 0
+        time_width = int(np.random.randint(0, max_time_width + 1))
+        if time_width:
+            time_start = int(np.random.randint(0, frames - time_width + 1))
+            augmented[:, :, time_start:time_start + time_width] = 0
+        return augmented
+
     def load_normalized_audio(self, index, resample=True):
         """Lädt einen Clip als mono float32 PCM mit genau einer Sekunde Länge."""
         wav_path, sample_rate, _ = self.samples[index]
@@ -83,18 +101,9 @@ class SpeechCommandsDataset(Dataset):
         cached = self.feature_cache[index]
         if cached is not None:
             result = cached
-            if not (self.augment and self.spikcommander):
+            if not self.augment:
                 return result
-            features = result[0].clone()
-            freq_width = int(np.random.randint(0, 13))
-            if freq_width:
-                freq_start = int(np.random.randint(0, 141 - freq_width))
-                features[:, freq_start:freq_start + freq_width, :] = 0
-            time_width = int(np.random.randint(0, 11))
-            if time_width:
-                time_start = int(np.random.randint(0, 101 - time_width))
-                features[:, :, time_start:time_start + time_width] = 0
-            return features, result[1]
+            return self._apply_spec_augment(result[0]), result[1]
 
         _, sample_rate, label = self.samples[index]
         waveform = torch.from_numpy(self.load_normalized_audio(index).copy()).unsqueeze(0)
@@ -107,16 +116,6 @@ class SpeechCommandsDataset(Dataset):
         features = torch.nn.functional.adaptive_avg_pool2d(mel.unsqueeze(0), target_shape).squeeze(0)
         result = (features.to(torch.float32), self.keyword_to_index[label])
         self.feature_cache[index] = result
-        if self.augment and self.spikcommander:
-            features = result[0].clone()
-            # Light SpecAugment: one frequency mask and one temporal mask.
-            freq_width = int(np.random.randint(0, 13))
-            if freq_width:
-                freq_start = int(np.random.randint(0, 141 - freq_width))
-                features[:, freq_start:freq_start + freq_width, :] = 0
-            time_width = int(np.random.randint(0, 11))
-            if time_width:
-                time_start = int(np.random.randint(0, 101 - time_width))
-                features[:, :, time_start:time_start + time_width] = 0
-            return features, result[1]
+        if self.augment:
+            return self._apply_spec_augment(result[0]), result[1]
         return result

@@ -98,6 +98,7 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
         "name": str(config.get("name", model_cfg.get("name", "model"))),
         "type": model_type,
         "dataset": dataset_name,
+        "spec_augment": bool(model_cfg.get("spec_augment", False)),
         # Bump when cached dataset preprocessing changes without changing its
         # public dataset name or tensor dimensions.
         "dataset_pipeline_version": (
@@ -269,6 +270,7 @@ def train_model(
         name=dataset_name,
         data_dir=data_dir,
         seed=random_seed if random_seed is not None else 42,
+        augment_train=bool(model_cfg.get("spec_augment", False)),
     )
     selection_dataset = dataset_info.validation_dataset or test_dataset
     selection_label = "Validation" if dataset_info.validation_dataset is not None else "Test"
@@ -533,6 +535,8 @@ def train_model(
             f"  - ANN teacher model:  enabled (alpha={distill_alpha:.2f}, "
             f"temperature={distill_temperature:g})"
         )
+    if bool(model_cfg.get("spec_augment", False)):
+        print("  - Training augmentation: SpecAugment (training split only)")
     if early_stopping_enabled:
         print(f"  - Early stopping:      Enabled (patience: {patience}, min delta: {min_delta}, metric: {monitor}, restore best weights: {restore_best_weights})")
     else:

@@ -19,6 +19,7 @@ def get_dataset(
     data_dir: str = "./data",
     download: bool = True,
     seed: int = 42,
+    augment_train: bool = False,
 ) -> Tuple[Dataset, Dataset, DatasetInfo]:
     """
     Lädt einen Datensatz anhand des Namens oder Alias.
@@ -125,7 +126,10 @@ def get_dataset(
         spikcommander = key == "speech_commands_spikcommander"
         info.validation_dataset = SpeechCommandsDataset(validation_source, torchaudio, spikcommander=spikcommander)
         return (
-            SpeechCommandsDataset(train_source, torchaudio, spikcommander=spikcommander, augment=spikcommander),
+            SpeechCommandsDataset(
+                train_source, torchaudio, spikcommander=spikcommander,
+                augment=spikcommander or augment_train,
+            ),
             SpeechCommandsDataset(test_source, torchaudio, spikcommander=spikcommander),
             info,
         )
