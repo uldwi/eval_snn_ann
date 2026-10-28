@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import tflite
 
-from .models import ConfigurableANN, ConfigurableSpikingJellySNN
+from .models import ConfigurableANN, ConfigurableSpikingJellySNN, get_encoding_code
 
 def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJellySNN]) -> bytes:
     """
