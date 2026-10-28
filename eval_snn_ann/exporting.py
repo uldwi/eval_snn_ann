@@ -692,6 +692,19 @@ def export_c_files(
             f.write(f"    .input_scale = {getattr(model, 'input_scale', 1.0):.6f}f,\n")
             f.write(f"    .analog_readout = {1 if getattr(model, 'output_readout', 'spike') == 'analog' else 0},\n")
             f.write("};\n")
+        if not is_transformer:
+            # Firmware code references transformer globals from shared
+            # inference paths even when the selected model is a regular ANN
+            # or SNN. Emit inert definitions so those builds link as well.
+            f.write("const transformer_config_t g_transformer_config = {};\n")
+            f.write("const float* const g_transformer_input_w = nullptr;\n")
+            f.write("const float* const g_transformer_input_b = nullptr;\n")
+            f.write("const float* const g_transformer_position = nullptr;\n")
+            f.write("const transformer_layer_weights_t g_transformer_layers[] = {{nullptr}};\n")
+            f.write("const float* const g_transformer_norm_w = nullptr;\n")
+            f.write("const float* const g_transformer_norm_b = nullptr;\n")
+            f.write("const float* const g_transformer_classifier_w = nullptr;\n")
+            f.write("const float* const g_transformer_classifier_b = nullptr;\n\n")
 
         if dataset_name in ("speech_commands", "kws"):
             hz_to_mel = lambda hz: 2595.0 * np.log10(1.0 + hz / 700.0)
