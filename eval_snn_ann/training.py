@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from .config import DEFAULT_CONFIG, parse_conv_layers
 from .data.hub import DatasetInfo, get_dataset, normalize_dataset_name
 from .models import (
-    ConfigurableANN, ConfigurableSpikingJellySNN, HAS_SPIKINGJELLY,
+    CompactTransformerANN, ConfigurableANN, ConfigurableSpikingJellySNN, HAS_SPIKINGJELLY,
     build_model_from_config, transfer_ann_to_snn,
 )
 from .models.snn import functional
@@ -98,7 +98,6 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
         "name": str(config.get("name", model_cfg.get("name", "model"))),
         "type": model_type,
         "dataset": dataset_name,
-        "spec_augment": bool(model_cfg.get("spec_augment", False)),
         # Bump when cached dataset preprocessing changes without changing its
         # public dataset name or tensor dimensions.
         "dataset_pipeline_version": (
@@ -120,6 +119,10 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "random_seed": train_cfg.get("random_seed", 42),
         },
     }
+
+    # Preserve existing cache signatures for models without SpecAugment.
+    if bool(model_cfg.get("spec_augment", False)):
+        signature["spec_augment"] = True
 
     if dataset_info is not None:
         signature["dataset_dims"] = {

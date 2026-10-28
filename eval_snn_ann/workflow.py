@@ -98,6 +98,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "hidden_layers": hidden_layers,
                 "output_size": output_size,
             }
+            if bool(m.get("spec_augment", False)):
+                model_dict["spec_augment"] = True
             architecture = str(m.get("architecture", "standard"))
             if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer", "spikcommander", "spik_commander"):
                 model_dict["architecture"] = architecture
