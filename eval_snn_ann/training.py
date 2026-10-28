@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from .config import DEFAULT_CONFIG
+from .config import DEFAULT_CONFIG, parse_conv_layers
 from .data.hub import DatasetInfo, get_dataset, normalize_dataset_name
 from .models import (
     ConfigurableANN, ConfigurableSpikingJellySNN, HAS_SPIKINGJELLY,
@@ -194,6 +194,39 @@ def _signature_differences(previous: Any, current: Any, prefix: str = "") -> Lis
     if previous != current:
         return [f"{prefix}: {previous!r} -> {current!r}"]
     return []
+
+
+def _normalize_signature_for_comparison(signature: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize harmless schema differences in checkpoints from older releases."""
+    normalized = copy.deepcopy(signature)
+    dataset_name = normalize_dataset_name(normalized.get("dataset", "mnist"))
+
+    # These fields were added after early checkpoints had already been saved.
+    normalized.setdefault("architecture", "standard")
+    normalized.setdefault("transformer", {})
+    if "dataset_pipeline_version" not in normalized:
+        pipeline_version = (
+            2 if dataset_name == "speech_commands_spikcommander"
+            else (1 if dataset_name == "physionet_eeg_mi_csp_temporal" else 1)
+        )
+        # Do not treat a missing version as current if the preprocessing has
+        # since had an explicit version bump.
+        if pipeline_version == 1:
+            normalized["dataset_pipeline_version"] = 1
+
+    # Older signatures stored only user-specified convolution values, while
+    # newer ones include the parser's expanded defaults.
+    if isinstance(normalized.get("conv_layers"), list):
+        normalized["conv_layers"] = parse_conv_layers(normalized["conv_layers"])
+
+    # These SNN controls were added to checkpoint signatures after their
+    # behavior had already been established as the constructor defaults.
+    if normalized.get("type") == "snn" and isinstance(normalized.get("snn_params"), dict):
+        snn_params = normalized["snn_params"]
+        snn_params.setdefault("temporal_input", False)
+        snn_params.setdefault("input_scale", 1.0)
+        snn_params.setdefault("output_readout", "spike")
+    return normalized
 
 def train_model(
     config: Dict[str, Any],
@@ -384,7 +417,13 @@ def train_model(
                 checkpoint = torch.load(cache_checkpoint_path, map_location=device)
 
             cached_hash = checkpoint.get("config_hash")
-            if cached_hash == sig_hash and "state_dict" in checkpoint:
+            cached_signature = checkpoint.get("config_signature")
+            cache_signature_matches = (
+                isinstance(cached_signature, dict)
+                and _normalize_signature_for_comparison(cached_signature)
+                == _normalize_signature_for_comparison(signature)
+            )
+            if (cached_hash == sig_hash or cache_signature_matches) and "state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["state_dict"])
                 test_acc = float(checkpoint.get("test_acc", 0.0))
                 test_loss = float(checkpoint.get("test_loss", 0.0))
@@ -395,7 +434,8 @@ def train_model(
                 print(f"  - Checkpoint:           {cache_checkpoint_path}")
                 print(f"  - Dataset:              {dataset_info.name} ({dataset_info.domain})")
                 print(f"  - Architecture:         {model.get_structure_summary()}")
-                print(f"  - Configuration hash:   {sig_hash[:12]} (unchanged)")
+                hash_status = "unchanged" if cached_hash == sig_hash else "compatible legacy signature"
+                print(f"  - Configuration hash:   {sig_hash[:12]} ({hash_status})")
                 print(f"  - Saved accuracy:       {test_acc:.2f}% (epoch {best_epoch})")
                 print(f"  - Saved loss:           {test_loss:.4f}")
                 print(f"  -> No retraining needed (cache hit).\n")
@@ -404,7 +444,6 @@ def train_model(
                 old_h = str(cached_hash)[:12] if cached_hash else "None"
                 print(f"\n[Cache] Found saved model '{model_name}', but configuration/hyperparameters changed:")
                 print(f"        Previous hash: {old_h} -> New hash: {sig_hash[:12]}")
-                cached_signature = checkpoint.get("config_signature")
                 if cached_signature:
                     differences = _signature_differences(cached_signature, signature)
                     for difference in differences[:8]:

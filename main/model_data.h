@@ -9,6 +9,7 @@ extern "C" {
 
 #define MODEL_TYPE_ANN 0
 #define MODEL_TYPE_SNN 1
+
 #define MODEL_TYPE_TRANSFORMER 2
 
 #define NEURON_TYPE_LIF 0
@@ -64,16 +65,12 @@ typedef struct {
     const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;
 } transformer_layer_weights_t;
 
-typedef struct {
-    int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size;
-    int spiking, num_steps;
-    float beta, threshold, input_scale;
-} transformer_config_t;
+typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; } transformer_config_t;
 
 extern const int g_model_type;
 extern const char* const g_model_name;
 
-// ANN-Spezifisch (TensorFlow Lite Micro FlatBuffer)
+// ANN-specific TensorFlow Lite Micro FlatBuffer
 extern const unsigned char g_model[];
 extern const int g_model_len;
 
@@ -83,6 +80,7 @@ extern const float* const g_snn_conv_weights[];
 extern const float* const g_snn_conv_biases[];
 extern const float* const g_snn_fc_weights[];
 extern const float* const g_snn_fc_biases[];
+
 extern const transformer_config_t g_transformer_config;
 extern const float* const g_transformer_input_w;
 extern const float* const g_transformer_input_b;
@@ -92,6 +90,7 @@ extern const float* const g_transformer_norm_w;
 extern const float* const g_transformer_norm_b;
 extern const float* const g_transformer_classifier_w;
 extern const float* const g_transformer_classifier_b;
+
 extern const float* const g_speech_mel_filterbank;
 
 #ifdef __cplusplus
