@@ -143,7 +143,7 @@ class SpikCommander(nn.Module):
         self.is_spiking_transformer = True
         self.is_spikcommander = True
         self.is_compact_transformer = True
-        self.deployable = False  # Firmware needs the dedicated temporal architecture.
+        self.deployable = True
         self.neuron_type = "lif"
         self.encoding_type = "temporal"
         self.beta = float(beta)

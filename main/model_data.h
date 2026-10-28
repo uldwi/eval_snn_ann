@@ -12,6 +12,8 @@ extern "C" {
 
 #define MODEL_TYPE_TRANSFORMER 2
 
+#define MODEL_TYPE_SPIKCOMMANDER 3
+
 #define NEURON_TYPE_LIF 0
 #define NEURON_TYPE_IF  1
 
@@ -67,6 +69,45 @@ typedef struct {
 
 typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; } transformer_config_t;
 
+#define SPIKCOMMANDER_PARAM_COUNT 40
+#define SC_INPUT_W 0
+#define SC_INPUT_B 1
+#define SC_EMBED_PW_W 2
+#define SC_EMBED_DW_W 3
+#define SC_BN1_W 4
+#define SC_BN1_B 5
+#define SC_BN1_MEAN 6
+#define SC_BN1_VAR 7
+#define SC_BN2_W 8
+#define SC_BN2_B 9
+#define SC_BN2_MEAN 10
+#define SC_BN2_VAR 11
+#define SC_EMBED_RES_W 12
+#define SC_NORM_W 13
+#define SC_NORM_B 14
+#define SC_CLASSIFIER_W 15
+#define SC_CLASSIFIER_B 16
+#define SC_B_NORM1_W 17
+#define SC_B_NORM1_B 18
+#define SC_QKV_W 19
+#define SC_QKV_B 20
+#define SC_GLOBAL_W 21
+#define SC_GLOBAL_B 22
+#define SC_LOCAL_W 23
+#define SC_LOCAL_B 24
+#define SC_VALUE_CONV_W 25
+#define SC_ATTN_W 26
+#define SC_ATTN_B 27
+#define SC_B_NORM2_W 28
+#define SC_B_NORM2_B 29
+#define SC_FF_IN_W 30
+#define SC_FF_IN_B 31
+#define SC_FF_CONTEXT_W 32
+#define SC_FF_OUT_W 33
+#define SC_FF_OUT_B 34
+
+typedef struct { int tokens, input_features, embed_dim, num_heads, output_size; float beta, threshold; const float *p[40]; } spikcommander_weights_t;
+
 extern const int g_model_type;
 extern const char* const g_model_name;
 
@@ -91,7 +132,11 @@ extern const float* const g_transformer_norm_b;
 extern const float* const g_transformer_classifier_w;
 extern const float* const g_transformer_classifier_b;
 
+extern const spikcommander_weights_t g_spikcommander;
+
 extern const float* const g_speech_mel_filterbank;
+
+extern const float* const g_speech_resample_filter;
 
 #ifdef __cplusplus
 }

@@ -27,6 +27,9 @@
 #ifndef HAS_SPEECH_AUDIO
 #define HAS_SPEECH_AUDIO 0
 #endif
+#ifndef SPIKCOMMANDER_AUDIO
+#define SPIKCOMMANDER_AUDIO 0
+#endif
 
 #define TRIGGER_GPIO GPIO_NUM_4
 
@@ -51,22 +54,40 @@ static int argmax_float(const float *arr, int len) {
 // ESP32-S3 FP32 inference for the compact Transformer defined in Python.
 // Export dimensions are intentionally fixed so the workspace
 // remains static and large temporary tensors do not use the task stack.
+#if SPIKCOMMANDER_AUDIO
+static constexpr int KWS_TOKENS = 100;
+static constexpr int KWS_FEATURES = 140;
+static constexpr int KWS_EMBED = 64;
+static constexpr int KWS_HEADS = 4;
+static constexpr int KWS_FFN = 256;
+static constexpr int KWS_LAYERS = 1;
+static constexpr int KWS_CLASSES = 35;
+static constexpr int SPEECH_SAMPLE_RATE = 8000;
+static constexpr int SPEECH_NFFT = 256;
+static constexpr int SPEECH_BINS = 129;
+static constexpr int SPEECH_HOP = 80;
+static constexpr int SPEECH_FRAMES = 101;
+static constexpr int SPEECH_MELS = 140;
+#else
 static constexpr int KWS_TOKENS = 16;
 static constexpr int KWS_FEATURES = 16;
 static constexpr int KWS_EMBED = 32;
 static constexpr int KWS_HEADS = 4;
-static constexpr int KWS_HEAD_DIM = KWS_EMBED / KWS_HEADS;
 static constexpr int KWS_FFN = 64;
 static constexpr int KWS_LAYERS = 2;
 static constexpr int KWS_CLASSES = 35;
+#endif
+static constexpr int KWS_HEAD_DIM = KWS_EMBED / KWS_HEADS;
 
 #if HAS_SPEECH_AUDIO
+#if !SPIKCOMMANDER_AUDIO
 static constexpr int SPEECH_SAMPLE_RATE = 16000;
 static constexpr int SPEECH_NFFT = 400;
 static constexpr int SPEECH_BINS = 201;
 static constexpr int SPEECH_HOP = 160;
 static constexpr int SPEECH_FRAMES = 101;
 static constexpr int SPEECH_MELS = 40;
+#endif
 
 struct SpeechComplex { float re, im; };
 static float s_speech_hann[SPEECH_NFFT];
@@ -74,8 +95,14 @@ static SpeechComplex s_speech_twiddle[SPEECH_NFFT];
 static SpeechComplex s_speech_fft_input[SPEECH_NFFT];
 static SpeechComplex s_speech_fft_output[SPEECH_NFFT];
 static SpeechComplex s_speech_fft_work[8][SPEECH_NFFT];
-static float s_speech_mel_power[SPEECH_MELS * SPEECH_FRAMES];
-static float s_speech_features[KWS_FEATURES * KWS_TOKENS];
+static union {
+    float mel_power[SPEECH_MELS * SPEECH_FRAMES];
+    float features[KWS_FEATURES * KWS_TOKENS];
+} s_speech_workspace;
+#define s_speech_mel_power s_speech_workspace.mel_power
+#if SPIKCOMMANDER_AUDIO
+static float s_speech_audio_8k[8000];
+#endif
 static bool s_speech_frontend_ready = false;
 
 static void init_speech_frontend(void) {
@@ -127,16 +154,38 @@ static int speech_reflect_index(int index) {
     return index;
 }
 
+#if SPIKCOMMANDER_AUDIO
+static void speech_resample_16k_to_8k(const int16_t *audio) {
+    for (int n=0;n<8000;++n) {
+        float value=0.0f;
+        for (int k=0;k<41;++k) {
+            int source=2*n+k-20;
+            if(source>=0 && source<16000)
+                value += (static_cast<float>(audio[source])/32768.0f) * g_speech_resample_filter[k];
+        }
+        s_speech_audio_8k[n]=value;
+    }
+}
+#endif
+
 static void speech_audio_to_mel(const int16_t *audio, float *features) {
     if (!s_speech_frontend_ready) init_speech_frontend();
+#if SPIKCOMMANDER_AUDIO
+    speech_resample_16k_to_8k(audio);
+    const float *pcm = s_speech_audio_8k;
+#else
+    const float *pcm = nullptr;
+#endif
     float mel_max = -100.0f;
     for (int frame = 0; frame < SPEECH_FRAMES; ++frame) {
         const int center = frame * SPEECH_HOP;
         for (int n = 0; n < SPEECH_NFFT; ++n) {
             const int sample_idx = speech_reflect_index(center + n - SPEECH_NFFT / 2);
-            s_speech_fft_input[n] = {
-                (static_cast<float>(audio[sample_idx]) / 32768.0f) * s_speech_hann[n], 0.0f
-            };
+#if SPIKCOMMANDER_AUDIO
+            s_speech_fft_input[n] = {pcm[sample_idx] * s_speech_hann[n], 0.0f};
+#else
+            s_speech_fft_input[n] = {(static_cast<float>(audio[sample_idx]) / 32768.0f) * s_speech_hann[n], 0.0f};
+#endif
         }
         speech_fft400(s_speech_fft_input, 1, SPEECH_NFFT, s_speech_fft_output, 0);
         for (int mel = 0; mel < SPEECH_MELS; ++mel) {
@@ -179,6 +228,7 @@ static void speech_audio_to_mel(const int16_t *audio, float *features) {
 }
 #endif
 
+#if !SPIKCOMMANDER_AUDIO
 static float s_tr_x[KWS_TOKENS * KWS_EMBED];
 static float s_tr_norm[KWS_TOKENS * KWS_EMBED];
 static float s_tr_qkv[KWS_TOKENS * 3 * KWS_EMBED];
@@ -437,6 +487,177 @@ static int run_transformer_inference(const float *mel) {
     transformer_linear(s_tr_proj, 1, KWS_EMBED, g_transformer_classifier_w,
                        g_transformer_classifier_b, KWS_CLASSES, s_tr_logits);
     return argmax_float(s_tr_logits, KWS_CLASSES);
+}
+#endif
+
+// Static workspace for the one-block, 64-channel SpikCommander variant.
+static float sc_seq[100 * 64], sc_x[100 * 64], sc_tmp[100 * 64], sc_tmp2[100 * 64];
+static float sc_qkv[100 * 3 * 64], sc_ff_ring[31 * 256];
+static float sc_logits[35];
+static uint32_t sc_spikes, sc_synops;
+static uint32_t sc_last_spikes;
+static float sc_lif_v[256], sc_gate_in[64], sc_gate[64];
+static float sc_ff_v[256], sc_combined_v[256], sc_out_v[64], sc_final_v[64];
+static float sc_pooled[64], sc_combined_spikes[256], sc_out_spikes[64];
+static float sc_attn_scores[41];
+static int sc_attn_offsets[41];
+
+static void sc_linear(const float *x, int rows, int in, const float *w,
+                      const float *bias, int out, float *y) {
+    for (int r = 0; r < rows; ++r) for (int o = 0; o < out; ++o) {
+        float v = bias ? bias[o] : 0.0f;
+        for (int i = 0; i < in; ++i) v += x[r * in + i] * w[o * in + i];
+        y[r * out + o] = v;
+    }
+}
+
+static void sc_norm(const float *x, int rows, int dim, const float *w,
+                    const float *b, float *y) {
+    for (int r = 0; r < rows; ++r) {
+        float mean = 0.0f, var = 0.0f;
+        for (int d = 0; d < dim; ++d) mean += x[r * dim + d];
+        mean /= dim;
+        for (int d = 0; d < dim; ++d) { float z=x[r*dim+d]-mean; var += z*z; }
+        float inv = 1.0f / sqrtf(var / dim + 1.0e-5f);
+        for (int d = 0; d < dim; ++d) y[r*dim+d] = (x[r*dim+d]-mean)*inv*w[d]+b[d];
+    }
+}
+
+static void sc_lif(const float *x, int steps, int channels, float *y) {
+    memset(sc_lif_v, 0, sizeof(sc_lif_v));
+    sc_last_spikes = 0;
+    for (int t=0; t<steps; ++t) for (int c=0; c<channels; ++c) {
+        sc_lif_v[c] = g_spikcommander.beta * sc_lif_v[c] + x[t*channels+c];
+        float s = sc_lif_v[c] >= g_spikcommander.threshold ? 1.0f : 0.0f;
+        sc_lif_v[c] -= s * g_spikcommander.threshold;
+        y[t*channels+c] = s;
+        sc_spikes += (uint32_t)s;
+        sc_last_spikes += (uint32_t)s;
+    }
+}
+
+static void sc_bn(const float *x, int tcount, const float *weight,
+                  const float *bias, const float *mean, const float *var, float *y) {
+    for (int t=0;t<tcount;++t) for(int d=0;d<64;++d)
+        y[t*64+d] = (x[t*64+d]-mean[d]) / sqrtf(var[d]+1.0e-5f) * weight[d] + bias[d];
+}
+
+static int run_spikcommander(const float *mel) {
+    const spikcommander_weights_t &m = g_spikcommander;
+    const float *const *p = m.p;
+    constexpr int T=100, F=140, D=64, H=4, HD=16, FF=256;
+    sc_spikes=0; sc_synops=0;
+    // Input projection: [mel-bin, time] -> [time, embedding].
+    for(int t=0;t<T;++t) for(int d=0;d<D;++d) {
+        float a=p[SC_INPUT_B][d];
+        for(int f=0;f<F;++f) a += mel[f*T+t]*p[SC_INPUT_W][d*F+f];
+        sc_seq[t*D+d]=a;
+    }
+    // Pointwise embedding conv, BN, and temporal LIF.
+    for(int t=0;t<T;++t) for(int o=0;o<D;++o) {
+        float a=0; for(int i=0;i<D;++i) a+=sc_seq[t*D+i]*p[SC_EMBED_PW_W][o*D+i];
+        sc_tmp[t*D+o]=a;
+    }
+    sc_bn(sc_tmp,T,p[SC_BN1_W],p[SC_BN1_B],p[SC_BN1_MEAN],p[SC_BN1_VAR],sc_tmp2);
+    sc_lif(sc_tmp2,T,D,sc_x);
+    sc_synops += sc_last_spikes * D;
+    // Depthwise temporal convolution (kernel 7), BN, then LIF.
+    for(int t=0;t<T;++t) for(int d=0;d<D;++d) {
+        float a=0; for(int k=0;k<7;++k) { int it=t+k-3; if(it>=0&&it<T) a+=sc_x[it*D+d]*p[SC_EMBED_DW_W][d*7+k]; }
+        sc_tmp[t*D+d]=a;
+    }
+    sc_bn(sc_tmp,T,p[SC_BN2_W],p[SC_BN2_B],p[SC_BN2_MEAN],p[SC_BN2_VAR],sc_tmp2);
+    sc_lif(sc_tmp2,T,D,sc_tmp);
+    sc_synops += sc_last_spikes * 7;
+    // Residual projection from the non-spiking input embedding.
+    for(int t=0;t<T;++t) for(int o=0;o<D;++o) {
+        float a=sc_tmp[t*D+o]; for(int i=0;i<D;++i) a+=sc_seq[t*D+i]*p[SC_EMBED_RES_W][o*D+i];
+        sc_tmp2[t*D+o]=a;
+    }
+    sc_lif(sc_tmp2,T,D,sc_x);
+    sc_synops += sc_last_spikes * (3 * D);
+    // Single SpikCommander multi-view block.
+    sc_norm(sc_x,T,D,p[SC_B_NORM1_W],p[SC_B_NORM1_B],sc_tmp);
+    sc_linear(sc_tmp,T,D,p[SC_QKV_W],p[SC_QKV_B],3*D,sc_qkv);
+    // q, k, v have independent LIF state, reset at the start of the sequence.
+    for(int part=0;part<3;++part) {
+        for(int t=0;t<T;++t) for(int d=0;d<D;++d) sc_tmp[t*D+d]=sc_qkv[t*3*D+part*D+d];
+        sc_lif(sc_tmp,T,D,sc_tmp2);
+        for(int t=0;t<T;++t) for(int d=0;d<D;++d) sc_qkv[t*3*D+part*D+d]=sc_tmp2[t*D+d];
+        sc_synops += sc_last_spikes * (part == 0 || part == 1 ? (T < 41 ? T : 41) * HD : (T < 41 ? T : 41) * HD);
+    }
+    for(int d=0;d<D;++d) { sc_gate_in[d]=0; for(int t=0;t<T;++t) sc_gate_in[d]+=(sc_qkv[t*3*D+d]+sc_qkv[t*3*D+D+d])/T; }
+    sc_linear(sc_gate_in,1,D,p[SC_GLOBAL_W],p[SC_GLOBAL_B],D,sc_gate);
+    sc_lif(sc_gate,1,D,sc_gate);
+    sc_synops += sc_last_spikes * T;
+    // Local value convolution and local gate.
+    for(int t=0;t<T;++t) for(int d=0;d<D;++d) {
+        float a=0; for(int k=0;k<9;++k) { int it=t+k-4; if(it>=0&&it<T) a+=sc_qkv[it*3*D+2*D+d]*p[SC_VALUE_CONV_W][d*9+k]; }
+        sc_tmp[t*D+d]=a+sc_qkv[t*3*D+d];
+    }
+    sc_linear(sc_tmp,T,D,p[SC_LOCAL_W],p[SC_LOCAL_B],D,sc_tmp2);
+    sc_lif(sc_tmp2,T,D,sc_tmp);
+    sc_synops += sc_last_spikes * D;
+    // 41-frame local attention per head, with the learned global gate on V.
+    for(int t=0;t<T;++t) for(int h=0;h<H;++h) {
+        float denom=0; int n=0;
+        for(int off=-20;off<=20;++off) { int k=t+off; if(k<0||k>=T) continue; float s=0;
+            for(int d=0;d<HD;++d) s+=sc_qkv[t*3*D+h*HD+d]*sc_qkv[k*3*D+D+h*HD+d];
+            sc_attn_scores[n]=expf(s/sqrtf((float)HD)); sc_attn_offsets[n++]=k;
+        }
+        for(int i=0;i<n;++i) denom+=sc_attn_scores[i];
+        for(int d=0;d<HD;++d) { float a=0; for(int i=0;i<n;++i) a+=sc_attn_scores[i]/denom*sc_qkv[sc_attn_offsets[i]*3*D+2*D+h*HD+d];
+            sc_tmp2[t*D+h*HD+d]=a*sc_tmp[t*D+h*HD+d]; }
+    }
+    for(int t=0;t<T;++t) for(int d=0;d<D;++d) sc_tmp2[t*D+d]+=sc_qkv[t*3*D+2*D+d]*sc_gate[d];
+    sc_linear(sc_tmp2,T,D,p[SC_ATTN_W],p[SC_ATTN_B],D,sc_tmp);
+    sc_lif(sc_tmp,T,D,sc_tmp2);
+    sc_synops += sc_last_spikes * D;
+    for(int i=0;i<T*D;++i) sc_tmp[i]=sc_x[i]+sc_tmp2[i];
+    sc_lif(sc_tmp,T,D,sc_x);
+    sc_synops += sc_last_spikes * (4 * D);
+    sc_norm(sc_x,T,D,p[SC_B_NORM2_W],p[SC_B_NORM2_B],sc_tmp);
+    uint32_t ff_events=0, combined_events=0, out_events=0, readout_events=0;
+    memset(sc_ff_v,0,sizeof(sc_ff_v)); memset(sc_combined_v,0,sizeof(sc_combined_v));
+    memset(sc_out_v,0,sizeof(sc_out_v)); memset(sc_final_v,0,sizeof(sc_final_v));
+    memset(sc_pooled,0,sizeof(sc_pooled));
+    // Delay output by 15 frames so the centered depthwise context convolution
+    // can run from a 31-frame ring buffer instead of a 100x256 SRAM tensor.
+    for(int t=0;t<T+15;++t) {
+        if(t<T) for(int o=0;o<FF;++o) {
+            float a=p[SC_FF_IN_B][o];
+            for(int i=0;i<D;++i) a+=sc_tmp[t*D+i]*p[SC_FF_IN_W][o*D+i];
+            sc_ff_v[o]=m.beta*sc_ff_v[o]+a;
+            float s=sc_ff_v[o]>=m.threshold?1.0f:0.0f; sc_ff_v[o]-=s*m.threshold;
+            sc_ff_ring[(t%31)*FF+o]=s; sc_spikes+=(uint32_t)s; ff_events+=(uint32_t)s;
+        }
+        int target=t-15;
+        if(target<0 || target>=T) continue;
+        for(int d=0;d<FF;++d) {
+            float context=0.0f;
+            for(int k=0;k<31;++k) { int source=target+k-15; if(source>=0&&source<T) context+=sc_ff_ring[(source%31)*FF+d]*p[SC_FF_CONTEXT_W][d*31+k]; }
+            sc_combined_v[d]=m.beta*sc_combined_v[d]+sc_ff_ring[(target%31)*FF+d]+context;
+            float s=sc_combined_v[d]>=m.threshold?1.0f:0.0f; sc_combined_v[d]-=s*m.threshold;
+            sc_combined_spikes[d]=s; sc_spikes+=(uint32_t)s; combined_events+=(uint32_t)s;
+        }
+        for(int o=0;o<D;++o) {
+            float a=p[SC_FF_OUT_B][o];
+            for(int i=0;i<FF;++i) a+=sc_combined_spikes[i]*p[SC_FF_OUT_W][o*FF+i];
+            sc_out_v[o]=m.beta*sc_out_v[o]+a;
+            float s=sc_out_v[o]>=m.threshold?1.0f:0.0f; sc_out_v[o]-=s*m.threshold;
+            sc_out_spikes[o]=s; sc_spikes+=(uint32_t)s; out_events+=(uint32_t)s;
+        }
+        for(int d=0;d<D;++d) {
+            sc_final_v[d]=m.beta*sc_final_v[d]+sc_x[target*D+d]+sc_out_spikes[d];
+            float s=sc_final_v[d]>=m.threshold?1.0f:0.0f; sc_final_v[d]-=s*m.threshold;
+            sc_pooled[d]+=s; sc_spikes+=(uint32_t)s; readout_events+=(uint32_t)s;
+        }
+    }
+    sc_synops += ff_events*31u + combined_events*D + out_events + readout_events*35u;
+    for(int d=0;d<D;++d) sc_pooled[d]/=T;
+    sc_norm(sc_pooled,1,D,p[SC_NORM_W],p[SC_NORM_B],sc_tmp);
+    sc_linear(sc_tmp,1,D,p[SC_CLASSIFIER_W],p[SC_CLASSIFIER_B],35,sc_logits);
+    return argmax_float(sc_logits,35);
 }
 
 // ---------------------------------------------------------------------
@@ -2151,8 +2372,9 @@ extern "C" void app_main(void)
 #define DATASET_NAME "mnist"
 #endif
     const char *model_type_name = g_model_type == MODEL_TYPE_SNN ? "SNN" :
+                                  (g_model_type == MODEL_TYPE_SPIKCOMMANDER ? "SpikCommander-SNN" :
                                   (g_model_type == MODEL_TYPE_TRANSFORMER ?
-                                   (g_transformer_config.spiking ? "Spiking-Transformer" : "Transformer-ANN") : "ANN");
+                                   (g_transformer_config.spiking ? "Spiking-Transformer" : "Transformer-ANN") : "ANN"));
     ESP_LOGI(TAG, "=== Initializing ESP32 inference: %s (%s, dataset: %s) ===",
              g_model_name, model_type_name, DATASET_NAME);
 
@@ -2232,6 +2454,18 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "SNN parameters: Neuron=%s, Encoding=%s, Mode=%s, Conv=%d, FC=%d, %d Steps, Beta=%.2f, Thresh=%.2f",
                  ntype_str, enc_str, exec_str, g_snn_config.num_conv_layers, g_snn_config.hidden_layers_count + 1,
                  g_snn_config.num_steps, g_snn_config.beta, g_snn_config.threshold);
+#if SPIKCOMMANDER_AUDIO
+    } else if (g_model_type == MODEL_TYPE_SPIKCOMMANDER) {
+        if (g_spikcommander.tokens != 100 || g_spikcommander.input_features != 140 ||
+            g_spikcommander.embed_dim != 64 || g_spikcommander.num_heads != 4 ||
+            g_spikcommander.output_size != DATASET_NUM_CLASSES || DATASET_INPUT_SIZE != 14000 ||
+            !g_spikcommander.p[SC_FF_OUT_B]) {
+            ESP_LOGE(TAG, "SpikCommander model configuration is incompatible with this firmware build.");
+            return;
+        }
+        input_elements = DATASET_INPUT_SIZE;
+        ESP_LOGI(TAG, "SpikCommander initialized (16 kHz PCM -> 8 kHz, 140 Mel bins, 100 frames, D=64).");
+#else
     } else if (g_model_type == MODEL_TYPE_TRANSFORMER) {
         if (g_transformer_config.tokens != KWS_TOKENS ||
             g_transformer_config.input_features != KWS_FEATURES ||
@@ -2257,6 +2491,7 @@ extern "C" void app_main(void)
                  g_transformer_config.tokens, g_transformer_config.embed_dim,
                  g_transformer_config.num_heads, g_transformer_config.num_layers,
                  g_transformer_config.output_size);
+#endif
     }
 
 #if HAS_SPEECH_AUDIO
@@ -2264,6 +2499,12 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "Speech Commands Mel filter bank is missing from the model export.");
         return;
     }
+#if SPIKCOMMANDER_AUDIO
+    if (!g_speech_resample_filter) {
+        ESP_LOGE(TAG, "SpikCommander resampling filter is missing from the firmware export.");
+        return;
+    }
+#endif
     init_speech_frontend();
     ESP_LOGI(TAG, "Speech Commands frontend initialized (16 kHz, FFT=%d, Mel=%d, Features=%dx%d).",
              SPEECH_NFFT, SPEECH_MELS, KWS_FEATURES, KWS_TOKENS);
@@ -2336,8 +2577,8 @@ extern "C" void app_main(void)
 #if HAS_SPEECH_AUDIO
             // PCM remains in flash; the Mel spectrogram is computed for each sample
             // on the ESP32 during the trigger window and included in the measurement.
-            speech_audio_to_mel(speech_test_audio[i], s_speech_features);
-            const float *model_input = s_speech_features;
+            speech_audio_to_mel(speech_test_audio[i], s_speech_workspace.features);
+            const float *model_input = s_speech_workspace.features;
 #else
             const float *img_data = mnist_test_images[i];
             const float *model_input = img_data;
@@ -2349,12 +2590,19 @@ extern "C" void app_main(void)
                 if (interpreter->Invoke() == kTfLiteOk) {
                     predicted = argmax_float(output->data.f, MNIST_NUM_OUTPUTS);
                 }
+#if SPIKCOMMANDER_AUDIO
+            } else if (g_model_type == MODEL_TYPE_SPIKCOMMANDER) {
+                predicted = run_spikcommander(model_input);
+                total_all_spikes += sc_spikes;
+                total_all_synops += sc_synops;
+#else
             } else if (g_model_type == MODEL_TYPE_TRANSFORMER) {
                 predicted = run_transformer_inference(model_input);
                 if (g_transformer_config.spiking) {
                     total_all_spikes += s_transformer_spikes;
                     total_all_synops += s_transformer_synops;
                 }
+#endif
             } else {
                 uint32_t sample_spikes = 0;
                 uint32_t sample_synops = 0;
@@ -2406,7 +2654,7 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "  - Time per inference:%.3f ms (%.1f Infs/s)",
                  time_per_inf_ms, (time_per_inf_ms > 0) ? (1000.0f / time_per_inf_ms) : 0.0f);
 
-        if (g_model_type == MODEL_TYPE_SNN ||
+        if (g_model_type == MODEL_TYPE_SNN || g_model_type == MODEL_TYPE_SPIKCOMMANDER ||
             (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking)) {
             float avg_spk_per_inf = (float)total_all_spikes / (float)MNIST_TEST_SUBSET;
             float avg_synops_per_inf = (float)total_all_synops / (float)MNIST_TEST_SUBSET;

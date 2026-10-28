@@ -50,7 +50,7 @@ class SpeechCommandsDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def load_normalized_audio(self, index):
+    def load_normalized_audio(self, index, resample=True):
         """Lädt einen Clip als mono float32 PCM mit genau einer Sekunde Länge."""
         wav_path, sample_rate, _ = self.samples[index]
         sample_rate, audio = wavfile.read(wav_path)
@@ -68,14 +68,15 @@ class SpeechCommandsDataset(Dataset):
             audio = audio.astype(np.float32)
         if audio.ndim > 1:
             audio = audio.mean(axis=1, dtype=np.float32)
-        if self.spikcommander:
+        if self.spikcommander and resample:
             # Properly anti-alias while converting the original 16-kHz GSC audio to 8 kHz.
             audio = resample_poly(audio, up=1, down=2).astype(np.float32, copy=False)
             sample_rate = 8000
-        if audio.size < sample_rate:
-            audio = np.pad(audio, (0, sample_rate - audio.size))
+        target_rate = 8000 if self.spikcommander and resample else 16000
+        if audio.size < target_rate:
+            audio = np.pad(audio, (0, target_rate - audio.size))
         else:
-            audio = audio[:sample_rate]
+            audio = audio[:target_rate]
         return np.asarray(audio, dtype=np.float32)
 
     def __getitem__(self, index):

@@ -402,6 +402,7 @@ def export_c_files(
         f.write("#define MODEL_TYPE_ANN 0\n")
         f.write("#define MODEL_TYPE_SNN 1\n\n")
         f.write("#define MODEL_TYPE_TRANSFORMER 2\n\n")
+        f.write("#define MODEL_TYPE_SPIKCOMMANDER 3\n\n")
         f.write("#define NEURON_TYPE_LIF 0\n")
         f.write("#define NEURON_TYPE_IF  1\n\n")
         f.write("#define ENCODING_DIRECT    0\n")
@@ -449,6 +450,12 @@ def export_c_files(
         f.write("    const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;\n")
         f.write("} transformer_layer_weights_t;\n\n")
         f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; } transformer_config_t;\n\n")
+        f.write("#define SPIKCOMMANDER_PARAM_COUNT 40\n")
+        sc_param_names = ["INPUT_W", "INPUT_B", "EMBED_PW_W", "EMBED_DW_W", "BN1_W", "BN1_B", "BN1_MEAN", "BN1_VAR", "BN2_W", "BN2_B", "BN2_MEAN", "BN2_VAR", "EMBED_RES_W", "NORM_W", "NORM_B", "CLASSIFIER_W", "CLASSIFIER_B", "B_NORM1_W", "B_NORM1_B", "QKV_W", "QKV_B", "GLOBAL_W", "GLOBAL_B", "LOCAL_W", "LOCAL_B", "VALUE_CONV_W", "ATTN_W", "ATTN_B", "B_NORM2_W", "B_NORM2_B", "FF_IN_W", "FF_IN_B", "FF_CONTEXT_W", "FF_OUT_W", "FF_OUT_B"]
+        for sc_idx, sc_name in enumerate(sc_param_names):
+            f.write(f"#define SC_{sc_name} {sc_idx}\n")
+        f.write("\n")
+        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, output_size; float beta, threshold; const float *p[40]; } spikcommander_weights_t;\n\n")
         f.write("extern const int g_model_type;\n")
         f.write("extern const char* const g_model_name;\n\n")
         f.write("// ANN-specific TensorFlow Lite Micro FlatBuffer\n")
@@ -469,7 +476,9 @@ def export_c_files(
         f.write("extern const float* const g_transformer_norm_b;\n")
         f.write("extern const float* const g_transformer_classifier_w;\n")
         f.write("extern const float* const g_transformer_classifier_b;\n\n")
+        f.write("extern const spikcommander_weights_t g_spikcommander;\n\n")
         f.write("extern const float* const g_speech_mel_filterbank;\n\n")
+        f.write("extern const float* const g_speech_resample_filter;\n\n")
         f.write("#ifdef __cplusplus\n}\n#endif\n")
 
     # 2. model_data.cc
@@ -478,9 +487,25 @@ def export_c_files(
         f.write('#include "model_data.h"\n\n')
         f.write(f'const char* const g_model_name = "{model_name}";\n')
 
+        def emit_transformer_array(symbol: str, tensor: torch.Tensor) -> None:
+            values = tensor.detach().cpu().numpy().astype(np.float32).reshape(-1)
+            f.write(f"static const float {symbol}[{values.size}] = {{\n")
+            for start in range(0, values.size, 8):
+                literals = []
+                for value in values[start:start + 8]:
+                    literal = f"{float(value):.9g}"
+                    if "." not in literal and "e" not in literal.lower():
+                        literal += ".0"
+                    literals.append(literal + "f")
+                f.write("  " + ", ".join(literals) + ",\n")
+            f.write("};\n")
+
         tflite_bytes = model_entry.get("tflite_bytes", b"")
         is_transformer = bool(getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False))
-        if is_transformer:
+        is_spikcommander = bool(getattr(model, "is_spikcommander", False))
+        if is_spikcommander:
+            f.write("const int g_model_type = MODEL_TYPE_SPIKCOMMANDER;\n\n")
+        elif is_transformer:
             f.write("const int g_model_type = MODEL_TYPE_TRANSFORMER;\n\n")
         elif model_type == "ann":
             f.write("const int g_model_type = MODEL_TYPE_ANN;\n\n")
@@ -503,25 +528,64 @@ def export_c_files(
         f.write('};\n\n')
         f.write(f'const int g_model_len = {len(tflite_bytes)};\n\n')
 
-        if is_transformer:
+        if is_spikcommander:
+            f.write("const snn_config_t g_snn_config = {};\n")
+            f.write("const float* const g_snn_conv_weights[] = {nullptr};\n")
+            f.write("const float* const g_snn_conv_biases[] = {nullptr};\n")
+            f.write("const float* const g_snn_fc_weights[] = {nullptr};\n")
+            f.write("const float* const g_snn_fc_biases[] = {nullptr};\n")
+            params = [
+                ("input_w", model.input_projection.weight), ("input_b", model.input_projection.bias),
+                ("embed_pw_w", model.embed_pw.weight), ("embed_dw_w", model.embed_dw.weight),
+                ("bn1_w", model.embed_bn1.weight), ("bn1_b", model.embed_bn1.bias),
+                ("bn1_mean", model.embed_bn1.running_mean), ("bn1_var", model.embed_bn1.running_var),
+                ("bn2_w", model.embed_bn2.weight), ("bn2_b", model.embed_bn2.bias),
+                ("bn2_mean", model.embed_bn2.running_mean), ("bn2_var", model.embed_bn2.running_var),
+                ("embed_res_w", model.embed_res.weight), ("norm_w", model.norm.weight),
+                ("norm_b", model.norm.bias), ("classifier_w", model.classifier.weight),
+                ("classifier_b", model.classifier.bias),
+            ]
+            block = model.layers[0]
+            for key, tensor in [
+                ("b_norm1_w", block.norm1.weight), ("b_norm1_b", block.norm1.bias),
+                ("qkv_w", block.qkv.weight), ("qkv_b", block.qkv.bias),
+                ("global_w", block.global_proj.weight), ("global_b", block.global_proj.bias),
+                ("local_w", block.local_proj.weight), ("local_b", block.local_proj.bias),
+                ("value_conv_w", block.value_conv.weight),
+                ("attn_w", block.attn_proj.weight), ("attn_b", block.attn_proj.bias),
+                ("b_norm2_w", block.norm2.weight), ("b_norm2_b", block.norm2.bias),
+                ("ff_in_w", block.ff_in.weight), ("ff_in_b", block.ff_in.bias),
+                ("ff_context_w", block.ff_context.weight),
+                ("ff_out_w", block.ff_out.weight), ("ff_out_b", block.ff_out.bias),
+            ]:
+                params.append((key, tensor))
+            param_names = []
+            for key, tensor in params:
+                symbol = f"s_spikcommander_{key}"
+                emit_transformer_array(symbol, tensor)
+                param_names.append(symbol)
+            pad = ["nullptr"] * (40 - len(param_names))
+            in_width = int(model.in_width)
+            in_height = int(model.in_height)
+            f.write("const spikcommander_weights_t g_spikcommander = {")
+            f.write(f"{in_width}, {in_height}, {model.embed_dim}, {model.num_heads}, {model.output_size}, "
+                    f"{model.beta:.8f}f, {model.threshold:.8f}f, {{")
+            f.write(", ".join(param_names + pad) + "}};\n")
+            f.write("const transformer_config_t g_transformer_config = {};\n")
+            f.write("const float* const g_transformer_input_w = nullptr;\n")
+            f.write("const float* const g_transformer_input_b = nullptr;\n")
+            f.write("const float* const g_transformer_position = nullptr;\n")
+            f.write("const transformer_layer_weights_t g_transformer_layers[] = {{nullptr}};\n")
+            f.write("const float* const g_transformer_norm_w = nullptr;\n")
+            f.write("const float* const g_transformer_norm_b = nullptr;\n")
+            f.write("const float* const g_transformer_classifier_w = nullptr;\n")
+            f.write("const float* const g_transformer_classifier_b = nullptr;\n\n")
+        elif is_transformer:
             f.write("const snn_config_t g_snn_config = {};\n")
             f.write("const float* const g_snn_conv_weights[] = {0};\n")
             f.write("const float* const g_snn_conv_biases[] = {0};\n")
             f.write("const float* const g_snn_fc_weights[] = {0};\n")
             f.write("const float* const g_snn_fc_biases[] = {0};\n\n")
-
-            def emit_transformer_array(symbol: str, tensor: torch.Tensor) -> None:
-                values = tensor.detach().cpu().numpy().astype(np.float32).reshape(-1)
-                f.write(f"static const float {symbol}[{values.size}] = {{\n")
-                for start in range(0, values.size, 8):
-                    literals = []
-                    for value in values[start:start + 8]:
-                        literal = f"{float(value):.9g}"
-                        if "." not in literal and "e" not in literal.lower():
-                            literal += ".0"
-                        literals.append(literal + "f")
-                    f.write("  " + ", ".join(literals) + ",\n")
-                f.write("};\n")
 
             emit_transformer_array("s_transformer_input_w", model.input_projection.weight)
             emit_transformer_array("s_transformer_input_b", model.input_projection.bias)
@@ -692,7 +756,7 @@ def export_c_files(
             f.write(f"    .input_scale = {getattr(model, 'input_scale', 1.0):.6f}f,\n")
             f.write(f"    .analog_readout = {1 if getattr(model, 'output_readout', 'spike') == 'analog' else 0},\n")
             f.write("};\n")
-        if not is_transformer:
+        if not is_transformer and not is_spikcommander:
             # Firmware code references transformer globals from shared
             # inference paths even when the selected model is a regular ANN
             # or SNN. Emit inert definitions so those builds link as well.
@@ -706,14 +770,21 @@ def export_c_files(
             f.write("const float* const g_transformer_classifier_w = nullptr;\n")
             f.write("const float* const g_transformer_classifier_b = nullptr;\n\n")
 
-        if dataset_name in ("speech_commands", "kws"):
+        if not is_spikcommander:
+            f.write("const spikcommander_weights_t g_spikcommander = {};\n")
+
+        if dataset_name in ("speech_commands", "kws", "speech_commands_spikcommander"):
             hz_to_mel = lambda hz: 2595.0 * np.log10(1.0 + hz / 700.0)
             mel_to_hz = lambda mel: 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
-            mel_points = np.linspace(hz_to_mel(20.0), hz_to_mel(7600.0), 42)
+            mel_count = 140 if dataset_name == "speech_commands_spikcommander" else 40
+            sample_rate = 8000 if dataset_name == "speech_commands_spikcommander" else 16000
+            n_fft = 256 if dataset_name == "speech_commands_spikcommander" else 400
+            f_max = 4000.0 if dataset_name == "speech_commands_spikcommander" else 7600.0
+            mel_points = np.linspace(hz_to_mel(20.0), hz_to_mel(f_max), mel_count + 2)
             hz_points = mel_to_hz(mel_points)
-            fft_frequencies = np.linspace(0.0, 8000.0, 201)
-            filterbank = np.zeros((40, 201), dtype=np.float32)
-            for mel_idx in range(40):
+            fft_frequencies = np.linspace(0.0, sample_rate / 2.0, n_fft // 2 + 1)
+            filterbank = np.zeros((mel_count, n_fft // 2 + 1), dtype=np.float32)
+            for mel_idx in range(mel_count):
                 lower, center, upper = hz_points[mel_idx:mel_idx + 3]
                 filterbank[mel_idx] = np.maximum(
                     0.0,
@@ -731,8 +802,16 @@ def export_c_files(
                     literals.append(literal + "f")
                 f.write("  " + ", ".join(literals) + ",\n")
             f.write("};\nconst float* const g_speech_mel_filterbank = s_speech_mel_filterbank;\n")
+            if dataset_name == "speech_commands_spikcommander":
+                from scipy.signal import firwin
+                coeffs = firwin(41, 0.5, window=("kaiser", 5.0)).astype(np.float32)
+                f.write("static const float s_speech_resample_filter[41] = {" + ", ".join(f"{v:.9g}f" for v in coeffs) + "};\n")
+                f.write("const float* const g_speech_resample_filter = s_speech_resample_filter;\n")
+            else:
+                f.write("const float* const g_speech_resample_filter = nullptr;\n")
         else:
             f.write("const float* const g_speech_mel_filterbank = nullptr;\n")
+            f.write("const float* const g_speech_resample_filter = nullptr;\n")
 
     # 3. mnist_test_data.h
     test_header_path = out_path / "mnist_test_data.h"
@@ -742,8 +821,9 @@ def export_c_files(
         f.write(f"#define DATASET_NAME \"{dataset_name}\"\n")
         f.write(f"#define DATASET_INPUT_SIZE {dataset_input_size}\n")
         f.write(f"#define DATASET_NUM_CLASSES {output_size}\n")
-        f.write(f"#define HAS_SPEECH_AUDIO {1 if dataset_name in ('speech_commands', 'kws') else 0}\n")
-        if dataset_name in ("speech_commands", "kws"):
+        f.write(f"#define HAS_SPEECH_AUDIO {1 if dataset_name in ('speech_commands', 'kws', 'speech_commands_spikcommander') else 0}\n")
+        f.write(f"#define SPIKCOMMANDER_AUDIO {1 if dataset_name == 'speech_commands_spikcommander' else 0}\n")
+        if dataset_name in ("speech_commands", "kws", "speech_commands_spikcommander"):
             f.write("#define SPEECH_AUDIO_SAMPLES 16000\n")
         f.write("\n")
         f.write(f"#define MNIST_TEST_SUBSET {num_test_samples}\n")
@@ -755,12 +835,14 @@ def export_c_files(
         f.write(", ".join(str(l) for l in labels))
         f.write("\n};\n\n")
 
-        if dataset_name in ("speech_commands", "kws"):
+        if dataset_name in ("speech_commands", "kws", "speech_commands_spikcommander"):
             if not hasattr(test_dataset, "load_normalized_audio"):
                 raise TypeError("Speech Commands ESP32 export requires load_normalized_audio() on the dataset")
             f.write("static const int16_t speech_test_audio[MNIST_TEST_SUBSET][SPEECH_AUDIO_SAMPLES] = {\n")
             for sample_idx in range(num_test_samples):
-                pcm = np.rint(test_dataset.load_normalized_audio(sample_idx) * 32768.0)
+                commander_pcm = dataset_name == "speech_commands_spikcommander"
+                audio = test_dataset.load_normalized_audio(sample_idx, resample=not commander_pcm)
+                pcm = np.rint(audio * 32768.0)
                 pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
                 f.write("  {\n")
                 for row in range(0, pcm.size, 16):
@@ -768,22 +850,21 @@ def export_c_files(
                 f.write("  },\n")
             f.write("};\n\n")
 
-        f.write("static const float mnist_test_images[MNIST_TEST_SUBSET][MNIST_IMAGE_SIZE] = {\n")
-        for i in range(num_test_samples):
-            img_tensor, _ = test_dataset[i]
-            if temporal_input:
-                # Store temporal SNN inputs in time-major order so each
-                # firmware step reads a contiguous feature vector.
-                img_np = img_tensor.reshape(1, model.in_channels * model.in_height, model.in_width)
-                img_np = img_np.permute(2, 1, 0).reshape(-1).numpy()
-            else:
-                img_np = img_tensor.view(-1).numpy()
-            f.write("  {\n")
-            for row in range(0, dataset_input_size, 14):
-                chunk = img_np[row:min(row + 14, dataset_input_size)]
-                f.write("    " + ", ".join(f"{v:.4f}f" for v in chunk) + ",\n")
-            f.write("  },\n")
-        f.write("};\n")
+        if dataset_name not in ("speech_commands", "kws", "speech_commands_spikcommander"):
+            f.write("static const float mnist_test_images[MNIST_TEST_SUBSET][MNIST_IMAGE_SIZE] = {\n")
+            for i in range(num_test_samples):
+                img_tensor, _ = test_dataset[i]
+                if temporal_input:
+                    img_np = img_tensor.reshape(1, model.in_channels * model.in_height, model.in_width)
+                    img_np = img_np.permute(2, 1, 0).reshape(-1).numpy()
+                else:
+                    img_np = img_tensor.view(-1).numpy()
+                f.write("  {\n")
+                for row in range(0, dataset_input_size, 14):
+                    chunk = img_np[row:min(row + 14, dataset_input_size)]
+                    f.write("    " + ", ".join(f"{v:.4f}f" for v in chunk) + ",\n")
+                f.write("  },\n")
+            f.write("};\n")
 
     if getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False):
         size_desc = f"{model_entry.get('model_size_bytes', 0):,} bytes (FP32 weights)"
