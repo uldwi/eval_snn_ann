@@ -728,9 +728,11 @@ static int run_spike_driven_transformer(const float *mel) {
     const float input_scale = g_transformer_config.input_scale > 0.0f
                                   ? g_transformer_config.input_scale : 1.0f;
     const int steps = g_transformer_config.num_steps;
-    float residual_potential[KWS_TOKENS * KWS_EMBED];
-    float attention_potential[KWS_TOKENS * KWS_EMBED];
-    float next_potential[KWS_TOKENS * KWS_EMBED];
+    // These work buffers are several kilobytes at the configured dimensions.
+    // Keep them out of the small ESP-IDF main-task stack.
+    static float residual_potential[KWS_TOKENS * KWS_EMBED];
+    static float attention_potential[KWS_TOKENS * KWS_EMBED];
+    static float next_potential[KWS_TOKENS * KWS_EMBED];
     memset(s_st_mem_input, 0, sizeof(s_st_mem_input));
     memset(s_st_mem_qkv, 0, sizeof(s_st_mem_qkv));
     memset(s_st_mem_attn, 0, sizeof(s_st_mem_attn));
@@ -743,7 +745,7 @@ static int run_spike_driven_transformer(const float *mel) {
     s_transformer_spikes = 0;
     s_transformer_synops = 0;
 
-    uint8_t ttfs_event_step[KWS_TOKENS * KWS_FEATURES];
+    static uint8_t ttfs_event_step[KWS_TOKENS * KWS_FEATURES];
     memset(ttfs_event_step, 0xff, sizeof(ttfs_event_step));
     if (g_transformer_config.input_ttfs) {
         for (int f = 0; f < KWS_FEATURES; ++f) {

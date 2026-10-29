@@ -82,13 +82,10 @@ models:
       min_delta: 0.001
       restore_best_weights: true
     learning_rate: 0.0005
-    num_steps: 32
+    num_steps: 8
     inference_steps: 8
     early_exit:
-      enabled: true
-      min_steps: 2
-      stable_steps: 2
-      max_accuracy_drop: 0.5
+      enabled: false
     beta: 0.9
     threshold: 1.0
     attention_threshold: 4.0
@@ -97,8 +94,8 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.3
-      temperature: 2.0
+      alpha: 0.8
+      temperature: 3.0
     transformer:
       embed_dim: 32
       num_heads: 4
@@ -107,11 +104,11 @@ models:
     type: snn
     optimization:
       pruning:
-        enabled: true
+        enabled: false
       quantization:
-        enabled: true
+        enabled: false
       clustering:
-        enabled: true
+        enabled: false
 
 
   - name: SNN_KWS_SpeechCommandsV02_35Words_CompactSpikingTransformer_Matched
@@ -129,20 +126,17 @@ models:
       min_delta: 0.001
       restore_best_weights: true
     learning_rate: 0.0005
-    num_steps: 32
+    num_steps: 8
     inference_steps: 8
     early_exit:
-      enabled: true
-      min_steps: 2
-      stable_steps: 2
-      max_accuracy_drop: 0.5
+      enabled: false
     threshold: 1.0
     input_scale: 1.0
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.3
-      temperature: 2.0
+      alpha: 0.8
+      temperature: 3.0
     transformer:
       embed_dim: 32
       num_heads: 4
@@ -151,11 +145,11 @@ models:
     type: snn
     optimization:
       pruning:
-        enabled: true
+        enabled: false
       quantization:
-        enabled: true
+        enabled: false
       clustering:
-        enabled: true
+        enabled: false
 
 
   # - name: SNN_KWS_SpeechCommandsV02_35Words_SpikCommander

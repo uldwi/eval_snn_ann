@@ -648,12 +648,15 @@ def export_c_files(
             early_exit_min_steps = int(getattr(model, "early_exit_min_steps", transformer_steps)) if early_exit_enabled else transformer_steps
             early_exit_stable_steps = int(getattr(model, "early_exit_stable_steps", 1)) if early_exit_enabled else 1
             early_exit_margin = float(getattr(model, "early_exit_margin", 0.0)) if early_exit_enabled else 0.0
+            early_exit_margin_literal = f"{early_exit_margin:.9g}"
+            if "." not in early_exit_margin_literal and "e" not in early_exit_margin_literal.lower():
+                early_exit_margin_literal += ".0"
             f.write(f"{tokens}, {features}, {embed_dim}, {heads}, {layer_count}, {ffn_dim}, {output_size}, "
                     f"{1 if is_spiking_transformer else 0}, {transformer_steps}, {transformer_beta:.6f}f, "
                     f"{transformer_threshold:.6f}f, {transformer_input_scale:.6f}f, "
                     f"{1 if spike_driven else 0}, {1 if input_ttfs else 0}, {attention_threshold:.6f}f, "
                     f"{1 if early_exit_enabled else 0}, {early_exit_min_steps}, "
-                    f"{early_exit_stable_steps}, {early_exit_margin:.9g}f" + "};\n")
+                    f"{early_exit_stable_steps}, {early_exit_margin_literal}f" + "};\n")
             f.write("const float* const g_transformer_input_w = s_transformer_input_w;\n")
             f.write("const float* const g_transformer_input_b = s_transformer_input_b;\n")
             f.write("const float* const g_transformer_position = s_transformer_position;\n")
