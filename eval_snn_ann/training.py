@@ -157,6 +157,9 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             signature["spike_driven_transformer"]["attention_threshold"] = float(
                 model_cfg.get("attention_threshold", 4.0)
             )
+            signature["spike_driven_transformer"]["encoding_type"] = str(
+                model_cfg.get("encoding_type", "direct")
+            ).lower()
     elif model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
         exec_mode = str(model_cfg.get("execution_mode", model_cfg.get("execution", "dense"))).lower()

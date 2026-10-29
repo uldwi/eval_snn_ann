@@ -449,7 +449,7 @@ def export_c_files(
         f.write("    const float *norm1_w, *norm1_b, *ff1_w, *ff1_b;\n")
         f.write("    const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;\n")
         f.write("} transformer_layer_weights_t;\n\n")
-        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; int spike_driven; float attention_threshold; int early_exit_enabled, early_exit_min_steps, early_exit_stable_steps; float early_exit_margin; } transformer_config_t;\n\n")
+        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; int spike_driven, input_ttfs; float attention_threshold; int early_exit_enabled, early_exit_min_steps, early_exit_stable_steps; float early_exit_margin; } transformer_config_t;\n\n")
         f.write("#define SPIKCOMMANDER_PARAM_COUNT 40\n")
         sc_param_names = ["INPUT_W", "INPUT_B", "EMBED_PW_W", "EMBED_DW_W", "BN1_W", "BN1_B", "BN1_MEAN", "BN1_VAR", "BN2_W", "BN2_B", "BN2_MEAN", "BN2_VAR", "EMBED_RES_W", "NORM_W", "NORM_B", "CLASSIFIER_W", "CLASSIFIER_B", "B_NORM1_W", "B_NORM1_B", "QKV_W", "QKV_B", "GLOBAL_W", "GLOBAL_B", "LOCAL_W", "LOCAL_B", "VALUE_CONV_W", "ATTN_W", "ATTN_B", "B_NORM2_W", "B_NORM2_B", "FF_IN_W", "FF_IN_B", "FF_CONTEXT_W", "FF_OUT_W", "FF_OUT_B"]
         for sc_idx, sc_name in enumerate(sc_param_names):
@@ -642,6 +642,7 @@ def export_c_files(
             transformer_threshold = float(getattr(model, "threshold", 1.0)) if is_spiking_transformer else 1.0
             transformer_input_scale = float(getattr(model, "input_scale", 1.0)) if is_spiking_transformer else 1.0
             spike_driven = bool(getattr(model, "is_spike_driven_transformer", False))
+            input_ttfs = bool(getattr(model, "ttfs_input", False)) if spike_driven else False
             attention_threshold = float(getattr(model, "attention_threshold", transformer_threshold)) if spike_driven else transformer_threshold
             early_exit_enabled = bool(getattr(model, "early_exit_enabled", False)) if is_spiking_transformer else False
             early_exit_min_steps = int(getattr(model, "early_exit_min_steps", transformer_steps)) if early_exit_enabled else transformer_steps
@@ -650,7 +651,7 @@ def export_c_files(
             f.write(f"{tokens}, {features}, {embed_dim}, {heads}, {layer_count}, {ffn_dim}, {output_size}, "
                     f"{1 if is_spiking_transformer else 0}, {transformer_steps}, {transformer_beta:.6f}f, "
                     f"{transformer_threshold:.6f}f, {transformer_input_scale:.6f}f, "
-                    f"{1 if spike_driven else 0}, {attention_threshold:.6f}f, "
+                    f"{1 if spike_driven else 0}, {1 if input_ttfs else 0}, {attention_threshold:.6f}f, "
                     f"{1 if early_exit_enabled else 0}, {early_exit_min_steps}, "
                     f"{early_exit_stable_steps}, {early_exit_margin:.9g}f" + "};\n")
             f.write("const float* const g_transformer_input_w = s_transformer_input_w;\n")

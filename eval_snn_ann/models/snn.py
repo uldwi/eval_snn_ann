@@ -143,10 +143,15 @@ class CompactSpikeDrivenTransformer(CompactSpikingTransformer):
     The Q/K/V interaction is a channel-wise K&V accumulation followed by a
     spiking gate on Q. Membrane-potential shortcuts keep block outputs binary.
     """
-    def __init__(self, *args, attention_threshold: float = 4.0, **kwargs):
+    def __init__(self, *args, attention_threshold: float = 4.0,
+                 encoding_type: str = "direct", **kwargs):
         super().__init__(*args, **kwargs)
         self.is_spike_driven_transformer = True
         self.attention_threshold = float(attention_threshold)
+        self.encoding_type = str(encoding_type).lower()
+        if self.encoding_type not in ("direct", "ttfs", "latency", "time_to_first_spike"):
+            raise ValueError("Spike-driven Transformer input encoding must be direct or ttfs")
+        self.ttfs_input = self.encoding_type in ("ttfs", "latency", "time_to_first_spike")
         self._spike = surrogate.ATan()
         # Normalization on binary activations would make them dense again.
         # Keep the ANN-compatible encoder weights elsewhere, but remove these
@@ -172,24 +177,41 @@ class CompactSpikeDrivenTransformer(CompactSpikingTransformer):
                 f"SpikeDrivenTransformer expected (batch, {self.in_height}, {self.in_width})"
             )
 
-        tokens = (self.input_projection(x.transpose(1, 2)) + self.position_embedding) * self.input_scale
-        batch, token_count, embed_dim = tokens.shape
+        mel_tokens = x.transpose(1, 2).clamp(0.0, 1.0)
         steps = self.num_steps if self.training else self.inference_steps
-        input_mem = torch.zeros_like(tokens)
-        spike_sum = torch.zeros_like(tokens)
+        direct_tokens = None
+        if not self.ttfs_input:
+            direct_tokens = (self.input_projection(mel_tokens) + self.position_embedding) * self.input_scale
+        else:
+            ttfs_spike_steps = torch.floor((1.0 - mel_tokens) * steps).long()
+            ttfs_spike_steps = ttfs_spike_steps.clamp_max(steps - 1)
+        batch, token_count = mel_tokens.shape[:2]
+        embed_dim = self.input_projection.out_features
+        state_shape = (batch, token_count, embed_dim)
+        input_mem = torch.zeros(state_shape, device=x.device, dtype=x.dtype)
+        spike_sum = torch.zeros_like(input_mem)
         layer_states = []
         for layer in self.encoder.layers:
             layer_states.append({
-                "q": torch.zeros_like(tokens), "k": torch.zeros_like(tokens),
-                "v": torch.zeros_like(tokens), "context": torch.zeros((batch, embed_dim), device=x.device, dtype=x.dtype),
-                "attention": torch.zeros_like(tokens),
+                "q": torch.zeros_like(input_mem), "k": torch.zeros_like(input_mem),
+                "v": torch.zeros_like(input_mem), "context": torch.zeros((batch, embed_dim), device=x.device, dtype=x.dtype),
+                "attention": torch.zeros_like(input_mem),
                 "hidden": torch.zeros((batch, token_count, layer.linear1.out_features), device=x.device, dtype=x.dtype),
-                "feedforward": torch.zeros_like(tokens),
+                "feedforward": torch.zeros_like(input_mem),
             })
 
         step_logits = []
-        for _ in range(steps):
-            current, input_mem, residual_potential = self._lif_step(tokens, input_mem)
+        for step in range(steps):
+            if self.ttfs_input:
+                input_events = ((mel_tokens > 0.0) & (ttfs_spike_steps == step)).to(mel_tokens.dtype)
+                bias = self.input_projection.bias if step == 0 else None
+                input_current = F.linear(input_events, self.input_projection.weight, bias)
+                if step == 0:
+                    input_current = input_current + self.position_embedding
+                input_current = input_current * self.input_scale
+            else:
+                input_current = direct_tokens
+            current, input_mem, residual_potential = self._lif_step(input_current, input_mem)
             for layer, state in zip(self.encoder.layers, layer_states):
                 qkv = F.linear(current, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias)
                 q, k, v = qkv.chunk(3, dim=-1)
@@ -239,7 +261,7 @@ class CompactSpikeDrivenTransformer(CompactSpikingTransformer):
         return (f"SNN-SpikeDrivenTransformer [{self.in_width} time tokens -> "
                 f"{self.input_projection.out_features} LIF embedding -> "
                 f"{len(self.encoder.layers)} SDSA/MLP blocks, binary mask-and-add attention] "
-                f"(Ttrain={self.num_steps}, Tinfer={self.inference_steps}, "
+                f"(Enc={self.encoding_type.upper()}, Ttrain={self.num_steps}, Tinfer={self.inference_steps}, "
                 f"β={self.beta:.2f}, θ={self.threshold:.2f}, "
                 f"θ_attn={self.attention_threshold:.2f})")
 

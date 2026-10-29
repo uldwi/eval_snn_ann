@@ -67,7 +67,7 @@ typedef struct {
     const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;
 } transformer_layer_weights_t;
 
-typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; int spike_driven; float attention_threshold; int early_exit_enabled, early_exit_min_steps, early_exit_stable_steps; float early_exit_margin; } transformer_config_t;
+typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; int spike_driven, input_ttfs; float attention_threshold; int early_exit_enabled, early_exit_min_steps, early_exit_stable_steps; float early_exit_margin; } transformer_config_t;
 
 #define SPIKCOMMANDER_PARAM_COUNT 40
 #define SC_INPUT_W 0

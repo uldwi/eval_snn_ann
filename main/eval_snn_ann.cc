@@ -743,14 +743,29 @@ static int run_spike_driven_transformer(const float *mel) {
     s_transformer_spikes = 0;
     s_transformer_synops = 0;
 
-    for (int t = 0; t < KWS_TOKENS; ++t) {
-        for (int d = 0; d < KWS_EMBED; ++d) {
-            float current = g_transformer_input_b[d];
-            const float *w = g_transformer_input_w + d * KWS_FEATURES;
-            for (int f = 0; f < KWS_FEATURES; ++f)
-                current += w[f] * mel[f * KWS_TOKENS + t];
-            s_st_input_current[t * KWS_EMBED + d] =
-                (current + g_transformer_position[t * KWS_EMBED + d]) * input_scale;
+    uint8_t ttfs_event_step[KWS_TOKENS * KWS_FEATURES];
+    memset(ttfs_event_step, 0xff, sizeof(ttfs_event_step));
+    if (g_transformer_config.input_ttfs) {
+        for (int f = 0; f < KWS_FEATURES; ++f) {
+            for (int t = 0; t < KWS_TOKENS; ++t) {
+                const float value = fminf(1.0f, fmaxf(0.0f, mel[f * KWS_TOKENS + t]));
+                if (value > 0.0f) {
+                    int event_step = static_cast<int>(floorf((1.0f - value) * steps));
+                    if (event_step >= steps) event_step = steps - 1;
+                    ttfs_event_step[f * KWS_TOKENS + t] = static_cast<uint8_t>(event_step);
+                }
+            }
+        }
+    } else {
+        for (int t = 0; t < KWS_TOKENS; ++t) {
+            for (int d = 0; d < KWS_EMBED; ++d) {
+                float current = g_transformer_input_b[d];
+                const float *w = g_transformer_input_w + d * KWS_FEATURES;
+                for (int f = 0; f < KWS_FEATURES; ++f)
+                    current += w[f] * mel[f * KWS_TOKENS + t];
+                s_st_input_current[t * KWS_EMBED + d] =
+                    (current + g_transformer_position[t * KWS_EMBED + d]) * input_scale;
+            }
         }
     }
 
@@ -758,6 +773,20 @@ static int run_spike_driven_transformer(const float *mel) {
     int previous_prediction = -1;
     int stable_prediction_steps = 0;
     for (int step = 0; step < steps; ++step) {
+        if (g_transformer_config.input_ttfs) {
+            for (int t = 0; t < KWS_TOKENS; ++t) {
+                for (int d = 0; d < KWS_EMBED; ++d) {
+                    float current = step == 0
+                        ? g_transformer_input_b[d] + g_transformer_position[t * KWS_EMBED + d]
+                        : 0.0f;
+                    const float *w = g_transformer_input_w + d * KWS_FEATURES;
+                    for (int f = 0; f < KWS_FEATURES; ++f) {
+                        if (ttfs_event_step[f * KWS_TOKENS + t] == step) current += w[f];
+                    }
+                    s_st_input_current[t * KWS_EMBED + d] = current * input_scale;
+                }
+            }
+        }
         for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
             const float v = beta * s_st_mem_input[i] + s_st_input_current[i];
             residual_potential[i] = v;

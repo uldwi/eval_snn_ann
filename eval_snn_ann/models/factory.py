@@ -99,6 +99,7 @@ def build_model_from_config(
             threshold=float(model_cfg.get("threshold", 1.0)),
             input_scale=float(model_cfg.get("input_scale", 1.0)),
             attention_threshold=float(model_cfg.get("attention_threshold", 4.0)),
+            encoding_type=str(model_cfg.get("encoding_type", "direct")),
         ).to(device)
     elif architecture in ("spiking_transformer", "spikingtransformer"):
         transformer_cfg = model_cfg.get("transformer", {})

@@ -39,7 +39,7 @@ microcontroller:
         SNN_SEL_LAZY_DECAY: 0
       sram_kb: 512
       trigger_gpio: 4
-  target: esp32s3
+  target: esp32c6
 models:
   - name: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
     architecture: compact_transformer
@@ -92,6 +92,7 @@ models:
     beta: 0.9
     threshold: 1.0
     attention_threshold: 4.0
+    encoding_type: ttfs
     input_scale: 1.0
     spec_augment: true
     distillation:
