@@ -19,6 +19,7 @@ from .data import (
 from .exporting import export_c_files, export_model_entry_to_main, export_pytorch_to_tflite
 from .models import (
     CompactSpikingTransformer,
+    CompactSpikeDrivenTransformer,
     CompactTransformerANN,
     ConfigurableANN,
     ConfigurableSpikingJellySNN,
@@ -42,7 +43,8 @@ from .workflow import get_model_configs, train_all_models, train_and_export
 
 __all__ = [
     "AVAILABLE_DATASETS", "DATASET_ALIASES", "DEFAULT_CONFIG", "DatasetInfo",
-    "CompactSpikingTransformer", "CompactTransformerANN", "ConfigurableANN",
+    "CompactSpikingTransformer", "CompactSpikeDrivenTransformer",
+    "CompactTransformerANN", "ConfigurableANN",
     "ConfigurableSpikingJellySNN", "SpikCommander", "apply_pruning",
     "apply_quantization", "apply_weight_clustering", "build_model_from_config",
     "compute_conv_layer_dims", "compute_model_signature", "compute_model_sparsity",

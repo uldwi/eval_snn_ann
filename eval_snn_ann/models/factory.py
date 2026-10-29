@@ -7,7 +7,10 @@ from torch import nn
 from ..config import parse_conv_layers, parse_hidden_layers
 from ..data.hub import DatasetInfo
 from .ann import ConfigurableANN, CompactTransformerANN
-from .snn import ConfigurableSpikingJellySNN, CompactSpikingTransformer, SpikCommander
+from .snn import (
+    ConfigurableSpikingJellySNN, CompactSpikingTransformer,
+    CompactSpikeDrivenTransformer, SpikCommander,
+)
 
 def transfer_ann_to_snn(
     ann_model: ConfigurableANN,
@@ -81,6 +84,22 @@ def build_model_from_config(
             threshold=float(model_cfg.get("threshold", 1.0)),
             dropout_rate=float(model_cfg.get("dropout_rate", 0.1)),
         ).to(device)
+    elif architecture in ("spike_driven_transformer", "spikedriven_transformer"):
+        transformer_cfg = model_cfg.get("transformer", {})
+        model = CompactSpikeDrivenTransformer(
+            input_size=input_size, output_size=output_size,
+            in_channels=in_channels, in_height=in_height, in_width=in_width,
+            embed_dim=int(transformer_cfg.get("embed_dim", 32)),
+            num_heads=int(transformer_cfg.get("num_heads", 4)),
+            num_layers=int(transformer_cfg.get("num_layers", 2)),
+            feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
+            num_steps=int(model_cfg.get("num_steps", 8)),
+            inference_steps=int(model_cfg.get("inference_steps", model_cfg.get("num_steps", 8))),
+            beta=float(model_cfg.get("beta", 0.9)),
+            threshold=float(model_cfg.get("threshold", 1.0)),
+            input_scale=float(model_cfg.get("input_scale", 1.0)),
+            attention_threshold=float(model_cfg.get("attention_threshold", 4.0)),
+        ).to(device)
     elif architecture in ("spiking_transformer", "spikingtransformer"):
         transformer_cfg = model_cfg.get("transformer", {})
         model = CompactSpikingTransformer(
@@ -91,6 +110,7 @@ def build_model_from_config(
             num_layers=int(transformer_cfg.get("num_layers", 2)),
             feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
             num_steps=int(model_cfg.get("num_steps", 8)),
+            inference_steps=int(model_cfg.get("inference_steps", model_cfg.get("num_steps", 8))),
             beta=float(model_cfg.get("beta", 0.5)),
             threshold=float(model_cfg.get("threshold", 1.0)),
             input_scale=float(model_cfg.get("input_scale", 1.0)),

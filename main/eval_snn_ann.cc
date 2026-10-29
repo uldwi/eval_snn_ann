@@ -237,14 +237,24 @@ static float s_tr_proj[KWS_TOKENS * KWS_EMBED];
 static float s_tr_ff1[KWS_TOKENS * KWS_FFN];
 static float s_tr_ff2[KWS_TOKENS * KWS_EMBED];
 static float s_tr_scores[KWS_TOKENS * KWS_TOKENS];
+static uint32_t s_tr_q_bits[KWS_TOKENS * KWS_HEADS];
+static uint32_t s_tr_k_bits[KWS_TOKENS * KWS_HEADS];
+static uint32_t s_tr_v_bits[KWS_HEADS * KWS_HEAD_DIM];
+static float s_tr_softmax_exp_lut[KWS_HEAD_DIM + 1];
 static float s_tr_logits[KWS_CLASSES];
 static uint32_t s_transformer_spikes = 0;
 static uint32_t s_transformer_synops = 0;
+static float s_st_input_current[KWS_TOKENS * KWS_EMBED];
 static float s_st_mem_input[KWS_TOKENS * KWS_EMBED];
 static float s_st_mem_qkv[KWS_LAYERS][3 * KWS_TOKENS * KWS_EMBED];
 static float s_st_mem_attn[KWS_LAYERS][KWS_TOKENS * KWS_EMBED];
 static float s_st_mem_ff[KWS_LAYERS][KWS_TOKENS * KWS_EMBED];
-static float s_st_spike_accum[KWS_TOKENS * KWS_EMBED];
+static uint8_t s_st_spike_accum[KWS_TOKENS * KWS_EMBED];
+static float s_st_qkv_gamma_sum[KWS_LAYERS][3 * KWS_EMBED];
+static float s_st_qkv_beta_sum[KWS_LAYERS][3 * KWS_EMBED];
+static float s_st_ff1_gamma_sum[KWS_LAYERS][KWS_FFN];
+static float s_st_ff1_beta_sum[KWS_LAYERS][KWS_FFN];
+static bool s_st_norm_projection_cache_ready = false;
 
 static void transformer_linear(const float *input, int rows, int in_dim,
                                const float *weight, const float *bias,
@@ -295,6 +305,256 @@ static inline float transformer_lif(float current, float &membrane,
     return 0.0f;
 }
 
+static uint32_t transformer_linear_lif(const float *input, int rows, int in_dim,
+                                       const float *weight, const float *bias,
+                                       int out_dim, const float *residual,
+                                       float *membrane, float beta, float threshold,
+                                       float *output) {
+    uint32_t spike_count = 0;
+    int active_indices[KWS_FFN > KWS_EMBED ? KWS_FFN : KWS_EMBED];
+    for (int r = 0; r < rows; ++r) {
+        const float *x = input + r * in_dim;
+        float *y = output + r * out_dim;
+        const float *res = residual ? residual + r * out_dim : nullptr;
+        int active_count = 0;
+        for (int i = 0; i < in_dim; ++i) {
+            if (x[i] != 0.0f) active_indices[active_count++] = i;
+        }
+        const bool sparse = active_count * 2 < in_dim;
+        for (int o = 0; o < out_dim; ++o) {
+            float current = bias ? bias[o] : 0.0f;
+            const float *w = weight + o * in_dim;
+            if (sparse) {
+                for (int n = 0; n < active_count; ++n) {
+                    const int i = active_indices[n];
+                    current += w[i] * x[i];
+                }
+            } else {
+                for (int i = 0; i < in_dim; ++i) current += w[i] * x[i];
+            }
+            if (res) current += res[o];
+            const int index = r * out_dim + o;
+            const float v = beta * membrane[index] + current;
+            const float spike = v >= threshold ? 1.0f : 0.0f;
+            membrane[index] = spike ? 0.0f : v;
+            y[o] = spike;
+            spike_count += static_cast<uint32_t>(spike);
+        }
+    }
+    return spike_count;
+}
+
+// Exact zero-skipping projection for dense-valued activations. When at least
+// half the inputs are zero, gather active indices once per row and reuse them
+// for every output; otherwise use the regular dense dot product.
+static void transformer_sparse_linear(const float *input, int rows, int in_dim,
+                                      const float *weight, const float *bias,
+                                      int out_dim, float *output) {
+    int active_indices[KWS_FFN > KWS_EMBED ? KWS_FFN : KWS_EMBED];
+    for (int r = 0; r < rows; ++r) {
+        const float *x = input + r * in_dim;
+        float *y = output + r * out_dim;
+        int active_count = 0;
+        for (int i = 0; i < in_dim; ++i) {
+            if (x[i] != 0.0f) active_indices[active_count++] = i;
+        }
+        const bool sparse = active_count * 2 < in_dim;
+        for (int o = 0; o < out_dim; ++o) {
+            const float *w = weight + o * in_dim;
+            float sum = bias ? bias[o] : 0.0f;
+            if (sparse) {
+                for (int n = 0; n < active_count; ++n) {
+                    const int i = active_indices[n];
+                    sum += w[i] * x[i];
+                }
+            } else {
+                for (int i = 0; i < in_dim; ++i) sum += w[i] * x[i];
+            }
+            y[o] = sum;
+        }
+    }
+}
+
+static int transformer_predict_accumulated_spikes(int executed_steps, float *margin_out) {
+    const float denom = static_cast<float>(executed_steps * KWS_TOKENS);
+    for (int d = 0; d < KWS_EMBED; ++d) {
+        float pooled = 0.0f;
+        for (int t = 0; t < KWS_TOKENS; ++t)
+            pooled += static_cast<float>(s_st_spike_accum[t * KWS_EMBED + d]);
+        s_tr_norm[d] = pooled / denom;
+    }
+    transformer_layer_norm(s_tr_norm, 1, g_transformer_norm_w, g_transformer_norm_b, s_tr_proj);
+    transformer_linear(s_tr_proj, 1, KWS_EMBED, g_transformer_classifier_w,
+                       g_transformer_classifier_b, KWS_CLASSES, s_tr_logits);
+
+    int best = 0;
+    int second = KWS_CLASSES > 1 ? 1 : 0;
+    if (s_tr_logits[second] > s_tr_logits[best]) {
+        const int tmp = best;
+        best = second;
+        second = tmp;
+    }
+    for (int c = 2; c < KWS_CLASSES; ++c) {
+        if (s_tr_logits[c] > s_tr_logits[best]) {
+            second = best;
+            best = c;
+        } else if (s_tr_logits[c] > s_tr_logits[second]) {
+            second = c;
+        }
+    }
+    *margin_out = s_tr_logits[best] - s_tr_logits[second];
+    return best;
+}
+
+static uint32_t transformer_lif_add(const float *current, const float *residual,
+                                    float *membrane, int count, float beta,
+                                    float threshold, float *output) {
+    uint32_t spike_count = 0;
+    for (int i = 0; i < count; ++i) {
+        const float v = beta * membrane[i] + current[i] + residual[i];
+        const float spike = v >= threshold ? 1.0f : 0.0f;
+        membrane[i] = spike ? 0.0f : v;
+        output[i] = spike;
+        spike_count += static_cast<uint32_t>(spike);
+    }
+    return spike_count;
+}
+
+static uint32_t transformer_lif_add_capture(const float *current, const float *residual,
+                                            float *membrane, int count, float beta,
+                                            float threshold, float *potential,
+                                            float *output) {
+    uint32_t spike_count = 0;
+    for (int i = 0; i < count; ++i) {
+        const float v = beta * membrane[i] + current[i] + residual[i];
+        potential[i] = v;
+        const float spike = v >= threshold ? 1.0f : 0.0f;
+        membrane[i] = spike ? 0.0f : v;
+        output[i] = spike;
+        spike_count += static_cast<uint32_t>(spike);
+    }
+    return spike_count;
+}
+
+static void transformer_prepare_sparse_norm_cache() {
+    if (s_st_norm_projection_cache_ready) return;
+    for (int l = 0; l < KWS_LAYERS; ++l) {
+        const transformer_layer_weights_t &layer = g_transformer_layers[l];
+        for (int o = 0; o < 3 * KWS_EMBED; ++o) {
+            float gamma_sum = 0.0f;
+            float beta_sum = 0.0f;
+            const float *w = layer.qkv_w + o * KWS_EMBED;
+            for (int i = 0; i < KWS_EMBED; ++i) {
+                gamma_sum += w[i] * layer.norm1_w[i];
+                beta_sum += w[i] * layer.norm1_b[i];
+            }
+            s_st_qkv_gamma_sum[l][o] = gamma_sum;
+            s_st_qkv_beta_sum[l][o] = beta_sum;
+        }
+        for (int o = 0; o < KWS_FFN; ++o) {
+            float gamma_sum = 0.0f;
+            float beta_sum = 0.0f;
+            const float *w = layer.ff1_w + o * KWS_EMBED;
+            for (int i = 0; i < KWS_EMBED; ++i) {
+                gamma_sum += w[i] * layer.norm2_w[i];
+                beta_sum += w[i] * layer.norm2_b[i];
+            }
+            s_st_ff1_gamma_sum[l][o] = gamma_sum;
+            s_st_ff1_beta_sum[l][o] = beta_sum;
+        }
+    }
+    s_st_norm_projection_cache_ready = true;
+}
+
+// LayerNorm followed by a linear layer can be written as a per-output offset
+// plus a weighted sum over active binary input spikes. This avoids turning a
+// sparse spike vector into a dense normalized vector before the projection.
+static uint32_t transformer_sparse_norm_linear_lif(
+    const float *input, int rows, const float *norm_w, const float *norm_b,
+    const float *weight, const float *bias, int out_dim,
+    const float *gamma_sum, const float *beta_sum, float *membrane,
+    float beta, float threshold, float *output) {
+    constexpr float eps = 1.0e-5f;
+    uint32_t spike_count = 0;
+    int active[KWS_EMBED];
+    float normalized[KWS_EMBED];
+    for (int r = 0; r < rows; ++r) {
+        const float *x = input + r * KWS_EMBED;
+        int active_count = 0;
+        for (int i = 0; i < KWS_EMBED; ++i) {
+            if (x[i] != 0.0f) active[active_count++] = i;
+        }
+        const float mean = static_cast<float>(active_count) / KWS_EMBED;
+        const float variance = mean * (1.0f - mean);
+        const float inv_std = 1.0f / sqrtf(variance + eps);
+        const bool sparse = active_count * 2 < KWS_EMBED;
+        if (!sparse) {
+            for (int i = 0; i < KWS_EMBED; ++i)
+                normalized[i] = (x[i] - mean) * inv_std * norm_w[i] + norm_b[i];
+        }
+        for (int o = 0; o < out_dim; ++o) {
+            const float *w = weight + o * KWS_EMBED;
+            float current = bias ? bias[o] : 0.0f;
+            if (sparse) {
+                float active_sum = 0.0f;
+                for (int n = 0; n < active_count; ++n) {
+                    const int i = active[n];
+                    active_sum += w[i] * norm_w[i];
+                }
+                current += beta_sum[o] + inv_std * (active_sum - mean * gamma_sum[o]);
+            } else {
+                for (int i = 0; i < KWS_EMBED; ++i) current += w[i] * normalized[i];
+            }
+            const int index = r * out_dim + o;
+            const float v = beta * membrane[index] + current;
+            const float spike = v >= threshold ? 1.0f : 0.0f;
+            membrane[index] = spike ? 0.0f : v;
+            output[index] = spike;
+            spike_count += static_cast<uint32_t>(spike);
+        }
+    }
+    return spike_count;
+}
+
+static void transformer_sparse_norm_linear(
+    const float *input, int rows, const float *norm_w, const float *norm_b,
+    const float *weight, const float *bias, int out_dim,
+    const float *gamma_sum, const float *beta_sum, float *output) {
+    constexpr float eps = 1.0e-5f;
+    int active[KWS_EMBED];
+    float normalized[KWS_EMBED];
+    for (int r = 0; r < rows; ++r) {
+        const float *x = input + r * KWS_EMBED;
+        int active_count = 0;
+        for (int i = 0; i < KWS_EMBED; ++i) {
+            if (x[i] != 0.0f) active[active_count++] = i;
+        }
+        const float mean = static_cast<float>(active_count) / KWS_EMBED;
+        const float variance = mean * (1.0f - mean);
+        const float inv_std = 1.0f / sqrtf(variance + eps);
+        const bool sparse = active_count * 2 < KWS_EMBED;
+        if (!sparse) {
+            for (int i = 0; i < KWS_EMBED; ++i)
+                normalized[i] = (x[i] - mean) * inv_std * norm_w[i] + norm_b[i];
+        }
+        for (int o = 0; o < out_dim; ++o) {
+            const float *w = weight + o * KWS_EMBED;
+            float sum = bias ? bias[o] : 0.0f;
+            if (sparse) {
+                float active_sum = 0.0f;
+                for (int n = 0; n < active_count; ++n) {
+                    const int i = active[n];
+                    active_sum += w[i] * norm_w[i];
+                }
+                sum += beta_sum[o] + inv_std * (active_sum - mean * gamma_sum[o]);
+            } else {
+                for (int i = 0; i < KWS_EMBED; ++i) sum += w[i] * normalized[i];
+            }
+            output[r * out_dim + o] = sum;
+        }
+    }
+}
+
 static int run_spiking_transformer(const float *mel) {
     const float beta = g_transformer_config.beta;
     const float threshold = g_transformer_config.threshold;
@@ -308,100 +568,151 @@ static int run_spiking_transformer(const float *mel) {
     memset(s_st_spike_accum, 0, sizeof(s_st_spike_accum));
     s_transformer_spikes = 0;
     s_transformer_synops = 0;
+    int executed_steps = 0;
+    int previous_prediction = -1;
+    int stable_prediction_steps = 0;
+    transformer_prepare_sparse_norm_cache();
 
+    // The acoustic tokens and position embeddings are constant across SNN steps.
+    // Project them once; only the LIF state changes from step to step.
+    for (int t = 0; t < KWS_TOKENS; ++t) {
+        for (int d = 0; d < KWS_EMBED; ++d) {
+            float current = g_transformer_input_b[d];
+            const float *w = g_transformer_input_w + d * KWS_FEATURES;
+            for (int f = 0; f < KWS_FEATURES; ++f) current += w[f] * mel[f * KWS_TOKENS + t];
+            current = (current + g_transformer_position[t * KWS_EMBED + d]) * input_scale;
+            s_st_input_current[t * KWS_EMBED + d] = current;
+        }
+    }
+
+    const float head_denominator = sqrtf(static_cast<float>(KWS_HEAD_DIM));
+    for (int delta = 0; delta <= KWS_HEAD_DIM; ++delta)
+        s_tr_softmax_exp_lut[delta] = expf(-static_cast<float>(delta) / head_denominator);
     for (int step = 0; step < steps; ++step) {
-        for (int t = 0; t < KWS_TOKENS; ++t) {
-            for (int d = 0; d < KWS_EMBED; ++d) {
-                float current = g_transformer_input_b[d];
-                const float *w = g_transformer_input_w + d * KWS_FEATURES;
-                for (int f = 0; f < KWS_FEATURES; ++f) current += w[f] * mel[f * KWS_TOKENS + t];
-                current += g_transformer_position[t * KWS_EMBED + d];
-                current *= input_scale;
-                float &mem = s_st_mem_input[t * KWS_EMBED + d];
-                const float spike = transformer_lif(current, mem, beta, threshold);
-                s_tr_x[t * KWS_EMBED + d] = spike;
-                s_transformer_spikes += static_cast<uint32_t>(spike);
-            }
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
+            const float spike = transformer_lif(s_st_input_current[i], s_st_mem_input[i], beta, threshold);
+            s_tr_x[i] = spike;
+            s_transformer_spikes += static_cast<uint32_t>(spike);
         }
 
         for (int layer_idx = 0; layer_idx < KWS_LAYERS; ++layer_idx) {
             const transformer_layer_weights_t &layer = g_transformer_layers[layer_idx];
-            transformer_layer_norm(s_tr_x, KWS_TOKENS, layer.norm1_w, layer.norm1_b, s_tr_norm);
-            transformer_linear(s_tr_norm, KWS_TOKENS, KWS_EMBED, layer.qkv_w, layer.qkv_b,
-                               3 * KWS_EMBED, s_tr_qkv);
             uint32_t qkv_in_spikes = 0;
             for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) qkv_in_spikes += static_cast<uint32_t>(s_tr_x[i]);
             s_transformer_synops += qkv_in_spikes * (3 * KWS_EMBED);
-            for (int i = 0; i < 3 * KWS_TOKENS * KWS_EMBED; ++i) {
-                s_tr_qkv[i] = transformer_lif(s_tr_qkv[i], s_st_mem_qkv[layer_idx][i], beta, threshold);
-                s_transformer_spikes += static_cast<uint32_t>(s_tr_qkv[i]);
+            s_transformer_spikes += transformer_sparse_norm_linear_lif(
+                s_tr_x, KWS_TOKENS, layer.norm1_w, layer.norm1_b,
+                layer.qkv_w, layer.qkv_b, 3 * KWS_EMBED,
+                s_st_qkv_gamma_sum[layer_idx], s_st_qkv_beta_sum[layer_idx],
+                s_st_mem_qkv[layer_idx], beta, threshold, s_tr_qkv);
+
+            // Q, K, and V are binary spikes. Pack them so QK products become
+            // AND+popcount and zero-valued V contributions are skipped.
+            for (int h = 0; h < KWS_HEADS; ++h) {
+                const int head_offset = h * KWS_HEAD_DIM;
+                for (int t = 0; t < KWS_TOKENS; ++t) {
+                    uint32_t q_bits = 0;
+                    for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                        const int base = t * (3 * KWS_EMBED) + head_offset + d;
+                        q_bits |= static_cast<uint32_t>(s_tr_qkv[base] != 0.0f) << d;
+                    }
+                    s_tr_q_bits[t * KWS_HEADS + h] = q_bits;
+                }
+                for (int t = 0; t < KWS_TOKENS; ++t) {
+                    uint32_t k_bits = 0;
+                    for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                        const int base = t * (3 * KWS_EMBED) + head_offset + d;
+                        k_bits |= static_cast<uint32_t>(s_tr_qkv[base + KWS_EMBED] != 0.0f) << d;
+                    }
+                    s_tr_k_bits[t * KWS_HEADS + h] = k_bits;
+                }
+                for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                    uint32_t v_bits = 0;
+                    for (int t = 0; t < KWS_TOKENS; ++t) {
+                        const int base = t * (3 * KWS_EMBED) + 2 * KWS_EMBED + head_offset + d;
+                        v_bits |= static_cast<uint32_t>(s_tr_qkv[base] != 0.0f) << t;
+                    }
+                    s_tr_v_bits[h * KWS_HEAD_DIM + d] = v_bits;
+                }
             }
 
             for (int h = 0; h < KWS_HEADS; ++h) {
                 const int head_offset = h * KWS_HEAD_DIM;
                 for (int q = 0; q < KWS_TOKENS; ++q) {
                     float *scores = s_tr_scores + q * KWS_TOKENS;
-                    float max_score = -INFINITY;
+                    int score_counts[KWS_TOKENS];
+                    int max_score_count = 0;
                     for (int k = 0; k < KWS_TOKENS; ++k) {
-                        float score = 0.0f;
-                        for (int d = 0; d < KWS_HEAD_DIM; ++d) {
-                            score += s_tr_qkv[q * (3 * KWS_EMBED) + head_offset + d] *
-                                     s_tr_qkv[k * (3 * KWS_EMBED) + KWS_EMBED + head_offset + d];
-                        }
-                        scores[k] = score / sqrtf(static_cast<float>(KWS_HEAD_DIM));
-                        if (scores[k] > max_score) max_score = scores[k];
+                        const uint32_t overlap = s_tr_q_bits[q * KWS_HEADS + h] &
+                                                 s_tr_k_bits[k * KWS_HEADS + h];
+                        score_counts[k] = __builtin_popcount(overlap);
+                        if (score_counts[k] > max_score_count) max_score_count = score_counts[k];
                     }
                     float denom = 0.0f;
                     for (int k = 0; k < KWS_TOKENS; ++k) {
-                        scores[k] = expf(scores[k] - max_score);
+                        scores[k] = s_tr_softmax_exp_lut[max_score_count - score_counts[k]];
                         denom += scores[k];
                     }
+                    const float inv_denom = 1.0f / denom;
+                    for (int k = 0; k < KWS_TOKENS; ++k) scores[k] *= inv_denom;
                     for (int d = 0; d < KWS_HEAD_DIM; ++d) {
                         float value = 0.0f;
-                        for (int k = 0; k < KWS_TOKENS; ++k) {
-                            value += (scores[k] / denom) *
-                                     s_tr_qkv[k * (3 * KWS_EMBED) + 2 * KWS_EMBED + head_offset + d];
+                        uint32_t active_values = s_tr_v_bits[h * KWS_HEAD_DIM + d];
+                        while (active_values != 0) {
+                            const int k = __builtin_ctz(active_values);
+                            value += scores[k];
+                            active_values &= active_values - 1;
                         }
                         s_tr_attn[q * KWS_EMBED + head_offset + d] = value;
                     }
                 }
             }
 
-            transformer_linear(s_tr_attn, KWS_TOKENS, KWS_EMBED,
-                               layer.attn_out_w, layer.attn_out_b, KWS_EMBED, s_tr_proj);
-            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
-                const float spike = transformer_lif(s_tr_x[i] + s_tr_proj[i],
-                                                     s_st_mem_attn[layer_idx][i], beta, threshold);
-                s_tr_x[i] = spike;
-                s_transformer_spikes += static_cast<uint32_t>(spike);
-            }
+            s_transformer_spikes += transformer_linear_lif(
+                s_tr_attn, KWS_TOKENS, KWS_EMBED, layer.attn_out_w, layer.attn_out_b,
+                KWS_EMBED, s_tr_x, s_st_mem_attn[layer_idx], beta, threshold, s_tr_x);
 
             uint32_t mlp_in_spikes = 0;
             for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) mlp_in_spikes += static_cast<uint32_t>(s_tr_x[i]);
             s_transformer_synops += mlp_in_spikes * KWS_FFN;
-            transformer_layer_norm(s_tr_x, KWS_TOKENS, layer.norm2_w, layer.norm2_b, s_tr_norm);
-            transformer_linear(s_tr_norm, KWS_TOKENS, KWS_EMBED, layer.ff1_w, layer.ff1_b,
-                               KWS_FFN, s_tr_ff1);
+            transformer_sparse_norm_linear(
+                s_tr_x, KWS_TOKENS, layer.norm2_w, layer.norm2_b,
+                layer.ff1_w, layer.ff1_b, KWS_FFN,
+                s_st_ff1_gamma_sum[layer_idx], s_st_ff1_beta_sum[layer_idx], s_tr_ff1);
             constexpr float inv_sqrt2 = 0.7071067811865475f;
             for (int i = 0; i < KWS_TOKENS * KWS_FFN; ++i) {
                 s_tr_ff1[i] = 0.5f * s_tr_ff1[i] * (1.0f + erff(s_tr_ff1[i] * inv_sqrt2));
             }
-            transformer_linear(s_tr_ff1, KWS_TOKENS, KWS_FFN, layer.ff2_w, layer.ff2_b,
-                               KWS_EMBED, s_tr_ff2);
-            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
-                const float spike = transformer_lif(s_tr_x[i] + s_tr_ff2[i],
-                                                     s_st_mem_ff[layer_idx][i], beta, threshold);
-                s_tr_x[i] = spike;
-                s_transformer_spikes += static_cast<uint32_t>(spike);
+            transformer_sparse_linear(s_tr_ff1, KWS_TOKENS, KWS_FFN,
+                                      layer.ff2_w, layer.ff2_b, KWS_EMBED, s_tr_ff2);
+            s_transformer_spikes += transformer_lif_add(
+                s_tr_ff2, s_tr_x, s_st_mem_ff[layer_idx], KWS_TOKENS * KWS_EMBED,
+                beta, threshold, s_tr_x);
+        }
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i)
+            s_st_spike_accum[i] += static_cast<uint8_t>(s_tr_x[i]);
+        executed_steps = step + 1;
+
+        if (g_transformer_config.early_exit_enabled &&
+            executed_steps >= g_transformer_config.early_exit_min_steps &&
+            executed_steps < steps) {
+            float confidence_margin = 0.0f;
+            const int prediction = transformer_predict_accumulated_spikes(executed_steps, &confidence_margin);
+            if (prediction == previous_prediction) ++stable_prediction_steps;
+            else stable_prediction_steps = 1;
+            previous_prediction = prediction;
+            if (stable_prediction_steps >= g_transformer_config.early_exit_stable_steps &&
+                confidence_margin >= g_transformer_config.early_exit_margin) {
+                break;
             }
         }
-        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) s_st_spike_accum[i] += s_tr_x[i];
     }
 
-    const float denom = static_cast<float>(steps * KWS_TOKENS);
+    const float denom = static_cast<float>(executed_steps * KWS_TOKENS);
     for (int d = 0; d < KWS_EMBED; ++d) {
         float pooled = 0.0f;
-        for (int t = 0; t < KWS_TOKENS; ++t) pooled += s_st_spike_accum[t * KWS_EMBED + d];
+        for (int t = 0; t < KWS_TOKENS; ++t)
+            pooled += static_cast<float>(s_st_spike_accum[t * KWS_EMBED + d]);
         s_tr_norm[d] = pooled / denom;
     }
     transformer_layer_norm(s_tr_norm, 1, g_transformer_norm_w, g_transformer_norm_b, s_tr_proj);
@@ -410,7 +721,152 @@ static int run_spiking_transformer(const float *mel) {
     return argmax_float(s_tr_logits, KWS_CLASSES);
 }
 
+static int run_spike_driven_transformer(const float *mel) {
+    const float beta = g_transformer_config.beta;
+    const float threshold = g_transformer_config.threshold;
+    const float attention_threshold = g_transformer_config.attention_threshold;
+    const float input_scale = g_transformer_config.input_scale > 0.0f
+                                  ? g_transformer_config.input_scale : 1.0f;
+    const int steps = g_transformer_config.num_steps;
+    float residual_potential[KWS_TOKENS * KWS_EMBED];
+    float attention_potential[KWS_TOKENS * KWS_EMBED];
+    float next_potential[KWS_TOKENS * KWS_EMBED];
+    memset(s_st_mem_input, 0, sizeof(s_st_mem_input));
+    memset(s_st_mem_qkv, 0, sizeof(s_st_mem_qkv));
+    memset(s_st_mem_attn, 0, sizeof(s_st_mem_attn));
+    memset(s_st_mem_ff, 0, sizeof(s_st_mem_ff));
+    memset(s_st_spike_accum, 0, sizeof(s_st_spike_accum));
+    static float context_mem[KWS_LAYERS][KWS_EMBED];
+    static float hidden_mem[KWS_LAYERS][KWS_TOKENS * KWS_FFN];
+    memset(context_mem, 0, sizeof(context_mem));
+    memset(hidden_mem, 0, sizeof(hidden_mem));
+    s_transformer_spikes = 0;
+    s_transformer_synops = 0;
+
+    for (int t = 0; t < KWS_TOKENS; ++t) {
+        for (int d = 0; d < KWS_EMBED; ++d) {
+            float current = g_transformer_input_b[d];
+            const float *w = g_transformer_input_w + d * KWS_FEATURES;
+            for (int f = 0; f < KWS_FEATURES; ++f)
+                current += w[f] * mel[f * KWS_TOKENS + t];
+            s_st_input_current[t * KWS_EMBED + d] =
+                (current + g_transformer_position[t * KWS_EMBED + d]) * input_scale;
+        }
+    }
+
+    int executed_steps = 0;
+    int previous_prediction = -1;
+    int stable_prediction_steps = 0;
+    for (int step = 0; step < steps; ++step) {
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i) {
+            const float v = beta * s_st_mem_input[i] + s_st_input_current[i];
+            residual_potential[i] = v;
+            const float spike = v >= threshold ? 1.0f : 0.0f;
+            s_st_mem_input[i] = spike ? 0.0f : v;
+            s_tr_x[i] = spike;
+            s_transformer_spikes += static_cast<uint32_t>(spike);
+        }
+
+        for (int layer_idx = 0; layer_idx < KWS_LAYERS; ++layer_idx) {
+            const transformer_layer_weights_t &layer = g_transformer_layers[layer_idx];
+            uint32_t input_spikes = 0;
+            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i)
+                input_spikes += static_cast<uint32_t>(s_tr_x[i]);
+            s_transformer_synops += input_spikes * (3 * KWS_EMBED);
+
+            transformer_sparse_linear(s_tr_x, KWS_TOKENS, KWS_EMBED,
+                                      layer.qkv_w, layer.qkv_b, 3 * KWS_EMBED, s_tr_qkv);
+            for (int t = 0; t < KWS_TOKENS; ++t) {
+                for (int d = 0; d < KWS_EMBED; ++d) {
+                    const int q_index = t * 3 * KWS_EMBED + d;
+                    const int k_index = q_index + KWS_EMBED;
+                    const int v_index = q_index + 2 * KWS_EMBED;
+                    s_tr_qkv[q_index] = transformer_lif(
+                        s_tr_qkv[q_index], s_st_mem_qkv[layer_idx][q_index], beta, threshold);
+                    s_tr_qkv[k_index] = transformer_lif(
+                        s_tr_qkv[k_index], s_st_mem_qkv[layer_idx][k_index], beta, threshold);
+                    s_tr_qkv[v_index] = transformer_lif(
+                        s_tr_qkv[v_index], s_st_mem_qkv[layer_idx][v_index], beta, threshold);
+                    s_transformer_spikes += static_cast<uint32_t>(s_tr_qkv[q_index]);
+                    s_transformer_spikes += static_cast<uint32_t>(s_tr_qkv[k_index]);
+                    s_transformer_spikes += static_cast<uint32_t>(s_tr_qkv[v_index]);
+                }
+            }
+
+            for (int d = 0; d < KWS_EMBED; ++d) {
+                float current = 0.0f;
+                for (int t = 0; t < KWS_TOKENS; ++t) {
+                    const int base = t * 3 * KWS_EMBED + d;
+                    current += s_tr_qkv[base + KWS_EMBED] * s_tr_qkv[base + 2 * KWS_EMBED];
+                }
+                const float context_spike = transformer_lif(
+                    current, context_mem[layer_idx][d], beta, attention_threshold);
+                s_tr_norm[d] = context_spike;
+                s_transformer_spikes += static_cast<uint32_t>(context_spike);
+            }
+
+            for (int t = 0; t < KWS_TOKENS; ++t) {
+                for (int d = 0; d < KWS_EMBED; ++d) {
+                    const int base = t * 3 * KWS_EMBED + d;
+                    s_tr_attn[t * KWS_EMBED + d] = s_tr_qkv[base] * s_tr_norm[d];
+                }
+            }
+            transformer_sparse_linear(s_tr_attn, KWS_TOKENS, KWS_EMBED,
+                                      layer.attn_out_w, layer.attn_out_b,
+                                      KWS_EMBED, s_tr_proj);
+            s_transformer_spikes += transformer_lif_add_capture(
+                s_tr_proj, residual_potential, s_st_mem_attn[layer_idx],
+                KWS_TOKENS * KWS_EMBED, beta, threshold,
+                attention_potential, s_tr_x);
+
+            uint32_t attention_spikes = 0;
+            for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i)
+                attention_spikes += static_cast<uint32_t>(s_tr_x[i]);
+            s_transformer_synops += attention_spikes * KWS_FFN;
+            transformer_sparse_linear(s_tr_x, KWS_TOKENS, KWS_EMBED,
+                                      layer.ff1_w, layer.ff1_b, KWS_FFN, s_tr_ff1);
+            for (int i = 0; i < KWS_TOKENS * KWS_FFN; ++i) {
+                const float v = beta * hidden_mem[layer_idx][i] + s_tr_ff1[i];
+                const float spike = v >= threshold ? 1.0f : 0.0f;
+                hidden_mem[layer_idx][i] = spike ? 0.0f : v;
+                s_tr_ff1[i] = spike;
+                s_transformer_spikes += static_cast<uint32_t>(spike);
+            }
+            transformer_sparse_linear(s_tr_ff1, KWS_TOKENS, KWS_FFN,
+                                      layer.ff2_w, layer.ff2_b, KWS_EMBED, s_tr_ff2);
+            s_transformer_spikes += transformer_lif_add_capture(
+                s_tr_ff2, attention_potential, s_st_mem_ff[layer_idx],
+                KWS_TOKENS * KWS_EMBED, beta, threshold,
+                next_potential, s_tr_x);
+            memcpy(residual_potential, next_potential, sizeof(residual_potential));
+        }
+
+        for (int i = 0; i < KWS_TOKENS * KWS_EMBED; ++i)
+            s_st_spike_accum[i] += static_cast<uint8_t>(s_tr_x[i]);
+        executed_steps = step + 1;
+        if (g_transformer_config.early_exit_enabled &&
+            executed_steps >= g_transformer_config.early_exit_min_steps &&
+            executed_steps < steps) {
+            float confidence_margin = 0.0f;
+            const int prediction = transformer_predict_accumulated_spikes(
+                executed_steps, &confidence_margin);
+            if (prediction == previous_prediction) ++stable_prediction_steps;
+            else stable_prediction_steps = 1;
+            previous_prediction = prediction;
+            if (stable_prediction_steps >= g_transformer_config.early_exit_stable_steps &&
+                confidence_margin >= g_transformer_config.early_exit_margin) {
+                break;
+            }
+        }
+    }
+
+    float unused_margin = 0.0f;
+    return transformer_predict_accumulated_spikes(executed_steps, &unused_margin);
+}
+
 static int run_transformer_inference(const float *mel) {
+    if (g_transformer_config.spiking && g_transformer_config.spike_driven)
+        return run_spike_driven_transformer(mel);
     if (g_transformer_config.spiking) return run_spiking_transformer(mel);
     // Input is (frequency, time); the ANN forward pass uses time as the token axis.
     for (int t = 0; t < KWS_TOKENS; ++t) {

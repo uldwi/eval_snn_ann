@@ -98,10 +98,17 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "hidden_layers": hidden_layers,
                 "output_size": output_size,
             }
+            if "inference_steps" in m:
+                model_dict["inference_steps"] = int(m["inference_steps"])
+            if isinstance(m.get("early_exit"), dict):
+                model_dict["early_exit"] = copy.deepcopy(m["early_exit"])
             if bool(m.get("spec_augment", False)):
                 model_dict["spec_augment"] = True
             architecture = str(m.get("architecture", "standard"))
-            if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer", "spikcommander", "spik_commander"):
+            if m_type != "snn" or architecture in (
+                "spiking_transformer", "spikingtransformer", "spike_driven_transformer",
+                "spikedriven_transformer", "spikcommander", "spik_commander",
+            ):
                 model_dict["architecture"] = architecture
                 model_dict["dropout_rate"] = float(m.get("dropout_rate", m.get("dropout", 0.0)))
                 if isinstance(m.get("transformer"), dict):
@@ -116,6 +123,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 model_dict["threshold"] = float(m.get("threshold", 1.0))
                 model_dict["temporal_input"] = bool(m.get("temporal_input", False))
                 model_dict["input_scale"] = float(m.get("input_scale", 1.0))
+                if architecture in ("spike_driven_transformer", "spikedriven_transformer"):
+                    model_dict["attention_threshold"] = float(m.get("attention_threshold", 4.0))
                 model_dict["output_readout"] = str(m.get("output_readout", "spike")).lower()
                 model_dict["execution_mode"] = str(m.get("execution_mode", m.get("execution", "dense")))
                 if m.get("ann_checkpoint"):
@@ -217,8 +226,17 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         "hidden_layers": hidden_layers,
         "output_size": output_size,
     }
+    if "inference_steps" in single_m:
+        model_dict["inference_steps"] = int(single_m["inference_steps"])
+    if isinstance(single_m.get("early_exit"), dict):
+        model_dict["early_exit"] = copy.deepcopy(single_m["early_exit"])
+    if bool(single_m.get("spec_augment", False)):
+        model_dict["spec_augment"] = True
     architecture = str(single_m.get("architecture", "standard"))
-    if m_type != "snn" or architecture in ("spiking_transformer", "spikingtransformer", "spikcommander", "spik_commander"):
+    if m_type != "snn" or architecture in (
+        "spiking_transformer", "spikingtransformer", "spike_driven_transformer",
+        "spikedriven_transformer", "spikcommander", "spik_commander",
+    ):
         model_dict["architecture"] = architecture
         model_dict["dropout_rate"] = float(single_m.get("dropout_rate", single_m.get("dropout", 0.0)))
         if isinstance(single_m.get("transformer"), dict):
@@ -233,6 +251,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         model_dict["threshold"] = float(single_m.get("threshold", 1.0))
         model_dict["temporal_input"] = bool(single_m.get("temporal_input", False))
         model_dict["input_scale"] = float(single_m.get("input_scale", 1.0))
+        if architecture in ("spike_driven_transformer", "spikedriven_transformer"):
+            model_dict["attention_threshold"] = float(single_m.get("attention_threshold", 4.0))
         model_dict["output_readout"] = str(single_m.get("output_readout", "spike")).lower()
         model_dict["execution_mode"] = str(single_m.get("execution_mode", single_m.get("execution", "dense")))
     else:

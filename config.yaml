@@ -62,11 +62,56 @@ models:
     type: ann
     optimization:
       pruning:
-        enabled: false
+        enabled: true
       quantization:
-        enabled: false
+        enabled: true
       clustering:
-        enabled: false
+        enabled: true
+
+  - name: SNN_KWS_SpeechCommandsV02_35Words_SpikeDrivenTransformer
+    architecture: spike_driven_transformer
+    ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
+    batch_size: 64
+    dataset: speech_commands
+    dropout_rate: 0.1
+    epochs: 120
+    early_stopping:
+      enabled: true
+      monitor: val_acc
+      patience: 12
+      min_delta: 0.001
+      restore_best_weights: true
+    learning_rate: 0.0005
+    num_steps: 32
+    inference_steps: 8
+    early_exit:
+      enabled: true
+      min_steps: 2
+      stable_steps: 2
+      max_accuracy_drop: 0.5
+    beta: 0.9
+    threshold: 1.0
+    attention_threshold: 4.0
+    input_scale: 1.0
+    spec_augment: true
+    distillation:
+      enabled: true
+      alpha: 0.3
+      temperature: 2.0
+    transformer:
+      embed_dim: 32
+      num_heads: 4
+      num_layers: 2
+      feedforward_dim: 64
+    type: snn
+    optimization:
+      pruning:
+        enabled: true
+      quantization:
+        enabled: true
+      clustering:
+        enabled: true
+
 
   - name: SNN_KWS_SpeechCommandsV02_35Words_CompactSpikingTransformer_Matched
     architecture: spiking_transformer
@@ -84,6 +129,12 @@ models:
       restore_best_weights: true
     learning_rate: 0.0005
     num_steps: 32
+    inference_steps: 8
+    early_exit:
+      enabled: true
+      min_steps: 2
+      stable_steps: 2
+      max_accuracy_drop: 0.5
     threshold: 1.0
     input_scale: 1.0
     spec_augment: true
@@ -99,11 +150,12 @@ models:
     type: snn
     optimization:
       pruning:
-        enabled: false
+        enabled: true
       quantization:
-        enabled: false
+        enabled: true
       clustering:
-        enabled: false
+        enabled: true
+
 
   # - name: SNN_KWS_SpeechCommandsV02_35Words_SpikCommander
   #   architecture: spikcommander
@@ -407,6 +459,7 @@ models:
 optimization:
   clustering:
     enabled: false
+
     num_clusters: 16
   pruning:
     amount: 0.3

@@ -449,7 +449,7 @@ def export_c_files(
         f.write("    const float *norm1_w, *norm1_b, *ff1_w, *ff1_b;\n")
         f.write("    const float *ff2_w, *ff2_b, *norm2_w, *norm2_b;\n")
         f.write("} transformer_layer_weights_t;\n\n")
-        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; } transformer_config_t;\n\n")
+        f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, feedforward_dim, output_size, spiking, num_steps; float beta, threshold, input_scale; int spike_driven; float attention_threshold; int early_exit_enabled, early_exit_min_steps, early_exit_stable_steps; float early_exit_margin; } transformer_config_t;\n\n")
         f.write("#define SPIKCOMMANDER_PARAM_COUNT 40\n")
         sc_param_names = ["INPUT_W", "INPUT_B", "EMBED_PW_W", "EMBED_DW_W", "BN1_W", "BN1_B", "BN1_MEAN", "BN1_VAR", "BN2_W", "BN2_B", "BN2_MEAN", "BN2_VAR", "EMBED_RES_W", "NORM_W", "NORM_B", "CLASSIFIER_W", "CLASSIFIER_B", "B_NORM1_W", "B_NORM1_B", "QKV_W", "QKV_B", "GLOBAL_W", "GLOBAL_B", "LOCAL_W", "LOCAL_B", "VALUE_CONV_W", "ATTN_W", "ATTN_B", "B_NORM2_W", "B_NORM2_B", "FF_IN_W", "FF_IN_B", "FF_CONTEXT_W", "FF_OUT_W", "FF_OUT_B"]
         for sc_idx, sc_name in enumerate(sc_param_names):
@@ -596,26 +596,35 @@ def export_c_files(
             emit_transformer_array("s_transformer_classifier_b", model.classifier.bias)
 
             layer_symbols = []
+            is_spike_driven = bool(getattr(model, "is_spike_driven_transformer", False))
             for layer_idx, layer in enumerate(model.encoder.layers):
                 names = {
                     "qkv_w": layer.self_attn.in_proj_weight,
                     "qkv_b": layer.self_attn.in_proj_bias,
                     "attn_out_w": layer.self_attn.out_proj.weight,
                     "attn_out_b": layer.self_attn.out_proj.bias,
-                    "norm1_w": layer.norm1.weight,
-                    "norm1_b": layer.norm1.bias,
                     "ff1_w": layer.linear1.weight,
                     "ff1_b": layer.linear1.bias,
                     "ff2_w": layer.linear2.weight,
                     "ff2_b": layer.linear2.bias,
-                    "norm2_w": layer.norm2.weight,
-                    "norm2_b": layer.norm2.bias,
                 }
+                if not is_spike_driven:
+                    names.update({
+                        "norm1_w": layer.norm1.weight,
+                        "norm1_b": layer.norm1.bias,
+                        "norm2_w": layer.norm2.weight,
+                        "norm2_b": layer.norm2.bias,
+                    })
                 symbols = {}
                 for key, tensor in names.items():
                     symbol = f"s_transformer_l{layer_idx}_{key}"
                     emit_transformer_array(symbol, tensor)
                     symbols[key] = symbol
+                if is_spike_driven:
+                    symbols.update({
+                        "norm1_w": "nullptr", "norm1_b": "nullptr",
+                        "norm2_w": "nullptr", "norm2_b": "nullptr",
+                    })
                 layer_symbols.append(symbols)
 
             tokens = model.in_width
@@ -628,13 +637,22 @@ def export_c_files(
                 raise ValueError("ESP32 Transformer export currently supports 16x16 input, D=32, 4 heads, 2 layers, FFN=64, and 35 classes")
             f.write("\nconst transformer_config_t g_transformer_config = {")
             is_spiking_transformer = bool(getattr(model, "is_spiking_transformer", False))
-            transformer_steps = int(getattr(model, "num_steps", 1)) if is_spiking_transformer else 1
+            transformer_steps = int(getattr(model, "inference_steps", model.num_steps)) if is_spiking_transformer else 1
             transformer_beta = float(getattr(model, "beta", 0.0)) if is_spiking_transformer else 0.0
             transformer_threshold = float(getattr(model, "threshold", 1.0)) if is_spiking_transformer else 1.0
             transformer_input_scale = float(getattr(model, "input_scale", 1.0)) if is_spiking_transformer else 1.0
+            spike_driven = bool(getattr(model, "is_spike_driven_transformer", False))
+            attention_threshold = float(getattr(model, "attention_threshold", transformer_threshold)) if spike_driven else transformer_threshold
+            early_exit_enabled = bool(getattr(model, "early_exit_enabled", False)) if is_spiking_transformer else False
+            early_exit_min_steps = int(getattr(model, "early_exit_min_steps", transformer_steps)) if early_exit_enabled else transformer_steps
+            early_exit_stable_steps = int(getattr(model, "early_exit_stable_steps", 1)) if early_exit_enabled else 1
+            early_exit_margin = float(getattr(model, "early_exit_margin", 0.0)) if early_exit_enabled else 0.0
             f.write(f"{tokens}, {features}, {embed_dim}, {heads}, {layer_count}, {ffn_dim}, {output_size}, "
                     f"{1 if is_spiking_transformer else 0}, {transformer_steps}, {transformer_beta:.6f}f, "
-                    f"{transformer_threshold:.6f}f, {transformer_input_scale:.6f}f" + "};\n")
+                    f"{transformer_threshold:.6f}f, {transformer_input_scale:.6f}f, "
+                    f"{1 if spike_driven else 0}, {attention_threshold:.6f}f, "
+                    f"{1 if early_exit_enabled else 0}, {early_exit_min_steps}, "
+                    f"{early_exit_stable_steps}, {early_exit_margin:.9g}f" + "};\n")
             f.write("const float* const g_transformer_input_w = s_transformer_input_w;\n")
             f.write("const float* const g_transformer_input_b = s_transformer_input_b;\n")
             f.write("const float* const g_transformer_position = s_transformer_position;\n")

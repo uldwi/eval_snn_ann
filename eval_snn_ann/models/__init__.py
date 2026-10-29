@@ -2,12 +2,14 @@
 from .ann import ConfigurableANN, CompactTransformerANN
 from .factory import build_model_from_config, transfer_ann_to_snn
 from .snn import (
-    CompactSpikingTransformer, ConfigurableSpikingJellySNN, SpikCommander,
+    CompactSpikingTransformer, CompactSpikeDrivenTransformer,
+    ConfigurableSpikingJellySNN, SpikCommander,
     encode_input, get_encoding_code, HAS_SPIKINGJELLY,
 )
 
 __all__ = [
     "ConfigurableANN", "CompactTransformerANN", "CompactSpikingTransformer",
+    "CompactSpikeDrivenTransformer",
     "ConfigurableSpikingJellySNN", "SpikCommander", "build_model_from_config",
     "transfer_ann_to_snn", "encode_input", "get_encoding_code", "HAS_SPIKINGJELLY",
 ]

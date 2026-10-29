@@ -141,16 +141,22 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "threshold": float(model_cfg.get("threshold", 1.0)),
             "dropout_rate": float(model_cfg.get("dropout_rate", 0.1)),
         }
-    elif architecture in ("spiking_transformer", "spikingtransformer"):
-        signature["spiking_transformer"] = {
+    elif architecture in ("spiking_transformer", "spikingtransformer",
+                          "spike_driven_transformer", "spikedriven_transformer"):
+        signature["spike_driven_transformer" if "spike_driven" in architecture or architecture == "spikedriven_transformer" else "spiking_transformer"] = {
             "transformer": copy.deepcopy(model_cfg.get("transformer", {})),
             "num_steps": int(model_cfg.get("num_steps", 8)),
+            "inference_steps": int(model_cfg.get("inference_steps", model_cfg.get("num_steps", 8))),
             "beta": float(model_cfg.get("beta", 0.5)),
             "threshold": float(model_cfg.get("threshold", 1.0)),
             "input_scale": float(model_cfg.get("input_scale", 1.0)),
             "distillation": copy.deepcopy(model_cfg.get("distillation", {})),
             "ann_checkpoint": model_cfg.get("ann_checkpoint"),
         }
+        if architecture in ("spike_driven_transformer", "spikedriven_transformer"):
+            signature["spike_driven_transformer"]["attention_threshold"] = float(
+                model_cfg.get("attention_threshold", 4.0)
+            )
     elif model_type == "snn":
         neuron_type = str(model_cfg.get("neuron_type", model_cfg.get("neuron", "lif"))).lower()
         exec_mode = str(model_cfg.get("execution_mode", model_cfg.get("execution", "dense"))).lower()
@@ -232,6 +238,110 @@ def _normalize_signature_for_comparison(signature: Dict[str, Any]) -> Dict[str, 
         snn_params.setdefault("output_readout", "spike")
     return normalized
 
+
+def _signature_matches_except_inference_steps(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    """Allow trained weights to be reused when only the deployed step count changed."""
+    old = _normalize_signature_for_comparison(previous)
+    new = _normalize_signature_for_comparison(current)
+    old_spiking = old.get("spiking_transformer")
+    new_spiking = new.get("spiking_transformer")
+    if not isinstance(old_spiking, dict) or not isinstance(new_spiking, dict):
+        return False
+
+    # Before inference_steps was configurable, inference used num_steps.
+    old_steps = old_spiking.pop("inference_steps", old_spiking.get("num_steps"))
+    new_steps = new_spiking.pop("inference_steps", new_spiking.get("num_steps"))
+    return old_steps != new_steps and old == new
+
+
+def _calibrate_transformer_early_exit(model, validation_dataset, early_exit_cfg, device: str) -> None:
+    """Choose an exit margin on validation data under a bounded accuracy loss."""
+    if not (getattr(model, "is_spiking_transformer", False)
+            and not getattr(model, "is_spikcommander", False)
+            and isinstance(early_exit_cfg, dict)
+            and bool(early_exit_cfg.get("enabled", False))):
+        return
+    if validation_dataset is None:
+        print("[Early exit] Disabled: this dataset has no validation split for calibration.")
+        model.early_exit_enabled = False
+        return
+
+    steps = int(model.inference_steps)
+    min_steps = max(1, min(steps, int(early_exit_cfg.get("min_steps", 2))))
+    stable_steps = max(1, min(steps, int(early_exit_cfg.get("stable_steps", 2))))
+    max_accuracy_drop = max(0.0, float(early_exit_cfg.get("max_accuracy_drop", 0.5)))
+    loader = DataLoader(validation_dataset, batch_size=64, shuffle=False)
+    all_logits, all_targets = [], []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for data, target in loader:
+            logits = model.forward_step_logits(data.to(device)).detach().cpu()
+            all_logits.append(logits)
+            all_targets.append(target.detach().cpu())
+    model.train(was_training)
+
+    if not all_logits:
+        print("[Early exit] Disabled: validation split is empty.")
+        model.early_exit_enabled = False
+        return
+
+    # [steps, samples, classes]
+    logits = torch.cat(all_logits, dim=1)
+    targets = torch.cat(all_targets, dim=0)
+    predictions = logits.argmax(dim=-1)
+    top_values = logits.topk(k=2, dim=-1).values
+    margins = top_values[..., 0] - top_values[..., 1]
+    sample_count = targets.numel()
+    final_correct = int((predictions[-1] == targets).sum().item())
+    baseline_accuracy = 100.0 * final_correct / max(1, sample_count)
+
+    stable = torch.zeros_like(predictions, dtype=torch.bool)
+    for step in range(stable_steps - 1, steps):
+        start = step - stable_steps + 1
+        stable[step] = (predictions[start:step + 1] == predictions[step:step + 1]).all(dim=0)
+    eligible = stable.clone()
+    eligible[:min_steps - 1] = False
+    candidate_margins = margins[eligible]
+    if candidate_margins.numel() == 0:
+        model.early_exit_enabled = False
+        print("[Early exit] Disabled: no validation observations meet the stability rule.")
+        return
+
+    # Quantile thresholds give a compact, deterministic search over exit rates.
+    quantiles = torch.linspace(0.0, 1.0, 101)
+    thresholds = torch.quantile(candidate_margins, quantiles).unique().tolist()
+    thresholds.append(float(candidate_margins.max().item()) + 1e-6)  # no-exit baseline
+    best = None
+    min_accuracy = baseline_accuracy - max_accuracy_drop
+    for threshold in thresholds:
+        exit_at = torch.full((sample_count,), steps, dtype=torch.long)
+        for step in range(min_steps - 1, steps):
+            take = (exit_at == steps) & eligible[step] & (margins[step] >= threshold)
+            exit_at[take] = step + 1
+        chosen = predictions[exit_at - 1, torch.arange(sample_count)]
+        accuracy = 100.0 * float((chosen == targets).sum().item()) / max(1, sample_count)
+        mean_steps = float(exit_at.float().mean().item())
+        if accuracy + 1e-9 >= min_accuracy and (best is None or mean_steps < best[0]):
+            best = (mean_steps, float(threshold), accuracy)
+
+    if best is None:
+        model.early_exit_enabled = False
+        print("[Early exit] Disabled: no calibrated threshold meets the accuracy constraint.")
+        return
+    model.early_exit_enabled = True
+    model.early_exit_min_steps = min_steps
+    model.early_exit_stable_steps = stable_steps
+    model.early_exit_margin = best[1]
+    model.early_exit_validation_accuracy = best[2]
+    model.early_exit_mean_steps = best[0]
+    print(
+        f"[Early exit] Calibrated on {sample_count} validation samples: margin >= "
+        f"{best[1]:.6g}, stable for {stable_steps} steps, min {min_steps}; "
+        f"accuracy {best[2]:.2f}% (full-step baseline {baseline_accuracy:.2f}%, "
+        f"allowed drop {max_accuracy_drop:.2f} pp), mean steps {best[0]:.2f}/{steps}."
+    )
+
 def train_model(
     config: Dict[str, Any],
     device: str = "cpu",
@@ -288,7 +398,8 @@ def train_model(
     # path alone is not enough for cache validation: the same ANN checkpoint
     # may have been overwritten with different weights.
     if model_type == "snn" and str(model_cfg.get("architecture", "")).lower() in (
-        "spiking_transformer", "spikingtransformer"
+        "spiking_transformer", "spikingtransformer", "spike_driven_transformer",
+        "spikedriven_transformer",
     ):
         ann_model_name = model_cfg.get(
             "ann_checkpoint", "ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer"
@@ -428,22 +539,63 @@ def train_model(
                 and _normalize_signature_for_comparison(cached_signature)
                 == _normalize_signature_for_comparison(signature)
             )
-            if (cached_hash == sig_hash or cache_signature_matches) and "state_dict" in checkpoint:
+            inference_only_cache_match = (
+                isinstance(cached_signature, dict)
+                and _signature_matches_except_inference_steps(cached_signature, signature)
+            )
+            if (
+                cached_hash == sig_hash or cache_signature_matches or inference_only_cache_match
+            ) and "state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["state_dict"])
                 test_acc = float(checkpoint.get("test_acc", 0.0))
                 test_loss = float(checkpoint.get("test_loss", 0.0))
                 best_epoch = checkpoint.get("best_epoch", "N/A")
+
+                if inference_only_cache_match:
+                    # The training trajectory and weights are unchanged. Refresh
+                    # metrics using the new deployed step count without retraining.
+                    test_acc, test_loss = evaluate_model(model, test_dataset, device=device)
+                    checkpoint.update({
+                        "config_signature": signature,
+                        "config_hash": sig_hash,
+                        "test_acc": float(test_acc),
+                        "test_loss": float(test_loss),
+                        "timestamp": time.time(),
+                    })
+                    torch.save(checkpoint, cache_checkpoint_path)
+                    cache_meta_path = Path(cache_checkpoint_path).with_suffix(".json")
+                    if cache_meta_path.exists():
+                        try:
+                            meta_data = json.loads(cache_meta_path.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError):
+                            meta_data = {}
+                        meta_data.update({
+                            "config_signature": signature,
+                            "config_hash": sig_hash,
+                            "test_acc": float(test_acc),
+                            "test_loss": float(test_loss),
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        })
+                        cache_meta_path.write_text(
+                            json.dumps(meta_data, indent=2, ensure_ascii=False), encoding="utf-8"
+                        )
 
                 print("\n" + "=" * 65)
                 print(f">>> [Cache] Using saved model: '{model_name}' ({'SNN' if model_type == 'snn' else 'ANN'}) <<<")
                 print(f"  - Checkpoint:           {cache_checkpoint_path}")
                 print(f"  - Dataset:              {dataset_info.name} ({dataset_info.domain})")
                 print(f"  - Architecture:         {model.get_structure_summary()}")
-                hash_status = "unchanged" if cached_hash == sig_hash else "compatible legacy signature"
+                if inference_only_cache_match:
+                    hash_status = "inference steps changed; weights reused and accuracy refreshed"
+                else:
+                    hash_status = "unchanged" if cached_hash == sig_hash else "compatible legacy signature"
                 print(f"  - Configuration hash:   {sig_hash[:12]} ({hash_status})")
-                print(f"  - Saved accuracy:       {test_acc:.2f}% (epoch {best_epoch})")
-                print(f"  - Saved loss:           {test_loss:.4f}")
-                print(f"  -> No retraining needed (cache hit).\n")
+                print(f"  - Accuracy:             {test_acc:.2f}% (epoch {best_epoch})")
+                print(f"  - Loss:                 {test_loss:.4f}")
+                _calibrate_transformer_early_exit(
+                    model, dataset_info.validation_dataset, model_cfg.get("early_exit", {}), device
+                )
+                print("  -> No retraining needed (cache hit).\n")
                 return model, test_dataset, test_acc, test_loss
             else:
                 old_h = str(cached_hash)[:12] if cached_hash else "None"
@@ -520,7 +672,11 @@ def train_model(
     if model_type == "snn":
         print(f"  - Neuron type:         {model.neuron_type.upper()}")
         print(f"  - Encoding type:       {model.encoding_type.upper()}")
-        print(f"  - Time steps:          {model.num_steps}")
+        if getattr(model, "is_spiking_transformer", False):
+            print(f"  - Training time steps: {model.num_steps}")
+            print(f"  - Inference time steps: {model.inference_steps}")
+        else:
+            print(f"  - Time steps:          {model.num_steps}")
         if getattr(model, "temporal_input", False):
             print(f"  - Sequence input:      {model.flat_size} features per time step; state reset after each sample")
             print(f"  - Input scale:         {getattr(model, 'input_scale', 1.0):g}x")
@@ -682,6 +838,10 @@ def train_model(
     if opt_info.get("applied", False):
         test_acc = float(opt_info.get("post_acc", test_acc))
         avg_loss = float(opt_info.get("post_loss", avg_loss))
+
+    _calibrate_transformer_early_exit(
+        model, dataset_info.validation_dataset, model_cfg.get("early_exit", {}), device
+    )
 
     if dataset_info.validation_dataset is not None:
         test_acc, avg_loss = evaluate_model(model, test_dataset, device=device)

@@ -24,6 +24,7 @@ class CompactSpikingTransformer(nn.Module):
                  in_height: int, in_width: int, embed_dim: int = 32,
                  num_heads: int = 4, num_layers: int = 2,
                  feedforward_dim: int = 64, num_steps: int = 8,
+                 inference_steps: int = None,
                  beta: float = 0.5, threshold: float = 1.0,
                  input_scale: float = 1.0):
         super().__init__()
@@ -44,6 +45,9 @@ class CompactSpikingTransformer(nn.Module):
         self.neuron_type = "lif"
         self.encoding_type = "direct"
         self.num_steps = int(num_steps)
+        self.inference_steps = int(inference_steps if inference_steps is not None else num_steps)
+        if self.inference_steps < 1 or self.inference_steps > self.num_steps:
+            raise ValueError("inference_steps must be between 1 and the training num_steps")
         self.beta = float(beta)
         self.threshold = float(threshold)
         self.input_scale = float(input_scale)
@@ -72,7 +76,7 @@ class CompactSpikingTransformer(nn.Module):
             surrogate_function=surrogate.ATan(), detach_reset=True,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward(self, x: torch.Tensor, return_step_logits: bool = False):
         if x.dim() == 2:
             x = x.view(x.size(0), self.in_channels, self.in_height, self.in_width)
         if x.dim() == 4:
@@ -83,8 +87,10 @@ class CompactSpikingTransformer(nn.Module):
         functional.reset_net(self)
         tokens = (self.input_projection(x.transpose(1, 2)) + self.position_embedding) * self.input_scale
         spike_sum = torch.zeros_like(tokens)
+        step_logits = []
+        steps = self.num_steps if self.training else self.inference_steps
         try:
-            for _ in range(self.num_steps):
+            for _ in range(steps):
                 cur = self.input_node(tokens)
                 for i, layer in enumerate(self.encoder.layers):
                     b, n, d = cur.shape
@@ -105,17 +111,137 @@ class CompactSpikingTransformer(nn.Module):
                     ff = F.linear(hidden, layer.linear2.weight, layer.linear2.bias)
                     cur = self.ff_nodes[i](cur + ff)
                 spike_sum = spike_sum + cur
-            pooled = spike_sum.mean(dim=1) / float(self.num_steps)
+                if return_step_logits:
+                    pooled = spike_sum.mean(dim=1) / float(len(step_logits) + 1)
+                    step_logits.append(self.classifier(self.norm(pooled)))
+            pooled = spike_sum.mean(dim=1) / float(steps)
+            if return_step_logits:
+                return torch.stack(step_logits, dim=0)
             return self.classifier(self.norm(pooled))
         finally:
             functional.reset_net(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward(x, return_step_logits=False)
+
+    def forward_step_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Return cumulative classifier logits after every inference step [T,B,C]."""
+        return self._forward(x, return_step_logits=True)
 
     def get_structure_summary(self) -> str:
         return (f"SNN-SpikingTransformer [{self.in_width} time tokens -> "
                 f"{self.input_projection.out_features} LIF embedding -> "
                 f"{len(self.encoder.layers)} spiking attention/MLP blocks] "
-                f"(T={self.num_steps}, β={self.beta:.2f}, θ={self.threshold:.2f}, "
+                f"(Ttrain={self.num_steps}, Tinfer={self.inference_steps}, "
+                f"β={self.beta:.2f}, θ={self.threshold:.2f}, "
                 f"Input×{self.input_scale:g})")
+
+
+class CompactSpikeDrivenTransformer(CompactSpikingTransformer):
+    """Speech transformer using binary spike-driven self-attention (SDSA).
+
+    The Q/K/V interaction is a channel-wise K&V accumulation followed by a
+    spiking gate on Q. Membrane-potential shortcuts keep block outputs binary.
+    """
+    def __init__(self, *args, attention_threshold: float = 4.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_spike_driven_transformer = True
+        self.attention_threshold = float(attention_threshold)
+        self._spike = surrogate.ATan()
+        # Normalization on binary activations would make them dense again.
+        # Keep the ANN-compatible encoder weights elsewhere, but remove these
+        # unused LayerNorm parameters from the deployed/trained SDSA model.
+        for layer in self.encoder.layers:
+            layer.norm1 = nn.Identity()
+            layer.norm2 = nn.Identity()
+
+    def _lif_step(self, current: torch.Tensor, membrane: torch.Tensor, threshold=None):
+        v = self.beta * membrane + current
+        threshold = self.threshold if threshold is None else float(threshold)
+        spikes = self._spike(v - threshold)
+        membrane = v * (1.0 - spikes.detach())
+        return spikes, membrane, v
+
+    def _forward(self, x: torch.Tensor, return_step_logits: bool = False):
+        if x.dim() == 2:
+            x = x.view(x.size(0), self.in_channels, self.in_height, self.in_width)
+        if x.dim() == 4:
+            x = x.mean(dim=1)
+        if x.dim() != 3 or x.size(1) != self.in_height or x.size(2) != self.in_width:
+            raise ValueError(
+                f"SpikeDrivenTransformer expected (batch, {self.in_height}, {self.in_width})"
+            )
+
+        tokens = (self.input_projection(x.transpose(1, 2)) + self.position_embedding) * self.input_scale
+        batch, token_count, embed_dim = tokens.shape
+        steps = self.num_steps if self.training else self.inference_steps
+        input_mem = torch.zeros_like(tokens)
+        spike_sum = torch.zeros_like(tokens)
+        layer_states = []
+        for layer in self.encoder.layers:
+            layer_states.append({
+                "q": torch.zeros_like(tokens), "k": torch.zeros_like(tokens),
+                "v": torch.zeros_like(tokens), "context": torch.zeros((batch, embed_dim), device=x.device, dtype=x.dtype),
+                "attention": torch.zeros_like(tokens),
+                "hidden": torch.zeros((batch, token_count, layer.linear1.out_features), device=x.device, dtype=x.dtype),
+                "feedforward": torch.zeros_like(tokens),
+            })
+
+        step_logits = []
+        for _ in range(steps):
+            current, input_mem, residual_potential = self._lif_step(tokens, input_mem)
+            for layer, state in zip(self.encoder.layers, layer_states):
+                qkv = F.linear(current, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias)
+                q, k, v = qkv.chunk(3, dim=-1)
+                q, state["q"], _ = self._lif_step(q, state["q"])
+                k, state["k"], _ = self._lif_step(k, state["k"])
+                v, state["v"], _ = self._lif_step(v, state["v"])
+
+                # SDSA v2: spike K&V, sum across tokens, spike the channel
+                # context, then mask Q. No QK matrix, softmax, or weighted V.
+                context_current = (k * v).sum(dim=1)
+                context, state["context"], _ = self._lif_step(
+                    context_current, state["context"], self.attention_threshold
+                )
+                attention = q * context.unsqueeze(1)
+                attention_current = F.linear(
+                    attention, layer.self_attn.out_proj.weight,
+                    layer.self_attn.out_proj.bias,
+                )
+                attention_spikes, state["attention"], attention_potential = self._lif_step(
+                    attention_current + residual_potential, state["attention"]
+                )
+
+                hidden_current = F.linear(attention_spikes, layer.linear1.weight, layer.linear1.bias)
+                hidden_spikes, state["hidden"], _ = self._lif_step(hidden_current, state["hidden"])
+                feedforward_current = F.linear(hidden_spikes, layer.linear2.weight, layer.linear2.bias)
+                current, state["feedforward"], residual_potential = self._lif_step(
+                    feedforward_current + attention_potential, state["feedforward"]
+                )
+
+            spike_sum = spike_sum + current
+            if return_step_logits:
+                pooled = spike_sum.mean(dim=1) / float(len(step_logits) + 1)
+                step_logits.append(self.classifier(self.norm(pooled)))
+
+        pooled = spike_sum.mean(dim=1) / float(steps)
+        if return_step_logits:
+            return torch.stack(step_logits, dim=0)
+        return self.classifier(self.norm(pooled))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward(x, return_step_logits=False)
+
+    def forward_step_logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward(x, return_step_logits=True)
+
+    def get_structure_summary(self) -> str:
+        return (f"SNN-SpikeDrivenTransformer [{self.in_width} time tokens -> "
+                f"{self.input_projection.out_features} LIF embedding -> "
+                f"{len(self.encoder.layers)} SDSA/MLP blocks, binary mask-and-add attention] "
+                f"(Ttrain={self.num_steps}, Tinfer={self.inference_steps}, "
+                f"β={self.beta:.2f}, θ={self.threshold:.2f}, "
+                f"θ_attn={self.attention_threshold:.2f})")
 
 class SpikCommander(nn.Module):
     """SpikCommander-inspired temporal SNN for Mel sequences.
