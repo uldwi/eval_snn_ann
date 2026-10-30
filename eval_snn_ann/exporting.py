@@ -852,7 +852,23 @@ def export_c_files(
         f.write(f"#define MNIST_IMAGE_SIZE {dataset_input_size}\n")
         f.write(f"#define MNIST_NUM_OUTPUTS {output_size}\n\n")
 
-        labels = [int(test_dataset[i][1]) for i in range(num_test_samples)]
+        speech_dataset = dataset_name in ("speech_commands", "kws", "speech_commands_spikcommander")
+        test_indices = (
+            test_dataset.stratified_subset_indices(num_test_samples)
+            if speech_dataset else list(range(num_test_samples))
+        )
+        if speech_dataset:
+            labels = [
+                int(test_dataset.keyword_to_index[test_dataset.samples[index][2]])
+                for index in test_indices
+            ]
+            class_counts = np.bincount(labels, minlength=output_size)
+            print(
+                f"[Export] Speech Commands subset is stratified across {np.count_nonzero(class_counts)} "
+                f"classes (per-class count {class_counts.min()}–{class_counts.max()})."
+            )
+        else:
+            labels = [int(test_dataset[i][1]) for i in test_indices]
         f.write("static const uint8_t mnist_test_labels[MNIST_TEST_SUBSET] = {\n  ")
         f.write(", ".join(str(l) for l in labels))
         f.write("\n};\n\n")
@@ -861,7 +877,7 @@ def export_c_files(
             if not hasattr(test_dataset, "load_normalized_audio"):
                 raise TypeError("Speech Commands ESP32 export requires load_normalized_audio() on the dataset")
             f.write("static const int16_t speech_test_audio[MNIST_TEST_SUBSET][SPEECH_AUDIO_SAMPLES] = {\n")
-            for sample_idx in range(num_test_samples):
+            for sample_idx in test_indices:
                 commander_pcm = dataset_name == "speech_commands_spikcommander"
                 audio = test_dataset.load_normalized_audio(sample_idx, resample=not commander_pcm)
                 pcm = np.rint(audio * 32768.0)
@@ -874,7 +890,7 @@ def export_c_files(
 
         if dataset_name not in ("speech_commands", "kws", "speech_commands_spikcommander"):
             f.write("static const float mnist_test_images[MNIST_TEST_SUBSET][MNIST_IMAGE_SIZE] = {\n")
-            for i in range(num_test_samples):
+            for i in test_indices:
                 img_tensor, _ = test_dataset[i]
                 if temporal_input:
                     img_np = img_tensor.reshape(1, model.in_channels * model.in_height, model.in_width)

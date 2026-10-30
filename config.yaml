@@ -96,6 +96,14 @@ models:
       enabled: true
       alpha: 0.8
       temperature: 3.0
+    parameter_calibration:
+      enabled: true
+      max_samples: 350
+      rounds: 2
+      beta_values: [0.75, 0.85, 0.90, 0.95]
+      threshold_values: [0.70, 0.85, 1.00, 1.15, 1.30]
+      attention_threshold_values: [2.0, 3.0, 4.0, 5.0, 6.0]
+    classwise_metrics: true
     transformer:
       embed_dim: 32
       num_heads: 4
@@ -137,6 +145,13 @@ models:
       enabled: true
       alpha: 0.8
       temperature: 3.0
+    parameter_calibration:
+      enabled: true
+      max_samples: 350
+      rounds: 2
+      beta_values: [0.75, 0.85, 0.90, 0.95]
+      threshold_values: [0.70, 0.85, 1.00, 1.15, 1.30]
+    classwise_metrics: true
     transformer:
       embed_dim: 32
       num_heads: 4

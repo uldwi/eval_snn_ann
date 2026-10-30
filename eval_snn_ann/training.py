@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from .config import DEFAULT_CONFIG, parse_conv_layers
 from .data.hub import DatasetInfo, get_dataset, normalize_dataset_name
@@ -345,6 +346,148 @@ def _calibrate_transformer_early_exit(model, validation_dataset, early_exit_cfg,
         f"allowed drop {max_accuracy_drop:.2f} pp), mean steps {best[0]:.2f}/{steps}."
     )
 
+
+def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, device: str) -> Dict[str, float]:
+    """Tune shared LIF parameters on a balanced validation subset, without changing inference work."""
+    if not (
+        getattr(model, "is_spiking_transformer", False)
+        and isinstance(calibration_cfg, dict)
+        and bool(calibration_cfg.get("enabled", False))
+    ):
+        return {}
+    if validation_dataset is None:
+        print("[Parameter calibration] Skipped: no validation split is available.")
+        return {}
+
+    max_samples = max(1, int(calibration_cfg.get("max_samples", 350)))
+    if hasattr(validation_dataset, "stratified_subset_indices"):
+        indices = validation_dataset.stratified_subset_indices(max_samples)
+        subset = Subset(validation_dataset, indices)
+    else:
+        subset = Subset(validation_dataset, list(range(min(max_samples, len(validation_dataset)))))
+    if len(subset) == 0:
+        print("[Parameter calibration] Skipped: validation subset is empty.")
+        return {}
+
+    loader = DataLoader(subset, batch_size=64, shuffle=False)
+    parameters = ["beta", "threshold"]
+    if hasattr(model, "attention_threshold"):
+        parameters.append("attention_threshold")
+    defaults = {
+        "beta": [0.75, 0.85, 0.90, 0.95],
+        "threshold": [0.70, 0.85, 1.00, 1.15, 1.30],
+        "attention_threshold": [2.0, 3.0, 4.0, 5.0, 6.0],
+    }
+    candidates = {
+        name: [float(v) for v in calibration_cfg.get(f"{name}_values", defaults[name])]
+        for name in parameters
+    }
+    rounds = max(1, int(calibration_cfg.get("rounds", 2)))
+    was_training = model.training
+
+    def accuracy() -> float:
+        correct = total = 0
+        model.eval()
+        with torch.no_grad():
+            for data, target in loader:
+                output = model(data.to(device))
+                correct += int(output.argmax(dim=1).eq(target.to(device)).sum().item())
+                total += int(target.numel())
+        return 100.0 * correct / max(1, total)
+
+    baseline = {name: float(getattr(model, name)) for name in parameters}
+    best_accuracy = accuracy()
+    baseline_accuracy = best_accuracy
+    for _ in range(rounds):
+        for name in parameters:
+            best_value = float(getattr(model, name))
+            local_best = accuracy()
+            values = list(dict.fromkeys(candidates[name] + [best_value]))
+            for value in values:
+                setattr(model, name, value)
+                candidate_accuracy = accuracy()
+                # Preserve the current value on ties to avoid needless changes.
+                if candidate_accuracy > local_best + 1e-9:
+                    local_best = candidate_accuracy
+                    best_value = value
+            setattr(model, name, best_value)
+            best_accuracy = local_best
+
+    model.train(was_training)
+    calibrated = {name: float(getattr(model, name)) for name in parameters}
+    changed = any(abs(calibrated[name] - baseline[name]) > 1e-9 for name in parameters)
+    print(
+        "[Parameter calibration] Validation subset: "
+        f"{len(subset)} balanced samples; accuracy {baseline_accuracy:.2f}% -> "
+        f"{best_accuracy:.2f}%; selected "
+        + ", ".join(f"{name}={value:g}" for name, value in calibrated.items())
+        + ("." if changed else " (configured values retained).")
+    )
+    return calibrated
+
+
+def _evaluate_classwise(
+    model, dataset, class_names: List[str], device: str, output_dir: Optional[str], model_name: str
+) -> Optional[Dict[str, Any]]:
+    """Report per-class precision/recall/F1 and save the full confusion matrix."""
+    if dataset is None or not class_names:
+        return None
+    n_classes = len(class_names)
+    confusion = np.zeros((n_classes, n_classes), dtype=np.int64)
+    loader = DataLoader(dataset, batch_size=64, shuffle=False)
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for data, target in loader:
+            output = model(data.to(device))
+            predicted = output.argmax(dim=1).detach().cpu().numpy()
+            actual = target.detach().cpu().numpy()
+            np.add.at(confusion, (actual, predicted), 1)
+            if HAS_SPIKINGJELLY and getattr(model, "neuron_type", None) is not None:
+                functional.reset_net(model)
+    model.train(was_training)
+
+    rows = []
+    for index, name in enumerate(class_names):
+        tp = int(confusion[index, index])
+        support = int(confusion[index].sum())
+        predicted_count = int(confusion[:, index].sum())
+        precision = tp / predicted_count if predicted_count else 0.0
+        recall = tp / support if support else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        rows.append({"class": name, "support": support, "precision": precision,
+                     "recall": recall, "f1": f1})
+
+    print("[Class-wise test metrics] Class | support | precision | recall | F1")
+    for row in rows:
+        print(f"  {row['class']:<10} | {row['support']:>7} | {row['precision'] * 100:>8.2f}% | "
+              f"{row['recall'] * 100:>6.2f}% | {row['f1'] * 100:>6.2f}%")
+    confusions = [
+        (int(confusion[a, p]), class_names[a], class_names[p])
+        for a in range(n_classes) for p in range(n_classes) if a != p and confusion[a, p]
+    ]
+    confusions.sort(reverse=True)
+    print("[Most common test confusions] " + (", ".join(
+        f"{actual}→{predicted}: {count}" for count, actual, predicted in confusions[:10]
+    ) or "none"))
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in model_name)
+        metrics_path = Path(output_dir) / f"{safe_name}_class_metrics.csv"
+        confusion_path = Path(output_dir) / f"{safe_name}_confusion_matrix.csv"
+        with metrics_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=["class", "support", "precision", "recall", "f1"])
+            writer.writeheader()
+            writer.writerows(rows)
+        with confusion_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["actual\\predicted", *class_names])
+            for name, row in zip(class_names, confusion):
+                writer.writerow([name, *[int(value) for value in row]])
+        print(f"[Class-wise test metrics] Saved {metrics_path} and {confusion_path}.")
+    return {"classes": rows, "confusion_matrix": confusion.tolist()}
+
 def train_model(
     config: Dict[str, Any],
     device: str = "cpu",
@@ -554,6 +697,55 @@ def train_model(
                 test_loss = float(checkpoint.get("test_loss", 0.0))
                 best_epoch = checkpoint.get("best_epoch", "N/A")
 
+                calibration_cfg = model_cfg.get("parameter_calibration", {})
+                stored_calibration = checkpoint.get("inference_calibration", {})
+                required_calibration = ["beta", "threshold"]
+                if hasattr(model, "attention_threshold"):
+                    required_calibration.append("attention_threshold")
+                if (isinstance(calibration_cfg, dict)
+                        and bool(calibration_cfg.get("enabled", False))
+                        and checkpoint.get("parameter_calibration_config") == calibration_cfg
+                        and isinstance(stored_calibration, dict)
+                        and all(key in stored_calibration for key in required_calibration)):
+                    calibrated_params = {
+                        key: float(stored_calibration[key]) for key in required_calibration
+                    }
+                    for key, value in calibrated_params.items():
+                        setattr(model, key, value)
+                    print("[Parameter calibration] Loaded saved deployment values: " +
+                          ", ".join(f"{key}={value:g}" for key, value in calibrated_params.items()))
+                else:
+                    calibrated_params = _calibrate_spiking_parameters(
+                        model, dataset_info.validation_dataset, calibration_cfg, device,
+                    )
+                _calibrate_transformer_early_exit(
+                    model, dataset_info.validation_dataset, model_cfg.get("early_exit", {}), device
+                )
+                if calibrated_params:
+                    test_acc, test_loss = evaluate_model(model, test_dataset, device=device)
+                    checkpoint.update({
+                        "test_acc": float(test_acc), "test_loss": float(test_loss),
+                        "inference_calibration": calibrated_params,
+                        "parameter_calibration_config": calibration_cfg,
+                        "timestamp": time.time(),
+                    })
+                    torch.save(checkpoint, cache_checkpoint_path)
+                    cache_meta_path = Path(cache_checkpoint_path).with_suffix(".json")
+                    if cache_meta_path.exists():
+                        try:
+                            meta_data = json.loads(cache_meta_path.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError):
+                            meta_data = {}
+                        meta_data.update({
+                            "test_acc": float(test_acc), "test_loss": float(test_loss),
+                            "inference_calibration": calibrated_params,
+                            "parameter_calibration_config": calibration_cfg,
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        })
+                        cache_meta_path.write_text(
+                            json.dumps(meta_data, indent=2, ensure_ascii=False), encoding="utf-8"
+                        )
+
                 if inference_only_cache_match:
                     # The training trajectory and weights are unchanged. Refresh
                     # metrics using the new deployed step count without retraining.
@@ -595,9 +787,13 @@ def train_model(
                 print(f"  - Configuration hash:   {sig_hash[:12]} ({hash_status})")
                 print(f"  - Accuracy:             {test_acc:.2f}% (epoch {best_epoch})")
                 print(f"  - Loss:                 {test_loss:.4f}")
-                _calibrate_transformer_early_exit(
-                    model, dataset_info.validation_dataset, model_cfg.get("early_exit", {}), device
-                )
+                if (bool(model_cfg.get("classwise_metrics", False))
+                        and dataset_name in ("speech_commands", "kws")
+                        and model_type == "snn"):
+                    _evaluate_classwise(
+                        model, test_dataset, dataset_info.class_names, device,
+                        resolved_save_dir, model_name,
+                    )
                 print("  -> No retraining needed (cache hit).\n")
                 return model, test_dataset, test_acc, test_loss
             else:
@@ -842,6 +1038,10 @@ def train_model(
         test_acc = float(opt_info.get("post_acc", test_acc))
         avg_loss = float(opt_info.get("post_loss", avg_loss))
 
+    calibrated_params = _calibrate_spiking_parameters(
+        model, dataset_info.validation_dataset,
+        model_cfg.get("parameter_calibration", {}), device,
+    )
     _calibrate_transformer_early_exit(
         model, dataset_info.validation_dataset, model_cfg.get("early_exit", {}), device
     )
@@ -849,6 +1049,14 @@ def train_model(
     if dataset_info.validation_dataset is not None:
         test_acc, avg_loss = evaluate_model(model, test_dataset, device=device)
         print(f"[PyTorch] Accuracy on the untouched {dataset_info.name} test split: {test_acc:.2f}%.")
+
+    if (bool(model_cfg.get("classwise_metrics", False))
+            and dataset_name in ("speech_commands", "kws")
+            and model_type == "snn"):
+        _evaluate_classwise(
+            model, test_dataset, dataset_info.class_names, device,
+            resolved_save_dir, model_name,
+        )
 
     # ---------------------------------------------------------
     # Automatically save the trained model (checkpoint and metadata)
@@ -867,6 +1075,8 @@ def train_model(
                 "test_loss": float(avg_loss),
                 "best_epoch": best_epoch,
                 "optimization": opt_info if opt_info.get("applied", False) else None,
+                "inference_calibration": calibrated_params,
+                "parameter_calibration_config": model_cfg.get("parameter_calibration", {}),
                 "timestamp": time.time(),
             }
             torch.save(checkpoint_data, checkpoint_path)
@@ -881,6 +1091,8 @@ def train_model(
                 "config_hash": sig_hash,
                 "config_signature": signature,
                 "optimization": opt_info if opt_info.get("applied", False) else None,
+                "inference_calibration": calibrated_params,
+                "parameter_calibration_config": model_cfg.get("parameter_calibration", {}),
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
             }
             with open(meta_path, "w", encoding="utf-8") as f:
@@ -905,9 +1117,15 @@ def evaluate_subset(
     if total <= 0:
         return 0.0, 0, 0
 
+    indices = (
+        test_dataset.stratified_subset_indices(total)
+        if hasattr(test_dataset, "stratified_subset_indices")
+        else list(range(total))
+    )
+
     correct = 0
     with torch.no_grad():
-        for i in range(total):
+        for i in indices:
             img_tensor, label = test_dataset[i]
             img_tensor = img_tensor.unsqueeze(0).to(device)
             out = model(img_tensor)

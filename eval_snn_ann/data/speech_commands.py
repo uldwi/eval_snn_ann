@@ -50,6 +50,35 @@ class SpeechCommandsDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def stratified_subset_indices(self, count: int, seed: int = 42) -> list[int]:
+        """Return a reproducible, approximately class-balanced subset of this split."""
+        by_class: dict[int, list[int]] = {}
+        for index, sample in enumerate(self.samples):
+            label = self.keyword_to_index.get(sample[2])
+            if label is not None:
+                by_class.setdefault(int(label), []).append(index)
+        if not by_class:
+            return []
+
+        rng = np.random.default_rng(seed)
+        for indices in by_class.values():
+            rng.shuffle(indices)
+
+        selected: list[int] = []
+        target_count = min(max(0, int(count)), sum(map(len, by_class.values())))
+        while len(selected) < target_count:
+            added = False
+            for label in sorted(by_class):
+                if by_class[label]:
+                    selected.append(by_class[label].pop())
+                    added = True
+                    if len(selected) >= target_count:
+                        break
+            if not added:
+                break
+        rng.shuffle(selected)
+        return selected
+
     @staticmethod
     def _apply_spec_augment(features: torch.Tensor) -> torch.Tensor:
         """Apply one time and one frequency mask to a cached Mel feature map."""
