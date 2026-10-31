@@ -83,7 +83,7 @@ models:
       restore_best_weights: true
     learning_rate: 0.0005
     num_steps: 8
-    inference_steps: 6
+    inference_steps: 8
     early_exit:
       enabled: true
       min_steps: 2
@@ -138,7 +138,7 @@ models:
       restore_best_weights: true
     learning_rate: 0.0005
     num_steps: 8
-    inference_steps: 6
+    inference_steps: 8
     early_exit:
       enabled: true
       min_steps: 2
@@ -149,7 +149,7 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.5
+      alpha: 0.8
       temperature: 3.0
     parameter_calibration:
       enabled: true
@@ -458,12 +458,11 @@ models:
         stride: 1
     dataset: speech_commands
     encoding_type: ttfs
-    epochs: 60
+    epochs: 40
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 10
-      min_delta: 0.001
+      patience: 8
       restore_best_weights: true
     hidden_layers:
       - 64
@@ -472,7 +471,6 @@ models:
     num_steps: 8
     threshold: 1.0
     ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
-    spec_augment: true
     type: snn
 optimization:
   clustering:

@@ -124,7 +124,6 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
     # Preserve existing cache signatures for models without SpecAugment.
     if bool(model_cfg.get("spec_augment", False)):
         signature["spec_augment"] = True
-        signature["spec_augment_version"] = 2
 
     if dataset_info is not None:
         signature["dataset_dims"] = {
