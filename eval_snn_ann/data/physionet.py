@@ -212,7 +212,11 @@ def _load_physionet_eeg_mi(
                 "Install project dependencies with `pip install -r requirements.txt`."
             ) from exc
 
-        train_x = np.concatenate(split_features["train"], axis=0)
+        # MNE's CSP rank estimation wraps the input in RawArray(copy=None),
+        # which requires float64 in older MNE releases. Convert explicitly
+        # here so cluster environments with MNE 1.8 do not fail on cached
+        # float32 segments. Keep this conversion limited to the training split.
+        train_x = np.concatenate(split_features["train"], axis=0).astype(np.float64, copy=False)
         train_y = np.concatenate(split_labels["train"], axis=0)
         csp_model = CSP(
             n_components=8,
@@ -227,6 +231,7 @@ def _load_physionet_eeg_mi(
             rank="full",
         )
         csp_model.fit(train_x, train_y)
+        del train_x, train_y
         transformed = {}
         for split in ("train", "validation", "test"):
             raw_x = np.concatenate(split_features[split], axis=0)

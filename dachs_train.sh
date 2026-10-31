@@ -13,7 +13,7 @@ PROJECT_DIR="$HOME/code/eval_snn_ann"
 PHYSIONET_SOURCE="$PROJECT_DIR/eval_snn_ann/data/physionet.py"
 TRAIN_SCRIPT="$PROJECT_DIR/dachs_train.sh"
 
-if ! grep -Fq 'rank="full"' "$PHYSIONET_SOURCE"; then
+if ! grep -Eq '^[[:space:]]*rank="full",[[:space:]]*(#.*)?$' "$PHYSIONET_SOURCE"; then
     echo "ERROR: DACHS checkout is missing the PhysioNet CSP rank fix."
     echo "Sync the updated eval_snn_ann/data/physionet.py from your working copy, then resubmit."
     exit 1
