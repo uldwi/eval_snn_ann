@@ -85,8 +85,8 @@ class SpeechCommandsDataset(Dataset):
         augmented = features.clone()
         mel_bins, frames = augmented.shape[-2:]
         # Preserve the original large-model masks while scaling them to smaller maps.
-        max_freq_width = min(12, mel_bins) if mel_bins == 140 else max(1, int(mel_bins * 0.1))
-        max_time_width = min(10, frames) if frames == 100 else max(1, int(frames * 0.1))
+        max_freq_width = min(12, mel_bins) if mel_bins == 140 else max(1, int(mel_bins * 0.2))
+        max_time_width = min(10, frames) if frames == 100 else max(1, int(frames * 0.2))
         freq_width = int(np.random.randint(0, max_freq_width + 1))
         if freq_width:
             freq_start = int(np.random.randint(0, mel_bins - freq_width + 1))

@@ -100,6 +100,7 @@ static union {
     float features[KWS_FEATURES * KWS_TOKENS];
 } s_speech_workspace;
 #define s_speech_mel_power s_speech_workspace.mel_power
+static float s_speech_pooled_features[KWS_FEATURES * KWS_TOKENS];
 #if SPIKCOMMANDER_AUDIO
 static float s_speech_audio_8k[8000];
 #endif
@@ -176,7 +177,6 @@ static void speech_audio_to_mel(const int16_t *audio, float *features) {
 #else
     const float *pcm = nullptr;
 #endif
-    float mel_max = -100.0f;
     for (int frame = 0; frame < SPEECH_FRAMES; ++frame) {
         const int center = frame * SPEECH_HOP;
         for (int n = 0; n < SPEECH_NFFT; ++n) {
@@ -195,20 +195,15 @@ static void speech_audio_to_mel(const int16_t *audio, float *features) {
                 const SpeechComplex value = s_speech_fft_output[bin];
                 power += (value.re * value.re + value.im * value.im) * filter[bin];
             }
-            const float log_power = 10.0f * log10f(fmaxf(power, 1.0e-10f));
-            s_speech_mel_power[mel * SPEECH_FRAMES + frame] = log_power;
-            if (log_power > mel_max) mel_max = log_power;
+            s_speech_mel_power[mel * SPEECH_FRAMES + frame] = power;
         }
     }
 
-    for (int mel = 0; mel < SPEECH_MELS; ++mel) {
-        for (int frame = 0; frame < SPEECH_FRAMES; ++frame) {
-            float value = s_speech_mel_power[mel * SPEECH_FRAMES + frame] - mel_max;
-            value = fmaxf(-80.0f, fminf(0.0f, value));
-            s_speech_mel_power[mel * SPEECH_FRAMES + frame] = (value + 80.0f) / 80.0f;
-        }
-    }
-
+    // Match SpeechCommandsDataset: adaptive-average-pool linear Mel power
+    // first, then convert to dB, normalize against the pooled maximum, and
+    // clamp to an 80 dB range. Pooling after the logarithm changes the input
+    // distribution and caused an avoidable host/device accuracy gap.
+    float mel_max = -100.0f;
     for (int out_mel = 0; out_mel < KWS_FEATURES; ++out_mel) {
         const int m_start = (out_mel * SPEECH_MELS) / KWS_FEATURES;
         const int m_end = ((out_mel + 1) * SPEECH_MELS + KWS_FEATURES - 1) / KWS_FEATURES;
@@ -222,8 +217,18 @@ static void speech_audio_to_mel(const int16_t *audio, float *features) {
                 }
             }
             const int area = (m_end - m_start) * (t_end - t_start);
-            features[out_mel * KWS_TOKENS + out_time] = sum / static_cast<float>(area);
+            const float pooled_power = sum / static_cast<float>(area);
+            const float log_power = 10.0f * log10f(fmaxf(pooled_power, 1.0e-10f));
+            const int index = out_mel * KWS_TOKENS + out_time;
+            s_speech_pooled_features[index] = log_power;
+            if (log_power > mel_max) mel_max = log_power;
         }
+    }
+
+    for (int i = 0; i < KWS_FEATURES * KWS_TOKENS; ++i) {
+        float value = s_speech_pooled_features[i] - mel_max;
+        value = fmaxf(-80.0f, fminf(0.0f, value));
+        features[i] = (value + 80.0f) / 80.0f;
     }
 }
 #endif

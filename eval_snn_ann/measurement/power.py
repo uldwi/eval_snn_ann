@@ -11,6 +11,8 @@ Install project dependencies with: pip install -r requirements.txt
 import argparse
 import logging
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -83,6 +85,42 @@ def find_esp_idf_export() -> str:
     return None
 
 
+def find_esp_idf_python_env(export_sh: str) -> str:
+    """Find an installed ESP-IDF Python env matching the selected IDF release."""
+    configured_env = os.environ.get("IDF_PYTHON_ENV_PATH")
+    if configured_env and os.path.isfile(os.path.join(configured_env, "bin", "python")):
+        return configured_env
+
+    idf_root = Path(export_sh).resolve().parent
+    version_file = idf_root / "tools" / "cmake" / "version.cmake"
+    try:
+        version_text = version_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    major_match = re.search(r"set\(IDF_VERSION_MAJOR\s+(\d+)\)", version_text)
+    minor_match = re.search(r"set\(IDF_VERSION_MINOR\s+(\d+)\)", version_text)
+    if not major_match or not minor_match:
+        return None
+
+    env_root = Path.home() / ".espressif" / "python_env"
+    candidates = list(env_root.glob(
+        f"idf{major_match.group(1)}.{minor_match.group(1)}_py*_env"
+    ))
+    candidates = [
+        path for path in candidates
+        if os.path.isfile(path / "bin" / "python")
+    ]
+    if not candidates:
+        return None
+
+    def python_version(path: Path) -> tuple[int, int]:
+        match = re.search(r"_py(\d+)\.(\d+)_env$", path.name)
+        return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+    return str(max(candidates, key=python_version))
+
+
 def flash_esp32(port: str = None, project_dir: str = None, build: bool = True) -> bool:
     """
     Build the ESP-IDF project and flash it to the ESP32.
@@ -95,9 +133,25 @@ def flash_esp32(port: str = None, project_dir: str = None, build: bool = True) -
         print("[ESP-IDF] Warning: ESP-IDF 'export.sh' not found. Skipping flash.", file=sys.stderr)
         return False
 
+    idf_python_env = find_esp_idf_python_env(export_sh)
+    if not idf_python_env:
+        idf_root = Path(export_sh).resolve().parent
+        print(
+            "[ESP-IDF] No working Python environment is installed for this ESP-IDF checkout.\n"
+            f"[ESP-IDF] Set it up with: cd {idf_root} && ./install.sh",
+            file=sys.stderr,
+        )
+        return False
+
+    idf_env_prefix = f"export IDF_PYTHON_ENV_PATH={shlex.quote(idf_python_env)} && "
+    print(f"[ESP-IDF] Using Python environment: {idf_python_env}")
+
     port_opt = f"-p {port} " if port else ""
     cmd_action = f"idf.py {port_opt}build flash" if build else f"idf.py {port_opt}flash"
-    full_cmd = f". {export_sh} && cd {project_dir} && {cmd_action}"
+    full_cmd = (
+        f"{idf_env_prefix}. {shlex.quote(export_sh)} && "
+        f"cd {shlex.quote(project_dir)} && {cmd_action}"
+    )
 
     print(f"\n[ESP-IDF] Building and flashing firmware to ESP32 ({cmd_action})...")
     res = subprocess.run(["bash", "-c", full_cmd])

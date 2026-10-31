@@ -124,6 +124,7 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
     # Preserve existing cache signatures for models without SpecAugment.
     if bool(model_cfg.get("spec_augment", False)):
         signature["spec_augment"] = True
+        signature["spec_augment_version"] = 2
 
     if dataset_info is not None:
         signature["dataset_dims"] = {
@@ -247,10 +248,15 @@ def _signature_matches_except_inference_steps(previous: Dict[str, Any], current:
     """Allow trained weights to be reused when only the deployed step count changed."""
     old = _normalize_signature_for_comparison(previous)
     new = _normalize_signature_for_comparison(current)
-    old_spiking = old.get("spiking_transformer")
-    new_spiking = new.get("spiking_transformer")
-    if not isinstance(old_spiking, dict) or not isinstance(new_spiking, dict):
+    transformer_key = next(
+        (key for key in ("spiking_transformer", "spike_driven_transformer")
+         if isinstance(old.get(key), dict) and isinstance(new.get(key), dict)),
+        None,
+    )
+    if transformer_key is None:
         return False
+    old_spiking = old[transformer_key]
+    new_spiking = new[transformer_key]
 
     # Before inference_steps was configurable, inference used num_steps.
     old_steps = old_spiking.pop("inference_steps", old_spiking.get("num_steps"))
@@ -704,6 +710,7 @@ def train_model(
                     required_calibration.append("attention_threshold")
                 if (isinstance(calibration_cfg, dict)
                         and bool(calibration_cfg.get("enabled", False))
+                        and not inference_only_cache_match
                         and checkpoint.get("parameter_calibration_config") == calibration_cfg
                         and isinstance(stored_calibration, dict)
                         and all(key in stored_calibration for key in required_calibration)):
