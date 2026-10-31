@@ -41,11 +41,10 @@ python train_mnist.py \
   --config "$HOME/code/eval_snn_ann/config.yaml" \
   --save-dir "$HOME/code/eval_snn_ann/saved_models" \
   --device cuda \
-  --skip-evaluation \
-  --force-train
+  --skip-evaluation
 ```
 
-`--skip-evaluation` skips ESP32/Joulescope evaluation. `--force-train` retrains even when matching checkpoints exist. Checkpoints are saved under `saved_models/` in persistent home storage; temporary files under `$TMPDIR` are removed after the job ends.
+`--skip-evaluation` skips ESP32/Joulescope evaluation. The script deliberately omits `--force-train`, so matching checkpoints in `saved_models/` are reused and only models whose configuration signature changed are retrained. Checkpoints are saved under `saved_models/` in persistent home storage; temporary files under `$TMPDIR` are removed after the job ends. A changed setting such as the SNN time-step count is a real signature change and triggers one retraining run.
 
 ## Adjust SLURM resources
 

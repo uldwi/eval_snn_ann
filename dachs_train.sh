@@ -7,9 +7,11 @@
 #SBATCH --mail-type=all
 #SBATCH --mail-user=hansert.jonas@gmail.com
 
+set -euo pipefail
+
 module load devel/cuda/12.4
 
-cd $TMPDIR
+cd "$TMPDIR"
 python3 -m venv dachs_env
 . dachs_env/bin/activate
 python3 -m pip install --upgrade pip
@@ -23,14 +25,13 @@ python3 -m pip install -r $HOME/code/eval_snn_ann/requirements.txt
 # IMPORTANT: Run dachs_setup.sh on the login node first
 # (or run the dataset loader manually) so data is present in $HOME.
 
-rsync -avz $HOME/code/eval_snn_ann/data/ $TMPDIR/data/
+rsync -avz "$HOME/code/eval_snn_ann/data/" "$TMPDIR/data/"
 
 # Train from the configuration and skip evaluation (no Joulescope/ESP32 on the cluster).
 python3 $HOME/code/eval_snn_ann/train_mnist.py \
-    --config $HOME/code/eval_snn_ann/config.yaml \
-    --save-dir $HOME/code/eval_snn_ann/saved_models \
+    --config "$HOME/code/eval_snn_ann/config.yaml" \
+    --save-dir "$HOME/code/eval_snn_ann/saved_models" \
     --device cuda \
-    --skip-evaluation \
-    --force-train
+    --skip-evaluation
 
 time deactivate
