@@ -220,6 +220,11 @@ def _load_physionet_eeg_mi(
             log=None,
             transform_into="csp_space",
             norm_trace=False,
+            # PhysioNet EEGMI uses all 64 EEG channels without projections.
+            # The rank was previously estimated as 64; setting it explicitly
+            # avoids MNE's float64-only RawArray rank-estimation path, which
+            # rejects our cached float32 segments on some MNE versions.
+            rank="full",
         )
         csp_model.fit(train_x, train_y)
         transformed = {}
