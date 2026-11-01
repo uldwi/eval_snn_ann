@@ -180,6 +180,10 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "threshold": float(model_cfg.get("threshold", 1.0)),
             "ann_checkpoint": model_cfg.get("ann_checkpoint"),
         }
+        if bool(model_cfg.get("distillation", {}).get("enabled", False)):
+            signature["snn_params"]["distillation"] = copy.deepcopy(
+                model_cfg.get("distillation", {})
+            )
     else:
         signature["ann_params"] = {
             "activation": str(model_cfg.get("activation", "relu")).lower(),
@@ -548,10 +552,19 @@ def train_model(
     # An SNN Transformer depends on its ANN initialization weights. The checkpoint
     # path alone is not enough for cache validation: the same ANN checkpoint
     # may have been overwritten with different weights.
-    if model_type == "snn" and str(model_cfg.get("architecture", "")).lower() in (
-        "spiking_transformer", "spikingtransformer", "spike_driven_transformer",
-        "spikedriven_transformer",
-    ):
+    model_architecture = str(model_cfg.get("architecture", "standard")).lower()
+    uses_ann_teacher = (
+        model_type == "snn"
+        and model_architecture not in ("spikcommander", "spik_commander")
+        and (
+            model_architecture in (
+                "spiking_transformer", "spikingtransformer",
+                "spike_driven_transformer", "spikedriven_transformer",
+            )
+            or bool(model_cfg.get("distillation", {}).get("enabled", False))
+        )
+    )
+    if uses_ann_teacher:
         ann_model_name = model_cfg.get(
             "ann_checkpoint", "ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer"
         )
@@ -821,7 +834,6 @@ def train_model(
     distill_cfg = model_cfg.get("distillation", {})
     distill_enabled = (
         model_type == "snn"
-        and getattr(model, "is_spiking_transformer", False)
         and not getattr(model, "is_spikcommander", False)
         and bool(distill_cfg.get("enabled", False))
     )
@@ -832,20 +844,50 @@ def train_model(
             raise ValueError("model.distillation.alpha must be between 0 and 1.")
         if distill_temperature <= 0.0:
             raise ValueError("model.distillation.temperature must be greater than 0.")
-        transformer_cfg = model_cfg.get("transformer", {})
-        teacher_model = CompactTransformerANN(
-            input_size=input_size,
-            output_size=output_size,
-            in_channels=in_channels,
-            in_height=in_height,
-            in_width=in_width,
-            embed_dim=int(transformer_cfg.get("embed_dim", 32)),
-            num_heads=int(transformer_cfg.get("num_heads", 4)),
-            num_layers=int(transformer_cfg.get("num_layers", 2)),
-            feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
-            dropout_rate=float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.1))),
-        ).to(device)
+        ann_model_name = model_cfg.get("ann_checkpoint")
+        if not ann_model_name:
+            raise ValueError(f"Model '{model_name}' enables distillation but has no ann_checkpoint.")
+        ann_checkpoint_path = os.path.join(resolved_save_dir, f"{ann_model_name}.pt")
+        if not os.path.isfile(ann_checkpoint_path):
+            raise FileNotFoundError(
+                f"ANN teacher checkpoint '{ann_checkpoint_path}' is missing for '{model_name}'."
+            )
         teacher_checkpoint = torch.load(ann_checkpoint_path, map_location=device, weights_only=False)
+        teacher_dataset = normalize_dataset_name(teacher_checkpoint.get("dataset", ""))
+        if teacher_dataset != dataset_name:
+            raise ValueError(
+                f"ANN teacher dataset '{teacher_dataset}' does not match SNN dataset '{dataset_name}'."
+            )
+        teacher_state = teacher_checkpoint.get("state_dict", {})
+        if teacher_checkpoint.get("model_type", "ann").lower() != "ann":
+            raise ValueError(f"Distillation teacher '{ann_model_name}' is not an ANN checkpoint.")
+
+        if getattr(model, "is_spiking_transformer", False):
+            transformer_cfg = model_cfg.get("transformer", {})
+            teacher_model = CompactTransformerANN(
+                input_size=input_size,
+                output_size=output_size,
+                in_channels=in_channels,
+                in_height=in_height,
+                in_width=in_width,
+                embed_dim=int(transformer_cfg.get("embed_dim", 32)),
+                num_heads=int(transformer_cfg.get("num_heads", 4)),
+                num_layers=int(transformer_cfg.get("num_layers", 2)),
+                feedforward_dim=int(transformer_cfg.get("feedforward_dim", 64)),
+                dropout_rate=float(model_cfg.get("dropout_rate", model_cfg.get("dropout", 0.1))),
+            ).to(device)
+        else:
+            teacher_model = ConfigurableANN(
+                input_size=input_size,
+                conv_layers=model_cfg.get("conv_layers", []),
+                hidden_layers=model_cfg.get("hidden_layers", [64]),
+                activation="relu",
+                output_size=output_size,
+                in_channels=in_channels,
+                in_height=in_height,
+                in_width=in_width,
+                dropout_rate=0.0,
+            ).to(device)
         teacher_model.load_state_dict(teacher_checkpoint["state_dict"], strict=True)
         teacher_model.eval()
         for parameter in teacher_model.parameters():

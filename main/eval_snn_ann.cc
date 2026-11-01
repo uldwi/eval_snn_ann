@@ -320,23 +320,49 @@ static uint32_t transformer_linear_lif(const float *input, int rows, int in_dim,
                                        float *membrane, float beta, float threshold,
                                        float *output) {
     uint32_t spike_count = 0;
-    int active_indices[KWS_FFN > KWS_EMBED ? KWS_FFN : KWS_EMBED];
+    constexpr int kMaxInput = KWS_FFN > KWS_EMBED ? KWS_FFN : KWS_EMBED;
+    constexpr int kMaskWords = (kMaxInput + 31) / 32;
+    uint32_t active_mask[kMaskWords];
+    int active_indices[kMaxInput];
     for (int r = 0; r < rows; ++r) {
         const float *x = input + r * in_dim;
         float *y = output + r * out_dim;
         const float *res = residual ? residual + r * out_dim : nullptr;
         int active_count = 0;
+        const int mask_words = (in_dim + 31) / 32;
+        for (int word = 0; word < mask_words; ++word) active_mask[word] = 0;
+        bool binary_input = true;
         for (int i = 0; i < in_dim; ++i) {
-            if (x[i] != 0.0f) active_indices[active_count++] = i;
+            if (x[i] != 0.0f) {
+                ++active_count;
+                active_mask[i >> 5] |= 1u << (i & 31);
+                if (x[i] != 1.0f) binary_input = false;
+            }
+        }
+        if (!binary_input) {
+            int n = 0;
+            for (int i = 0; i < in_dim; ++i)
+                if (x[i] != 0.0f) active_indices[n++] = i;
         }
         const bool sparse = active_count * 2 < in_dim;
         for (int o = 0; o < out_dim; ++o) {
             float current = bias ? bias[o] : 0.0f;
             const float *w = weight + o * in_dim;
             if (sparse) {
-                for (int n = 0; n < active_count; ++n) {
-                    const int i = active_indices[n];
-                    current += w[i] * x[i];
+                if (binary_input) {
+                    for (int word = 0; word < mask_words; ++word) {
+                        uint32_t bits = active_mask[word];
+                        while (bits != 0) {
+                            const int i = (word << 5) + __builtin_ctz(bits);
+                            current += w[i];
+                            bits &= bits - 1;
+                        }
+                    }
+                } else {
+                    for (int n = 0; n < active_count; ++n) {
+                        const int i = active_indices[n];
+                        current += w[i] * x[i];
+                    }
                 }
             } else {
                 for (int i = 0; i < in_dim; ++i) current += w[i] * x[i];
@@ -359,22 +385,51 @@ static uint32_t transformer_linear_lif(const float *input, int rows, int in_dim,
 static void transformer_sparse_linear(const float *input, int rows, int in_dim,
                                       const float *weight, const float *bias,
                                       int out_dim, float *output) {
-    int active_indices[KWS_FFN > KWS_EMBED ? KWS_FFN : KWS_EMBED];
+    constexpr int kMaxInput = KWS_FFN > KWS_EMBED ? KWS_FFN : KWS_EMBED;
+    constexpr int kMaskWords = (kMaxInput + 31) / 32;
+    uint32_t active_mask[kMaskWords];
+    int active_indices[kMaxInput];
     for (int r = 0; r < rows; ++r) {
         const float *x = input + r * in_dim;
         float *y = output + r * out_dim;
         int active_count = 0;
+        const int mask_words = (in_dim + 31) / 32;
+        for (int word = 0; word < mask_words; ++word) active_mask[word] = 0;
+        bool binary_input = true;
         for (int i = 0; i < in_dim; ++i) {
-            if (x[i] != 0.0f) active_indices[active_count++] = i;
+            if (x[i] != 0.0f) {
+                ++active_count;
+                active_mask[i >> 5] |= 1u << (i & 31);
+                if (x[i] != 1.0f) binary_input = false;
+            }
+        }
+        if (!binary_input) {
+            int n = 0;
+            for (int i = 0; i < in_dim; ++i)
+                if (x[i] != 0.0f) active_indices[n++] = i;
         }
         const bool sparse = active_count * 2 < in_dim;
         for (int o = 0; o < out_dim; ++o) {
             const float *w = weight + o * in_dim;
             float sum = bias ? bias[o] : 0.0f;
             if (sparse) {
-                for (int n = 0; n < active_count; ++n) {
-                    const int i = active_indices[n];
-                    sum += w[i] * x[i];
+                if (binary_input) {
+                    // Spike inputs are exactly one or zero. A packed mask lets
+                    // the sparse path add active weights directly, with no
+                    // float multiply or per-feature zero check in the dot loop.
+                    for (int word = 0; word < mask_words; ++word) {
+                        uint32_t bits = active_mask[word];
+                        while (bits != 0) {
+                            const int i = (word << 5) + __builtin_ctz(bits);
+                            sum += w[i];
+                            bits &= bits - 1;
+                        }
+                    }
+                } else {
+                    for (int n = 0; n < active_count; ++n) {
+                        const int i = active_indices[n];
+                        sum += w[i] * x[i];
+                    }
                 }
             } else {
                 for (int i = 0; i < in_dim; ++i) sum += w[i] * x[i];
@@ -648,12 +703,24 @@ static int run_spiking_transformer(const float *mel) {
             for (int h = 0; h < KWS_HEADS; ++h) {
                 const int head_offset = h * KWS_HEAD_DIM;
                 for (int q = 0; q < KWS_TOKENS; ++q) {
+                    const uint32_t q_bits = s_tr_q_bits[q * KWS_HEADS + h];
+                    if (q_bits == 0) {
+                        // With an all-zero binary query every Q·K score is
+                        // exactly zero, so softmax is uniform. Compute the
+                        // V average directly instead of building T scores.
+                        for (int d = 0; d < KWS_HEAD_DIM; ++d) {
+                            const uint32_t active_values = s_tr_v_bits[h * KWS_HEAD_DIM + d];
+                            s_tr_attn[q * KWS_EMBED + head_offset + d] =
+                                static_cast<float>(__builtin_popcount(active_values)) /
+                                static_cast<float>(KWS_TOKENS);
+                        }
+                        continue;
+                    }
                     float *scores = s_tr_scores + q * KWS_TOKENS;
                     int score_counts[KWS_TOKENS];
                     int max_score_count = 0;
                     for (int k = 0; k < KWS_TOKENS; ++k) {
-                        const uint32_t overlap = s_tr_q_bits[q * KWS_HEADS + h] &
-                                                 s_tr_k_bits[k * KWS_HEADS + h];
+                        const uint32_t overlap = q_bits & s_tr_k_bits[k * KWS_HEADS + h];
                         score_counts[k] = __builtin_popcount(overlap);
                         if (score_counts[k] > max_score_count) max_score_count = score_counts[k];
                     }
@@ -835,9 +902,23 @@ static int run_spike_driven_transformer(const float *mel) {
 
             for (int d = 0; d < KWS_EMBED; ++d) {
                 float current = 0.0f;
-                for (int t = 0; t < KWS_TOKENS; ++t) {
-                    const int base = t * 3 * KWS_EMBED + d;
-                    current += s_tr_qkv[base + KWS_EMBED] * s_tr_qkv[base + 2 * KWS_EMBED];
+                if (KWS_TOKENS <= 32) {
+                    uint32_t key_bits = 0;
+                    uint32_t value_bits = 0;
+                    for (int t = 0; t < KWS_TOKENS; ++t) {
+                        const int base = t * 3 * KWS_EMBED + d;
+                        key_bits |= static_cast<uint32_t>(s_tr_qkv[base + KWS_EMBED] != 0.0f) << t;
+                        value_bits |= static_cast<uint32_t>(s_tr_qkv[base + 2 * KWS_EMBED] != 0.0f) << t;
+                    }
+                    // This spike-driven attention context is a binary dot
+                    // product over tokens: replace T float multiplies/adds by
+                    // one bitwise AND and population count.
+                    current = static_cast<float>(__builtin_popcount(key_bits & value_bits));
+                } else {
+                    for (int t = 0; t < KWS_TOKENS; ++t) {
+                        const int base = t * 3 * KWS_EMBED + d;
+                        current += s_tr_qkv[base + KWS_EMBED] * s_tr_qkv[base + 2 * KWS_EMBED];
+                    }
                 }
                 const float context_spike = transformer_lif(
                     current, context_mem[layer_idx][d], beta, attention_threshold);
@@ -848,7 +929,8 @@ static int run_spike_driven_transformer(const float *mel) {
             for (int t = 0; t < KWS_TOKENS; ++t) {
                 for (int d = 0; d < KWS_EMBED; ++d) {
                     const int base = t * 3 * KWS_EMBED + d;
-                    s_tr_attn[t * KWS_EMBED + d] = s_tr_qkv[base] * s_tr_norm[d];
+                    s_tr_attn[t * KWS_EMBED + d] =
+                        (s_tr_qkv[base] != 0.0f && s_tr_norm[d] != 0.0f) ? 1.0f : 0.0f;
                 }
             }
             transformer_sparse_linear(s_tr_attn, KWS_TOKENS, KWS_EMBED,

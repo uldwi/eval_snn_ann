@@ -46,14 +46,15 @@ models:
     batch_size: 64
     dataset: speech_commands
     dropout_rate: 0.1
-    epochs: 60
+    epochs: 100
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 10
+      patience: 15
       min_delta: 0.001
       restore_best_weights: true
-    learning_rate: 0.0005
+    learning_rate: 0.0003
+    spec_augment: true
     transformer:
       embed_dim: 32
       num_heads: 4
@@ -62,11 +63,11 @@ models:
     type: ann
     optimization:
       pruning:
-        enabled: true
+        enabled: false
       quantization:
-        enabled: true
+        enabled: false
       clustering:
-        enabled: true
+        enabled: false
 
   - name: SNN_KWS_SpeechCommandsV02_35Words_SpikeDrivenTransformer
     architecture: spike_driven_transformer
@@ -87,8 +88,8 @@ models:
     early_exit:
       enabled: true
       min_steps: 2
-      stable_steps: 2
-      max_accuracy_drop: 0.5
+      stable_steps: 1
+      max_accuracy_drop: 1.0
     beta: 0.9
     threshold: 1.0
     attention_threshold: 4.0
@@ -142,8 +143,8 @@ models:
     early_exit:
       enabled: true
       min_steps: 2
-      stable_steps: 2
-      max_accuracy_drop: 0.5
+      stable_steps: 1
+      max_accuracy_drop: 1.0
     threshold: 1.0
     input_scale: 1.0
     spec_augment: true
@@ -437,11 +438,25 @@ models:
         pool_size: 2
         stride: 1
     dataset: speech_commands
-    epochs: 10
+    epochs: 40
+    early_stopping:
+      enabled: true
+      monitor: val_acc
+      patience: 8
+      min_delta: 0.001
+      restore_best_weights: true
+    spec_augment: true
     hidden_layers:
       - 64
     learning_rate: 0.001
     type: ann
+    optimization:
+      pruning:
+        enabled: false
+      quantization:
+        enabled: false
+      clustering:
+        enabled: false
   - name: SNN_KWS_SpeechCommandsV02_35Words_IF_Conv16_32_64_TTFS
     batch_size: 64
     beta: 0.9
@@ -458,11 +473,12 @@ models:
         stride: 1
     dataset: speech_commands
     encoding_type: ttfs
-    epochs: 40
+    execution_mode: event_based
+    epochs: 60
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 8
+      patience: 12
       restore_best_weights: true
     hidden_layers:
       - 64
@@ -471,7 +487,19 @@ models:
     num_steps: 8
     threshold: 1.0
     ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
+    distillation:
+      enabled: true
+      alpha: 0.5
+      temperature: 3.0
+    spec_augment: true
     type: snn
+    optimization:
+      pruning:
+        enabled: false
+      quantization:
+        enabled: false
+      clustering:
+        enabled: false
 optimization:
   clustering:
     enabled: false
