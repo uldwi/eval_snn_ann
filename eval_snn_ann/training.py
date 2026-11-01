@@ -152,6 +152,7 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "threshold": float(model_cfg.get("threshold", 1.0)),
             "input_scale": float(model_cfg.get("input_scale", 1.0)),
             "distillation": copy.deepcopy(model_cfg.get("distillation", {})),
+            "step_supervision": bool(model_cfg.get("step_supervision", False)),
             "ann_checkpoint": model_cfg.get("ann_checkpoint"),
         }
         if architecture in ("spike_driven_transformer", "spikedriven_transformer"):
@@ -356,13 +357,13 @@ def _calibrate_transformer_early_exit(model, validation_dataset, early_exit_cfg,
     )
 
 
-def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, device: str) -> Dict[str, float]:
-    """Tune shared LIF parameters on a balanced validation subset, without changing inference work."""
-    if not (
-        getattr(model, "is_spiking_transformer", False)
-        and isinstance(calibration_cfg, dict)
-        and bool(calibration_cfg.get("enabled", False))
-    ):
+def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, device: str) -> Dict[str, Any]:
+    """Tune deployment-only SNN parameters against validation accuracy."""
+    if not (isinstance(calibration_cfg, dict) and bool(calibration_cfg.get("enabled", False))):
+        return {}
+    is_transformer = bool(getattr(model, "is_spiking_transformer", False))
+    is_standard_snn = isinstance(model, ConfigurableSpikingJellySNN)
+    if not (is_transformer or is_standard_snn):
         return {}
     if validation_dataset is None:
         print("[Parameter calibration] Skipped: no validation split is available.")
@@ -379,16 +380,30 @@ def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, de
         return {}
 
     loader = DataLoader(subset, batch_size=64, shuffle=False)
-    parameters = ["beta", "threshold"]
-    if hasattr(model, "attention_threshold"):
-        parameters.append("attention_threshold")
+    if is_transformer:
+        parameters = ["beta", "threshold", "input_scale"]
+        if hasattr(model, "attention_threshold"):
+            parameters.append("attention_threshold")
+        if hasattr(model, "inference_steps") and calibration_cfg.get("inference_steps_values"):
+            parameters.append("inference_steps")
+    else:
+        parameters = ["threshold", "input_scale", "output_readout"]
+        if model.neuron_type == "lif":
+            parameters.append("beta")
     defaults = {
         "beta": [0.75, 0.85, 0.90, 0.95],
         "threshold": [0.70, 0.85, 1.00, 1.15, 1.30],
         "attention_threshold": [2.0, 3.0, 4.0, 5.0, 6.0],
+        "input_scale": [0.5, 0.75, 1.0, 1.25, 1.5],
+        "output_readout": ["spike", "analog"],
+        "inference_steps": [int(model.inference_steps)],
     }
     candidates = {
-        name: [float(v) for v in calibration_cfg.get(f"{name}_values", defaults[name])]
+        name: [
+            str(v).lower() if name == "output_readout" else
+            int(v) if name == "inference_steps" else float(v)
+            for v in calibration_cfg.get(f"{name}_values", defaults[name])
+        ]
         for name in parameters
     }
     rounds = max(1, int(calibration_cfg.get("rounds", 2)))
@@ -404,35 +419,60 @@ def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, de
                 total += int(target.numel())
         return 100.0 * correct / max(1, total)
 
-    baseline = {name: float(getattr(model, name)) for name in parameters}
+    baseline = {name: getattr(model, name) for name in parameters}
     best_accuracy = accuracy()
     baseline_accuracy = best_accuracy
     for _ in range(rounds):
         for name in parameters:
-            best_value = float(getattr(model, name))
+            best_value = getattr(model, name)
             local_best = accuracy()
             values = list(dict.fromkeys(candidates[name] + [best_value]))
             for value in values:
-                setattr(model, name, value)
+                _set_snn_deployment_parameter(model, name, value)
                 candidate_accuracy = accuracy()
                 # Preserve the current value on ties to avoid needless changes.
                 if candidate_accuracy > local_best + 1e-9:
                     local_best = candidate_accuracy
                     best_value = value
-            setattr(model, name, best_value)
+            _set_snn_deployment_parameter(model, name, best_value)
             best_accuracy = local_best
 
     model.train(was_training)
-    calibrated = {name: float(getattr(model, name)) for name in parameters}
-    changed = any(abs(calibrated[name] - baseline[name]) > 1e-9 for name in parameters)
+    calibrated = {name: getattr(model, name) for name in parameters}
+    changed = any(calibrated[name] != baseline[name] for name in parameters)
     print(
         "[Parameter calibration] Validation subset: "
         f"{len(subset)} balanced samples; accuracy {baseline_accuracy:.2f}% -> "
         f"{best_accuracy:.2f}%; selected "
-        + ", ".join(f"{name}={value:g}" for name, value in calibrated.items())
+        + ", ".join(f"{name}={value:g}" if isinstance(value, (int, float)) else f"{name}={value}" for name, value in calibrated.items())
         + ("." if changed else " (configured values retained).")
     )
     return calibrated
+
+
+def _set_snn_deployment_parameter(model, name: str, value: Any) -> None:
+    """Apply calibrated values to the actual runtime neurons, not only metadata."""
+    if name == "output_readout":
+        setattr(model, name, str(value).lower())
+        return
+    value = int(value) if name == "inference_steps" else float(value)
+    setattr(model, name, value)
+    neurons = []
+    for attr in ("input_node", "q_nodes", "k_nodes", "v_nodes", "attn_nodes", "ff_nodes",
+                 "conv_lif_list", "lif_layers"):
+        nodes = getattr(model, attr, None)
+        if nodes is None:
+            continue
+        neurons.extend(list(nodes) if isinstance(nodes, (nn.ModuleList, list, tuple)) else [nodes])
+    if name == "threshold":
+        for node in neurons:
+            if hasattr(node, "v_threshold"):
+                node.v_threshold = value
+    elif name == "beta" and not getattr(model, "is_spike_driven_transformer", False):
+        tau = 1.0 / max(1e-4, 1.0 - value)
+        for node in neurons:
+            if hasattr(node, "tau"):
+                node.tau = tau
 
 
 def _evaluate_classwise(
@@ -717,9 +757,14 @@ def train_model(
 
                 calibration_cfg = model_cfg.get("parameter_calibration", {})
                 stored_calibration = checkpoint.get("inference_calibration", {})
-                required_calibration = ["beta", "threshold"]
-                if hasattr(model, "attention_threshold"):
-                    required_calibration.append("attention_threshold")
+                calibration_cfg = calibration_cfg if isinstance(calibration_cfg, dict) else {}
+                required_calibration = [
+                    name for name in ("beta", "threshold", "attention_threshold", "input_scale",
+                                      "output_readout", "inference_steps")
+                    if f"{name}_values" in calibration_cfg
+                ]
+                if not required_calibration:
+                    required_calibration = ["beta", "threshold"] if getattr(model, "is_spiking_transformer", False) else []
                 if (isinstance(calibration_cfg, dict)
                         and bool(calibration_cfg.get("enabled", False))
                         and not inference_only_cache_match
@@ -727,12 +772,15 @@ def train_model(
                         and isinstance(stored_calibration, dict)
                         and all(key in stored_calibration for key in required_calibration)):
                     calibrated_params = {
-                        key: float(stored_calibration[key]) for key in required_calibration
+                        key: stored_calibration[key] for key in required_calibration
                     }
                     for key, value in calibrated_params.items():
-                        setattr(model, key, value)
+                        _set_snn_deployment_parameter(model, key, value)
                     print("[Parameter calibration] Loaded saved deployment values: " +
-                          ", ".join(f"{key}={value:g}" for key, value in calibrated_params.items()))
+                          ", ".join(
+                              f"{key}={value:g}" if isinstance(value, (int, float)) else f"{key}={value}"
+                              for key, value in calibrated_params.items()
+                          ))
                 else:
                     calibrated_params = _calibrate_spiking_parameters(
                         model, dataset_info.validation_dataset, calibration_cfg, device,
@@ -991,16 +1039,36 @@ def train_model(
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
-            output = model(data)
-            hard_loss = criterion(output, target)
+            supervise_steps = bool(model_cfg.get("step_supervision", False)) and hasattr(model, "forward_step_logits")
+            if supervise_steps:
+                step_outputs = model.forward_step_logits(data)
+                output = step_outputs[-1]
+                step_weights = torch.arange(1, step_outputs.size(0) + 1, device=device, dtype=step_outputs.dtype)
+                step_weights = step_weights / step_weights.sum()
+                hard_loss = sum(
+                    step_weights[index] * criterion(step_outputs[index], target)
+                    for index in range(step_outputs.size(0))
+                )
+            else:
+                output = model(data)
+                step_outputs = None
+                hard_loss = criterion(output, target)
             if teacher_model is not None:
                 with torch.no_grad():
                     teacher_output = teacher_model(data)
-                soft_loss = F.kl_div(
-                    F.log_softmax(output / distill_temperature, dim=1),
-                    F.softmax(teacher_output / distill_temperature, dim=1),
-                    reduction="batchmean",
-                ) * (distill_temperature ** 2)
+                distillation_outputs = step_outputs if step_outputs is not None else output.unsqueeze(0)
+                soft_losses = [
+                    F.kl_div(
+                        F.log_softmax(step_output / distill_temperature, dim=1),
+                        F.softmax(teacher_output / distill_temperature, dim=1),
+                        reduction="batchmean",
+                    ) * (distill_temperature ** 2)
+                    for step_output in distillation_outputs
+                ]
+                if step_outputs is not None:
+                    soft_loss = sum(step_weights[index] * value for index, value in enumerate(soft_losses))
+                else:
+                    soft_loss = soft_losses[0]
                 loss = (1.0 - distill_alpha) * hard_loss + distill_alpha * soft_loss
             else:
                 loss = hard_loss

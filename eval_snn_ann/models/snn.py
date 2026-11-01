@@ -608,6 +608,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
             else:
                 x_4d = x
             x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
+            x_seq = x_seq * self.input_scale
             cur = x_seq
             for conv, lif, pool in zip(self.conv_layers_list, self.conv_lif_list, self.conv_pool_list):
                 cur = conv(cur)
@@ -623,6 +624,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
             else:
                 x_flat = x.view(batch_size, -1)
                 x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+                x_seq = x_seq * self.input_scale
             cur = x_seq
 
         for i, (fc, lif) in enumerate(zip(self.fcs, self.lif_layers)):
@@ -653,6 +655,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
                 else:
                     x_4d = x
                 x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
+                x_seq = x_seq * self.input_scale
             else:
                 if self.temporal_input:
                     x_seq = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
@@ -662,6 +665,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
                 else:
                     x_flat = x.view(batch_size, -1)
                     x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+                    x_seq = x_seq * self.input_scale
 
             total_spikes = 0
             total_synops = 0

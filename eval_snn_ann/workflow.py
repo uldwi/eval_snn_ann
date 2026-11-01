@@ -102,6 +102,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 model_dict["inference_steps"] = int(m["inference_steps"])
             if isinstance(m.get("early_exit"), dict):
                 model_dict["early_exit"] = copy.deepcopy(m["early_exit"])
+            if isinstance(m.get("parameter_calibration"), dict):
+                model_dict["parameter_calibration"] = copy.deepcopy(m["parameter_calibration"])
             if bool(m.get("spec_augment", False)):
                 model_dict["spec_augment"] = True
             architecture = str(m.get("architecture", "standard"))
@@ -115,6 +117,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                     model_dict["transformer"] = copy.deepcopy(m["transformer"])
                 if isinstance(m.get("distillation"), dict):
                     model_dict["distillation"] = copy.deepcopy(m["distillation"])
+                if "step_supervision" in m:
+                    model_dict["step_supervision"] = bool(m["step_supervision"])
             if m_type == "snn":
                 model_dict["neuron_type"] = str(m.get("neuron_type", m.get("neuron", "lif"))).lower()
                 model_dict["encoding_type"] = str(m.get("encoding_type", m.get("encoding", "direct"))).lower()
@@ -230,6 +234,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         model_dict["inference_steps"] = int(single_m["inference_steps"])
     if isinstance(single_m.get("early_exit"), dict):
         model_dict["early_exit"] = copy.deepcopy(single_m["early_exit"])
+    if isinstance(single_m.get("parameter_calibration"), dict):
+        model_dict["parameter_calibration"] = copy.deepcopy(single_m["parameter_calibration"])
     if bool(single_m.get("spec_augment", False)):
         model_dict["spec_augment"] = True
     architecture = str(single_m.get("architecture", "standard"))
@@ -243,6 +249,8 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
             model_dict["transformer"] = copy.deepcopy(single_m["transformer"])
         if isinstance(single_m.get("distillation"), dict):
             model_dict["distillation"] = copy.deepcopy(single_m["distillation"])
+        if "step_supervision" in single_m:
+            model_dict["step_supervision"] = bool(single_m["step_supervision"])
     if m_type == "snn":
         model_dict["neuron_type"] = str(single_m.get("neuron_type", single_m.get("neuron", "lif"))).lower()
         model_dict["encoding_type"] = str(single_m.get("encoding_type", single_m.get("encoding", "direct"))).lower()

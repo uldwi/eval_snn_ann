@@ -84,7 +84,7 @@ models:
       restore_best_weights: true
     learning_rate: 0.0005
     num_steps: 8
-    inference_steps: 8
+    inference_steps: 7
     early_exit:
       enabled: true
       min_steps: 2
@@ -98,15 +98,18 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.5
+      alpha: 0.4
       temperature: 3.0
+    step_supervision: true
     parameter_calibration:
       enabled: true
-      max_samples: 350
-      rounds: 2
-      beta_values: [0.75, 0.85, 0.90, 0.95]
-      threshold_values: [0.70, 0.85, 1.00, 1.15, 1.30]
-      attention_threshold_values: [2.0, 3.0, 4.0, 5.0, 6.0]
+      max_samples: 1000
+      rounds: 3
+      beta_values: [0.70, 0.80, 0.90, 0.95]
+      threshold_values: [0.60, 0.75, 0.90, 1.05, 1.20, 1.35]
+      input_scale_values: [0.50, 0.75, 1.00, 1.25, 1.50]
+      attention_threshold_values: [2.0, 3.0, 4.0, 5.0, 6.0, 8.0]
+      inference_steps_values: [6, 7, 8]
     classwise_metrics: true
     transformer:
       embed_dim: 32
@@ -139,7 +142,7 @@ models:
       restore_best_weights: true
     learning_rate: 0.0005
     num_steps: 8
-    inference_steps: 8
+    inference_steps: 7
     early_exit:
       enabled: true
       min_steps: 2
@@ -150,14 +153,17 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.8
+      alpha: 0.4
       temperature: 3.0
+    step_supervision: true
     parameter_calibration:
       enabled: true
-      max_samples: 350
-      rounds: 2
-      beta_values: [0.75, 0.85, 0.90, 0.95]
-      threshold_values: [0.70, 0.85, 1.00, 1.15, 1.30]
+      max_samples: 1000
+      rounds: 3
+      beta_values: [0.70, 0.80, 0.90, 0.95]
+      threshold_values: [0.60, 0.75, 0.90, 1.05, 1.20, 1.35]
+      input_scale_values: [0.50, 0.75, 1.00, 1.25, 1.50]
+      inference_steps_values: [6, 7, 8]
     classwise_metrics: true
     transformer:
       embed_dim: 32
@@ -491,6 +497,13 @@ models:
       enabled: true
       alpha: 0.5
       temperature: 3.0
+    parameter_calibration:
+      enabled: true
+      max_samples: 1000
+      rounds: 3
+      threshold_values: [0.50, 0.65, 0.80, 0.95, 1.10, 1.25, 1.40]
+      input_scale_values: [0.50, 0.75, 1.00, 1.25, 1.50, 2.00]
+      output_readout_values: [spike, analog]
     spec_augment: true
     type: snn
     optimization:

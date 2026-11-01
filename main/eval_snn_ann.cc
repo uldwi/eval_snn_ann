@@ -31,6 +31,13 @@
 #define SPIKCOMMANDER_AUDIO 0
 #endif
 
+#if HAS_SPEECH_AUDIO
+namespace kiss_fft_float {
+#include "signal/src/kiss_fft_wrappers/kiss_fft_common.h"
+#include "tools/kiss_fftr.h"
+}  // namespace kiss_fft_float
+#endif
+
 #define TRIGGER_GPIO GPIO_NUM_4
 
 static const char *TAG = "EVAL_SNN_ANN";
@@ -92,9 +99,20 @@ static constexpr int SPEECH_MELS = 40;
 struct SpeechComplex { float re, im; };
 static float s_speech_hann[SPEECH_NFFT];
 static SpeechComplex s_speech_twiddle[SPEECH_NFFT];
+static float s_speech_real_fft_input[SPEECH_NFFT];
+static kiss_fft_float::kiss_fft_cpx s_speech_real_fft_output[SPEECH_BINS];
+alignas(16) static uint8_t s_speech_real_fft_storage[8192];
+static kiss_fft_float::kiss_fftr_cfg s_speech_real_fft = nullptr;
 static SpeechComplex s_speech_fft_input[SPEECH_NFFT];
 static SpeechComplex s_speech_fft_output[SPEECH_NFFT];
 static SpeechComplex s_speech_fft_work[8][SPEECH_NFFT];
+// One cached twiddle phase for each mixed-radix FFT stage, radix input and
+// output index. This keeps integer division/modulo out of the FFT hot loop.
+static uint16_t s_speech_fft_phase[8][5][SPEECH_NFFT];
+static float s_speech_power_spectrum[SPEECH_BINS];
+static uint16_t s_speech_mel_start[SPEECH_MELS];
+static uint16_t s_speech_mel_end[SPEECH_MELS];
+static float s_speech_log10_mantissa[257];
 static union {
     float mel_power[SPEECH_MELS * SPEECH_FRAMES];
     float features[KWS_FEATURES * KWS_TOKENS];
@@ -108,10 +126,53 @@ static bool s_speech_frontend_ready = false;
 
 static void init_speech_frontend(void) {
     constexpr float pi = 3.14159265358979323846f;
+    size_t fft_storage_size = sizeof(s_speech_real_fft_storage);
+    s_speech_real_fft = kiss_fft_float::kiss_fftr_alloc(
+        SPEECH_NFFT, 0, s_speech_real_fft_storage, &fft_storage_size);
+    if (!s_speech_real_fft) {
+        ESP_LOGE(TAG, "Could not allocate the KissFFT real-FFT plan; using the fallback FFT.");
+    }
     for (int n = 0; n < SPEECH_NFFT; ++n) {
         s_speech_hann[n] = 0.5f - 0.5f * cosf((2.0f * pi * n) / SPEECH_NFFT);
         const float angle = (-2.0f * pi * n) / SPEECH_NFFT;
         s_speech_twiddle[n] = {cosf(angle), sinf(angle)};
+    }
+    // Precompute all phase indices used by the recursive factorization.
+    // The original inner-loop modulo was expensive on the C6's integer core.
+    int fft_n = SPEECH_NFFT;
+    for (int level = 0; level < 8 && fft_n > 1; ++level) {
+        const int radix = (fft_n % 2 == 0) ? 2 : 5;
+        const int scale = SPEECH_NFFT / fft_n;
+        for (int j = 0; j < radix; ++j) {
+            for (int out_idx = 0; out_idx < fft_n; ++out_idx) {
+                s_speech_fft_phase[level][j][out_idx] = static_cast<uint16_t>(
+                    ((j * out_idx) % fft_n) * scale);
+            }
+        }
+        fft_n /= radix;
+    }
+    // Fast log10 from a 256-interval lookup table over the normalized
+    // mantissa. Linear interpolation has sub-micro-dB error after the x10
+    // conversion used by the Mel pipeline, avoiding thousands of software
+    // log10f calls for each audio sample.
+    for (int i = 0; i <= 256; ++i) {
+        s_speech_log10_mantissa[i] = log10f(1.0f + static_cast<float>(i) / 256.0f);
+    }
+    // Mel filters are triangular and zero outside a compact frequency range.
+    // Cache each range once so the per-frame projection avoids scanning the
+    // zero-filled parts of the dense filter-bank matrix.
+    for (int mel = 0; mel < SPEECH_MELS; ++mel) {
+        const float *filter = g_speech_mel_filterbank + mel * SPEECH_BINS;
+        int first = SPEECH_BINS;
+        int last = 0;
+        for (int bin = 0; bin < SPEECH_BINS; ++bin) {
+            if (filter[bin] != 0.0f) {
+                if (first == SPEECH_BINS) first = bin;
+                last = bin + 1;
+            }
+        }
+        s_speech_mel_start[mel] = static_cast<uint16_t>(first == SPEECH_BINS ? 0 : first);
+        s_speech_mel_end[mel] = static_cast<uint16_t>(first == SPEECH_BINS ? 0 : last);
     }
     s_speech_frontend_ready = true;
 }
@@ -129,16 +190,31 @@ static void speech_fft400(const SpeechComplex *src, int stride, int n,
         speech_fft400(src + j * stride, stride * radix, sub_n,
                       sub + j * sub_n, level + 1);
     }
-    const int twiddle_scale = SPEECH_NFFT / n;
+    if (radix == 2) {
+        const SpeechComplex *even = sub;
+        const SpeechComplex *odd = sub + sub_n;
+        for (int k = 0; k < sub_n; ++k) {
+            const SpeechComplex a = even[k];
+            const SpeechComplex b = odd[k];
+            for (int q = 0; q < 2; ++q) {
+                const int out_idx = k + q * sub_n;
+                const SpeechComplex w = s_speech_twiddle[s_speech_fft_phase[level][1][out_idx]];
+                dst[out_idx] = {
+                    a.re + b.re * w.re - b.im * w.im,
+                    a.im + b.re * w.im + b.im * w.re,
+                };
+            }
+        }
+        return;
+    }
     for (int q = 0; q < radix; ++q) {
         for (int k = 0; k < sub_n; ++k) {
             const int out_idx = k + q * sub_n;
             float real = 0.0f;
             float imag = 0.0f;
             for (int j = 0; j < radix; ++j) {
-                const int phase = (j * out_idx * twiddle_scale) % SPEECH_NFFT;
                 const SpeechComplex a = sub[j * sub_n + k];
-                const SpeechComplex w = s_speech_twiddle[phase];
+                const SpeechComplex w = s_speech_twiddle[s_speech_fft_phase[level][j][out_idx]];
                 real += a.re * w.re - a.im * w.im;
                 imag += a.re * w.im + a.im * w.re;
             }
@@ -148,11 +224,24 @@ static void speech_fft400(const SpeechComplex *src, int stride, int n,
 }
 
 static int speech_reflect_index(int index) {
-    while (index < 0 || index >= SPEECH_SAMPLE_RATE) {
-        if (index < 0) index = -index;
-        else index = 2 * SPEECH_SAMPLE_RATE - 2 - index;
-    }
+    if (index < 0) index = -index;
+    if (index >= SPEECH_SAMPLE_RATE) index = 2 * SPEECH_SAMPLE_RATE - 2 - index;
     return index;
+}
+
+static float speech_fast_log10f(float value) {
+    union FloatBits {
+        float f;
+        uint32_t u;
+    } bits = {value};
+    const int exponent = static_cast<int>((bits.u >> 23) & 0xffu) - 127;
+    const uint32_t mantissa = bits.u & 0x7fffffu;
+    const uint32_t index = mantissa >> 15;
+    const uint32_t remainder = mantissa & 0x7fffu;
+    const float lo = s_speech_log10_mantissa[index];
+    const float hi = s_speech_log10_mantissa[index + 1];
+    const float fraction = static_cast<float>(remainder) * (1.0f / 32768.0f);
+    return static_cast<float>(exponent) * 0.3010299956639812f + lo + (hi - lo) * fraction;
 }
 
 #if SPIKCOMMANDER_AUDIO
@@ -183,20 +272,38 @@ static void speech_audio_to_mel(const int16_t *audio, float *features) {
         for (int n = 0; n < SPEECH_NFFT; ++n) {
             const int sample_idx = speech_reflect_index(center + n - SPEECH_NFFT / 2);
 #if SPIKCOMMANDER_AUDIO
-            s_speech_fft_input[n] = {pcm[sample_idx] * s_speech_hann[n], 0.0f};
+            s_speech_real_fft_input[n] = pcm[sample_idx] * s_speech_hann[n];
 #else
-            s_speech_fft_input[n] = {(static_cast<float>(audio[sample_idx]) / 32768.0f) * s_speech_hann[n], 0.0f};
+            s_speech_real_fft_input[n] = (static_cast<float>(audio[sample_idx]) / 32768.0f) * s_speech_hann[n];
 #endif
+            if (!s_speech_real_fft) {
+                s_speech_fft_input[n] = {s_speech_real_fft_input[n], 0.0f};
+            }
         }
-        speech_fft400(s_speech_fft_input, 1, SPEECH_NFFT, s_speech_fft_output, 0);
+        if (s_speech_real_fft) {
+            kiss_fft_float::kiss_fftr(s_speech_real_fft, s_speech_real_fft_input,
+                                      s_speech_real_fft_output);
+            for (int bin = 0; bin < SPEECH_BINS; ++bin) {
+                s_speech_fft_output[bin] = {
+                    s_speech_real_fft_output[bin].r,
+                    s_speech_real_fft_output[bin].i,
+                };
+            }
+        } else {
+            speech_fft400(s_speech_fft_input, 1, SPEECH_NFFT, s_speech_fft_output, 0);
+        }
+        // Compute each FFT-bin magnitude once. Previously re²+im² was
+        // recalculated for every Mel filter that touched the same bin.
+        for (int bin = 0; bin < SPEECH_BINS; ++bin) {
+            const SpeechComplex value = s_speech_fft_output[bin];
+            s_speech_power_spectrum[bin] = value.re * value.re + value.im * value.im;
+        }
         for (int mel = 0; mel < SPEECH_MELS; ++mel) {
             float power = 0.0f;
             const float *filter = g_speech_mel_filterbank + mel * SPEECH_BINS;
-            for (int bin = 0; bin < SPEECH_BINS; ++bin) {
-                const SpeechComplex value = s_speech_fft_output[bin];
-                power += (value.re * value.re + value.im * value.im) * filter[bin];
-            }
-            const float log_power = 10.0f * log10f(fmaxf(power, 1.0e-10f));
+            for (int bin = s_speech_mel_start[mel]; bin < s_speech_mel_end[mel]; ++bin)
+                power += s_speech_power_spectrum[bin] * filter[bin];
+            const float log_power = 10.0f * speech_fast_log10f(fmaxf(power, 1.0e-10f));
             s_speech_mel_power[mel * SPEECH_FRAMES + frame] = log_power;
             if (log_power > mel_max) mel_max = log_power;
         }
@@ -3147,6 +3254,10 @@ extern "C" void app_main(void)
         int correct_count = 0;
         uint64_t total_all_spikes = 0;
         uint64_t total_all_synops = 0;
+#if HAS_SPEECH_AUDIO
+        uint64_t speech_frontend_elapsed_us = 0;
+        uint64_t model_elapsed_us = 0;
+#endif
         #if SNN_PROFILE
         snn_prof_reset();
         #endif
@@ -3155,13 +3266,18 @@ extern "C" void app_main(void)
 #if HAS_SPEECH_AUDIO
             // PCM remains in flash; the Mel spectrogram is computed for each sample
             // on the ESP32 during the trigger window and included in the measurement.
+            const int64_t frontend_start_us = esp_timer_get_time();
             speech_audio_to_mel(speech_test_audio[i], s_speech_workspace.features);
+            speech_frontend_elapsed_us += (uint64_t)(esp_timer_get_time() - frontend_start_us);
             const float *model_input = s_speech_workspace.features;
 #else
             const float *img_data = mnist_test_images[i];
             const float *model_input = img_data;
 #endif
             int predicted = -1;
+#if HAS_SPEECH_AUDIO
+            const int64_t model_start_us = esp_timer_get_time();
+#endif
 
             if (g_model_type == MODEL_TYPE_ANN && interpreter) {
                 memcpy(input->data.f, model_input, (size_t)input_elements * sizeof(float));
@@ -3188,6 +3304,9 @@ extern "C" void app_main(void)
                 total_all_spikes += sample_spikes;
                 total_all_synops += sample_synops;
             }
+#if HAS_SPEECH_AUDIO
+            model_elapsed_us += (uint64_t)(esp_timer_get_time() - model_start_us);
+#endif
 
             if (predicted == mnist_test_labels[i]) {
                 correct_count++;
@@ -3231,6 +3350,12 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "  - Total duration:    %.3f ms", elapsed_ms);
         ESP_LOGI(TAG, "  - Time per inference:%.3f ms (%.1f Infs/s)",
                  time_per_inf_ms, (time_per_inf_ms > 0) ? (1000.0f / time_per_inf_ms) : 0.0f);
+#if HAS_SPEECH_AUDIO
+        ESP_LOGI(TAG, "  - Mel frontend:      %.3f ms/inference",
+                 (double)speech_frontend_elapsed_us / (double)MNIST_TEST_SUBSET / 1000.0);
+        ESP_LOGI(TAG, "  - Model inference:   %.3f ms/inference",
+                 (double)model_elapsed_us / (double)MNIST_TEST_SUBSET / 1000.0);
+#endif
 
         if (g_model_type == MODEL_TYPE_SNN || g_model_type == MODEL_TYPE_SPIKCOMMANDER ||
             (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking)) {
