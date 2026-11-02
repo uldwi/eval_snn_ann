@@ -5050,7 +5050,7 @@ const snn_config_t g_snn_config = {
     .execution_mode = 1,
     .temporal_input = 0,
     .input_scale = 1.000000f,
-    .analog_readout = 0,
+    .analog_readout = 1,
 };
 const transformer_config_t g_transformer_config = {};
 const float* const g_transformer_input_w = nullptr;

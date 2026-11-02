@@ -390,14 +390,19 @@ def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, de
         parameters = ["threshold", "input_scale", "output_readout"]
         if model.neuron_type == "lif":
             parameters.append("beta")
+        if hasattr(model, "inference_steps") and calibration_cfg.get("inference_steps_values"):
+            parameters.append("inference_steps")
     defaults = {
         "beta": [0.75, 0.85, 0.90, 0.95],
         "threshold": [0.70, 0.85, 1.00, 1.15, 1.30],
         "attention_threshold": [2.0, 3.0, 4.0, 5.0, 6.0],
         "input_scale": [0.5, 0.75, 1.0, 1.25, 1.5],
         "output_readout": ["spike", "analog"],
-        "inference_steps": [int(model.inference_steps)],
     }
+    if is_transformer:
+        defaults["inference_steps"] = [int(getattr(model, "inference_steps", model.num_steps))]
+    elif hasattr(model, "inference_steps"):
+        defaults["inference_steps"] = [int(model.inference_steps)]
     candidates = {
         name: [
             str(v).lower() if name == "output_readout" else
@@ -406,6 +411,11 @@ def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, de
         ]
         for name in parameters
     }
+    if "inference_steps" in candidates:
+        candidates["inference_steps"] = [
+            value for value in candidates["inference_steps"]
+            if 1 <= value <= model.num_steps
+        ]
     rounds = max(1, int(calibration_cfg.get("rounds", 2)))
     was_training = model.training
 
@@ -452,10 +462,16 @@ def _calibrate_spiking_parameters(model, validation_dataset, calibration_cfg, de
 
 def _set_snn_deployment_parameter(model, name: str, value: Any) -> None:
     """Apply calibrated values to the actual runtime neurons, not only metadata."""
+    # Checkpoints can carry calibration keys from another model family. Ignore
+    # unsupported values so they cannot invalidate an otherwise usable weight cache.
+    if not hasattr(model, name):
+        return
     if name == "output_readout":
         setattr(model, name, str(value).lower())
         return
     value = int(value) if name == "inference_steps" else float(value)
+    if name == "inference_steps" and not 1 <= value <= model.num_steps:
+        raise ValueError(f"inference_steps must be between 1 and num_steps ({model.num_steps}).")
     setattr(model, name, value)
     neurons = []
     for attr in ("input_node", "q_nodes", "k_nodes", "v_nodes", "attn_nodes", "ff_nodes",
@@ -761,7 +777,7 @@ def train_model(
                 required_calibration = [
                     name for name in ("beta", "threshold", "attention_threshold", "input_scale",
                                       "output_readout", "inference_steps")
-                    if f"{name}_values" in calibration_cfg
+                    if f"{name}_values" in calibration_cfg and hasattr(model, name)
                 ]
                 if not required_calibration:
                     required_calibration = ["beta", "threshold"] if getattr(model, "is_spiking_transformer", False) else []
@@ -972,6 +988,8 @@ def train_model(
             print(f"  - Inference time steps: {model.inference_steps}")
         else:
             print(f"  - Time steps:          {model.num_steps}")
+            if model.inference_steps != model.num_steps:
+                print(f"  - Inference time steps: {model.inference_steps}")
         if getattr(model, "temporal_input", False):
             print(f"  - Sequence input:      {model.flat_size} features per time step; state reset after each sample")
             print(f"  - Input scale:         {getattr(model, 'input_scale', 1.0):g}x")

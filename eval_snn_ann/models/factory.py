@@ -145,6 +145,7 @@ def build_model_from_config(
             temporal_input=temporal_input,
             input_scale=input_scale,
             output_readout=output_readout,
+            inference_steps=(int(model_cfg["inference_steps"]) if "inference_steps" in model_cfg else None),
         ).to(device)
     elif architecture in ("transformer", "compact_transformer"):
         transformer_cfg = model_cfg.get("transformer", {})

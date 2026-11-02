@@ -75,23 +75,23 @@ models:
     batch_size: 64
     dataset: speech_commands
     dropout_rate: 0.1
-    epochs: 120
+    epochs: 160
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 12
+      patience: 20
       min_delta: 0.001
       restore_best_weights: true
     learning_rate: 0.0005
-    num_steps: 8
-    inference_steps: 7
+    num_steps: 12
+    inference_steps: 8
     early_exit:
       enabled: true
       min_steps: 2
       stable_steps: 1
       max_accuracy_drop: 1.0
-    beta: 0.9
-    threshold: 1.0
+    beta: 0.8
+    threshold: 1.05
     attention_threshold: 4.0
     encoding_type: direct
     input_scale: 1.0
@@ -103,8 +103,8 @@ models:
     step_supervision: true
     parameter_calibration:
       enabled: true
-      max_samples: 1000
-      rounds: 3
+      max_samples: 2000
+      rounds: 4
       beta_values: [0.70, 0.80, 0.90, 0.95]
       threshold_values: [0.60, 0.75, 0.90, 1.05, 1.20, 1.35]
       input_scale_values: [0.50, 0.75, 1.00, 1.25, 1.50]
@@ -130,19 +130,19 @@ models:
     architecture: spiking_transformer
     ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
     batch_size: 64
-    beta: 0.9
+    beta: 0.7
     dataset: speech_commands
     dropout_rate: 0.1
-    epochs: 120
+    epochs: 160
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 12
+      patience: 20
       min_delta: 0.001
       restore_best_weights: true
     learning_rate: 0.0005
-    num_steps: 8
-    inference_steps: 7
+    num_steps: 12
+    inference_steps: 8
     early_exit:
       enabled: true
       min_steps: 2
@@ -158,8 +158,8 @@ models:
     step_supervision: true
     parameter_calibration:
       enabled: true
-      max_samples: 1000
-      rounds: 3
+      max_samples: 2000
+      rounds: 4
       beta_values: [0.70, 0.80, 0.90, 0.95]
       threshold_values: [0.60, 0.75, 0.90, 1.05, 1.20, 1.35]
       input_scale_values: [0.50, 0.75, 1.00, 1.25, 1.50]
@@ -230,7 +230,7 @@ models:
     type: ann
   - name: SNN_MNIST_LIF_Conv16_32_64_TTFS
     batch_size: 64
-    beta: 0.9
+    beta: 0.7
     conv_layers:
       - kernel_size: 3
         out_channels: 16
@@ -491,6 +491,7 @@ models:
     learning_rate: 0.001
     neuron_type: if
     num_steps: 8
+    inference_steps: 8
     threshold: 1.0
     ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_Conv16_32_64
     distillation:
@@ -499,11 +500,12 @@ models:
       temperature: 3.0
     parameter_calibration:
       enabled: true
-      max_samples: 1000
-      rounds: 3
+      max_samples: 2000
+      rounds: 4
       threshold_values: [0.50, 0.65, 0.80, 0.95, 1.10, 1.25, 1.40]
       input_scale_values: [0.50, 0.75, 1.00, 1.25, 1.50, 2.00]
       output_readout_values: [spike, analog]
+      inference_steps_values: [4, 6, 8]
     spec_augment: true
     type: snn
     optimization:

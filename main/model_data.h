@@ -50,6 +50,7 @@ typedef struct {
     int hidden_layers_count;
     int fc_layer_sizes[SNN_MAX_FC_LAYERS + 1];
     int num_steps;
+    int inference_steps;
     float beta;
     float threshold;
     int output_size;

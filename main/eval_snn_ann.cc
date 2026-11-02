@@ -1823,14 +1823,16 @@ static bool build_quant_and_decay_tables(void) {
     return true;
 }
 
+static int snn_inference_steps(const snn_config_t &cfg);
+
 static bool init_snn_buffers(void) {
     const snn_config_t &cfg = g_snn_config;
     init_geometry();
 
-    ESP_LOGI(TAG, "SNN init: input=%d, conv_layers=%d, flat=%d, fc=%d->%d->%d, steps=%d",
+    ESP_LOGI(TAG, "SNN init: input=%d, conv_layers=%d, flat=%d, fc=%d->%d->%d, train_steps=%d, inference_steps=%d",
              cfg.input_size, cfg.num_conv_layers, cfg.flat_size,
              cfg.fc_layer_sizes[0], cfg.fc_layer_sizes[1], cfg.fc_layer_sizes[2],
-             cfg.num_steps);
+             cfg.num_steps, snn_inference_steps(cfg));
     ESP_LOGI(TAG, "SNN init: free heap before allocation: %u Bytes (min: %u)",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
@@ -1992,10 +1994,15 @@ static bool init_snn_buffers(void) {
 // ---------------------------------------------------------------------
 // Eingangs-Encoding
 // ---------------------------------------------------------------------
-static void encode_input_times(const float *img) {
+static int snn_inference_steps(const snn_config_t &cfg) {
+    return (cfg.inference_steps >= 1 && cfg.inference_steps <= cfg.num_steps)
+               ? cfg.inference_steps : cfg.num_steps;
+}
+
+static void encode_input_times(const float *img, int steps) {
     const snn_config_t &cfg = g_snn_config;
     if (cfg.encoding_type == ENCODING_TTFS) {
-        const float last = (float)(cfg.num_steps - 1);
+        const float last = (float)(steps - 1);
         for (int j = 0; j < cfg.input_size; ++j) {
             const float val = img[j];
             if (val > 0.0f) {
@@ -2009,7 +2016,7 @@ static void encode_input_times(const float *img) {
         for (int j = 0; j < cfg.input_size; ++j) {
             const float val = img[j];
             const float clamped = (val < 0.0f) ? 0.0f : ((val > 1.0f) ? 1.0f : val);
-            s_snn_in_tf[j] = (int16_t)lroundf(clamped * (float)cfg.num_steps);
+            s_snn_in_tf[j] = (int16_t)lroundf(clamped * (float)steps);
         }
     }
 }
@@ -2877,6 +2884,7 @@ static void pool_dense_ref(int l, float *dst) {
 
 static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
     const snn_config_t &cfg = g_snn_config;
+    const int steps = snn_inference_steps(cfg);
     const int L = cfg.num_conv_layers;
     const int num_fc_layers = cfg.hidden_layers_count + 1;
     const bool direct = (cfg.encoding_type == ENCODING_DIRECT);
@@ -2891,10 +2899,10 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
     float readout_sum[128];
     memset(spk_sum, 0, sizeof(spk_sum));
     memset(readout_sum, 0, sizeof(readout_sum));
-    if (!cfg.temporal_input) encode_input_times(img);
+    if (!cfg.temporal_input) encode_input_times(img, steps);
 
     uint32_t spikes = 0;
-    for (int t = 0; t < cfg.num_steps; ++t) {
+    for (int t = 0; t < steps; ++t) {
         const float *step_img = cfg.temporal_input ? img + (size_t)t * cfg.input_size : img;
         for (int j = 0; j < cfg.input_size; ++j) {
             switch (cfg.encoding_type) {
@@ -2986,13 +2994,14 @@ static int run_snn_inference_dense_ref(const float *img, uint32_t *out_spikes) {
 
 static int run_snn_inference_dense(const float *img, uint32_t *out_spikes, uint32_t *out_synops) {
     const snn_config_t &cfg = g_snn_config;
+    const int steps = snn_inference_steps(cfg);
     uint32_t total_spk = 0;
     uint32_t total_synops = 0;
 
     reset_snn_state();
-    if (!cfg.temporal_input) encode_input_times(img);
+    if (!cfg.temporal_input) encode_input_times(img, steps);
 
-    for (int t = 0; t < cfg.num_steps; ++t) {
+    for (int t = 0; t < steps; ++t) {
         const float *step_img = cfg.temporal_input ? img + (size_t)t * cfg.input_size : img;
         snn_step(step_img, t, &total_spk, &total_synops);
     }
@@ -3006,13 +3015,14 @@ static int run_snn_inference_dense(const float *img, uint32_t *out_spikes, uint3
 
 static int run_snn_inference_event_based(const float *img, uint32_t *out_spikes, uint32_t *out_synops) {
     const snn_config_t &cfg = g_snn_config;
+    const int steps = snn_inference_steps(cfg);
     uint32_t total_spk = 0;
     uint32_t total_synops = 0;
 
     reset_snn_state();
-    if (!cfg.temporal_input) encode_input_times(img);
+    if (!cfg.temporal_input) encode_input_times(img, steps);
 
-    for (int t = 0; t < cfg.num_steps; ++t) {
+    for (int t = 0; t < steps; ++t) {
         const float *step_img = cfg.temporal_input ? img + (size_t)t * cfg.input_size : img;
         snn_step(step_img, t, &total_spk, &total_synops);
     }

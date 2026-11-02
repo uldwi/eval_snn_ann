@@ -476,6 +476,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
         temporal_input: bool = False,
         input_scale: float = 1.0,
         output_readout: str = "spike",
+        inference_steps: int = None,
     ):
         super().__init__()
         self.input_size = int(input_size)
@@ -498,6 +499,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
             self.execution_mode = "dense"
         self.num_steps = int(num_steps)
         self.temporal_input = bool(temporal_input)
+        configured_inference_steps = inference_steps
         self.input_scale = float(input_scale)
         self.output_readout = str(output_readout).lower().strip()
         if self.output_readout not in ("spike", "analog"):
@@ -512,6 +514,11 @@ class ConfigurableSpikingJellySNN(nn.Module):
             # Dataset tensors have shape [channel, feature, time]. Each
             # time step is passed to the fully connected layers as a separate vector.
             self.num_steps = int(in_width)
+        self.inference_steps = int(
+            configured_inference_steps if configured_inference_steps is not None else self.num_steps
+        )
+        if not 1 <= self.inference_steps <= self.num_steps:
+            raise ValueError("inference_steps must be between 1 and the training num_steps")
         self.threshold = float(threshold)
         self.dropout_rate = float(dropout_rate) if dropout_rate is not None else 0.0
         if self.dropout_rate > 0:
@@ -600,6 +607,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)
+        steps = self.num_steps if self.training else self.inference_steps
         if self.has_conv:
             if x.dim() == 2:
                 x_4d = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
@@ -607,7 +615,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
                 x_4d = x.unsqueeze(1)
             else:
                 x_4d = x
-            x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
+            x_seq = encode_input(x_4d, self.encoding_type, steps)
             x_seq = x_seq * self.input_scale
             cur = x_seq
             for conv, lif, pool in zip(self.conv_layers_list, self.conv_lif_list, self.conv_pool_list):
@@ -619,11 +627,12 @@ class ConfigurableSpikingJellySNN(nn.Module):
             if self.temporal_input:
                 x_seq = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
                 x_seq = x_seq.reshape(batch_size, self.in_channels * self.in_height, self.in_width)
+                x_seq = x_seq[:, :, :steps]
                 x_seq = x_seq.permute(2, 0, 1).contiguous()
                 x_seq = x_seq * self.input_scale
             else:
                 x_flat = x.view(batch_size, -1)
-                x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+                x_seq = encode_input(x_flat, self.encoding_type, steps)
                 x_seq = x_seq * self.input_scale
             cur = x_seq
 
@@ -654,17 +663,18 @@ class ConfigurableSpikingJellySNN(nn.Module):
                     x_4d = x.unsqueeze(1)
                 else:
                     x_4d = x
-                x_seq = encode_input(x_4d, self.encoding_type, self.num_steps)
+                x_seq = encode_input(x_4d, self.encoding_type, self.inference_steps)
                 x_seq = x_seq * self.input_scale
             else:
                 if self.temporal_input:
                     x_seq = x.view(batch_size, self.in_channels, self.in_height, self.in_width)
                     x_seq = x_seq.reshape(batch_size, self.in_channels * self.in_height, self.in_width)
+                    x_seq = x_seq[:, :, :self.inference_steps]
                     x_seq = x_seq.permute(2, 0, 1).contiguous()
                     x_seq = x_seq * self.input_scale
                 else:
                     x_flat = x.view(batch_size, -1)
-                    x_seq = encode_input(x_flat, self.encoding_type, self.num_steps)
+                    x_seq = encode_input(x_flat, self.encoding_type, self.inference_steps)
                     x_seq = x_seq * self.input_scale
 
             total_spikes = 0
@@ -734,7 +744,7 @@ class ConfigurableSpikingJellySNN(nn.Module):
             enc_label = f"TEMPORAL/{enc_label}"
         readout_label = f", Readout={self.output_readout.upper()}"
         if self.neuron_type == "if":
-            param_str = f"T={self.num_steps}, Enc={enc_label}, θ={self.threshold:.1f}"
+            param_str = f"Ttrain={self.num_steps}, Tinfer={self.inference_steps}, Enc={enc_label}, θ={self.threshold:.1f}"
         else:
-            param_str = f"T={self.num_steps}, Enc={enc_label}, β={self.beta:.2f}, θ={self.threshold:.1f}"
+            param_str = f"Ttrain={self.num_steps}, Tinfer={self.inference_steps}, Enc={enc_label}, β={self.beta:.2f}, θ={self.threshold:.1f}"
         return f"SpikingJelly {n_label} [{' -> '.join(parts)}] ({param_str}{readout_label})"

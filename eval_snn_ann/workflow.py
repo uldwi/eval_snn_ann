@@ -174,7 +174,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
             if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
                 model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
             if m_ds in ("speech_commands", "speech_commands_spikcommander"):
-                model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 100)
+                model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 500)
 
             model_optimization = copy.deepcopy(global_optimization)
             if isinstance(m.get("optimization"), dict):
@@ -303,7 +303,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
     if "num_test_samples" in model_evaluation and model_evaluation["num_test_samples"] is not None:
         model_evaluation["num_test_samples"] = int(model_evaluation["num_test_samples"])
     if single_ds in ("speech_commands", "speech_commands_spikcommander"):
-        model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 100)
+        model_evaluation["num_test_samples"] = min(model_evaluation.get("num_test_samples", 500), 500)
 
     model_optimization = copy.deepcopy(global_optimization)
     if isinstance(single_m.get("optimization"), dict):
