@@ -80,15 +80,17 @@ models:
     batch_size: 64
     dataset: speech_commands
     dropout_rate: 0.1
-    epochs: 160
+    epochs: 220
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 20
+      patience: 30
       min_delta: 0.001
       restore_best_weights: true
     learning_rate: 0.0005
-    num_steps: 12
+    # More training steps improve temporal feature learning; deployment remains
+    # capped at eight steps to keep ESP32 inference cost unchanged.
+    num_steps: 16
     inference_steps: 8
     early_exit:
       enabled: true
@@ -103,7 +105,9 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.7
+      # Keep the ANN teacher as a guide, while prioritizing ground-truth labels
+      # for the SNN's quantized/spiking dynamics.
+      alpha: 0.3
       temperature: 2.0
     step_supervision: true
     parameter_calibration:
@@ -139,15 +143,17 @@ models:
     beta: 0.7
     dataset: speech_commands
     dropout_rate: 0.1
-    epochs: 160
+    epochs: 220
     early_stopping:
       enabled: true
       monitor: val_acc
-      patience: 20
+      patience: 30
       min_delta: 0.001
       restore_best_weights: true
     learning_rate: 0.0005
-    num_steps: 12
+    # More training steps improve temporal feature learning; deployment remains
+    # capped at eight steps to keep ESP32 inference cost unchanged.
+    num_steps: 16
     inference_steps: 8
     early_exit:
       enabled: true
@@ -159,7 +165,8 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.7
+      # Stronger hard-label supervision reduces the mismatch to the ANN teacher.
+      alpha: 0.3
       temperature: 2.0
     step_supervision: true
     parameter_calibration:

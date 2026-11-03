@@ -1,0 +1,116 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[ngerman]{babel}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\geometry{margin=25mm}
+\sisetup{locale=DE, per-mode=symbol}
+\title{Spikende neuronale Netze für energieeffiziente Inferenz auf Mikrocontrollern\\\large Ein vorläufiger Vergleich über Bild-, Audio- und Biosignalaufgaben}
+\author{Autorinnen und Autoren: TBD}
+\date{\today}
+\begin{document}
+\maketitle
+\begin{abstract}
+Ressourcenbeschränkte Mikrocontroller stellen hohe Anforderungen an die Energieeffizienz maschineller Inferenz. Spikende neuronale Netze (SNN) versprechen, durch zeitlich sparse Aktivität Rechenaufwand einzusparen; ob sich dieser Vorteil auf digitaler Mikrocontroller-Hardware tatsächlich in geringeren Energiebedarf und kürzere Laufzeiten übersetzt, hängt jedoch von Aufgabe, Modell und Implementierung ab. In dieser Arbeit vergleichen wir künstliche neuronale Netze (ANN) und SNN für Bildklassifikation, Keyword Spotting und Biosignalverarbeitung anhand von Modellgenauigkeit, Laufzeit und Energie pro Inferenz. Die vorläufigen Messwerte zeigen für mehrere CNN-basierte Aufgaben niedrigere SNN-Energie und kürzere Laufzeit. Beispielsweise sinkt die berichtete Energie pro Inferenz bei MNIST von 89.31 auf 19.39~mJ und bei PhysioNet EEG Motor Imagery von 37.49 auf 25.76~mJ. Diese Verbesserungen gehen teilweise mit geringerer Genauigkeit einher; bei transformerbasiertem Keyword Spotting treten zudem unterschiedliche Resultate je nach SNN-Variante auf. Da Plattform- und Backendzuordnung einzelner Läufe, Wiederholungszahlen und Streuungsmaße noch zu verifizieren sind, werden diese Ergebnisse als vorläufig behandelt. Die Arbeit untersucht somit, unter welchen konkreten Bedingungen SNN auf Mikrocontrollern Effizienzvorteile gegenüber ANN erreichen.
+\end{abstract}
+
+\section{Einleitung}
+Maschinelle Inferenz am Netzwerkrand kann Daten lokal verarbeiten und damit Kommunikationsaufwand und Abhängigkeit von einer Cloud reduzieren. Mikrocontroller ermöglichen diesen Ansatz auch in kleinen, kostensensitiven und energiebegrenzten Geräten. Ihr begrenztes Energie- und Speicherbudget macht die Wahl der Modellarchitektur und ihrer Implementierung besonders relevant.
+
+Spikende neuronale Netze verarbeiten Informationen über zeitlich verteilte Ereignisse. Wenn nur ein Teil der Neuronen aktiv ist, kann eine ereignisorientierte Implementierung unnötige Berechnungen vermeiden. Diese theoretische Eigenschaft garantiert jedoch keine geringere Energie auf einem digitalen Mikrocontroller: Die tatsächlichen Kosten hängen unter anderem von der Ausführungsroutine, der zeitlichen Schrittzahl, dem Deployment-Backend und der Hardware ab.
+
+Wir untersuchen daher den Energiebedarf und die Laufzeit von ANN und SNN auf mehreren Aufgaben. Der vorliegende Messstand umfasst MNIST, FashionMNIST, CIFAR-10, Keyword Spotting und PhysioNet EEG Motor Imagery. Neben Energie und Laufzeit betrachten wir die Host- und Gerätegenauigkeit, Modellgröße sowie für SNN die Zahl der Spikes und synaptischen Operationen, sofern diese verfügbar sind.
+
+Die Untersuchung wird von drei Fragen geleitet: (1) Wie unterscheiden sich Genauigkeit, Laufzeit und Energie pro Inferenz zwischen ANN und SNN? (2) Sind mögliche Vorteile von Aufgabe, Architektur und Implementierung abhängig? (3) Welche Abwägungen zwischen Genauigkeit, Energie, Laufzeit und Spike-Aktivität zeigen sich in den Messungen? Die zentrale vorläufige Beobachtung ist, dass mehrere SNN-Läufe weniger Energie benötigen und schneller sind als ihre ANN-Gegenstücke, während sich zugleich Genauigkeitsverluste und Gegenbeispiele zeigen.
+
+\section{Hintergrund und verwandte Arbeiten}
+ANN berechnen Aktivierungen schichtweise, während SNN Neuronenaktivität über diskrete Zeitschritte und Schwellenereignisse modellieren. In dieser Arbeit kommen laut Modellbezeichnungen unter anderem LIF- und IF-Neuronen sowie spikende Transformer-Varianten zum Einsatz. Eine belastbare Einordnung dieser Implementierungen und ihres Verhältnisses zu früheren TinyML- und SNN-Arbeiten erfordert noch eine gezielte Literaturauswertung. Die entsprechenden Primärquellen werden vor der Einreichung ergänzt.
+
+\section{Methodik}
+\subsection{Aufgaben und Modelle}
+Die vorläufigen Messungen decken fünf Aufgabenbereiche ab. MNIST und FashionMNIST dienen der Bildklassifikation; CIFAR-10 ergänzt eine anspruchsvollere Bildaufgabe. Keyword Spotting (KWS) wird sowohl mit CNN-Modellen als auch mit einem Compact Transformer und zwei spikenden Transformer-Varianten untersucht. Die Biosignalaufgabe PhysioNet EEG Motor Imagery verwendet zeitliche und räumliche Faltungen. Datensatzversionen, Aufteilung, Vorverarbeitung und Lizenzangaben müssen für jede Aufgabe noch vollständig dokumentiert werden.
+
+Die ANN/SNN-Paare sind anhand ihrer Aufgabenzuordnung und Architekturbezeichnungen gebildet. Bei den CNN-Paaren weisen die Modellnamen auf vergleichbare Faltungsstrukturen hin. Beim Transformer-KWS gibt es eine ANN-Referenz sowie Spike-Driven- und Spiking-Transformer. Checkpoints, Trainings-Seeds, Kodierung, Zeitschritte und konkrete Optimierungen sind für die finale Fassung noch mit den jeweiligen Konfigurationen abzugleichen.
+
+\subsection{Hardware und Messgrößen}
+Die Projektkonfiguration beschreibt ESP32-C6- und ESP32-S3-Boards. Der ESP32-C6 ist dort mit RISC-V und 160~MHz, der ESP32-S3 mit Xtensa LX7 und 240~MHz angegeben. Die Tabelle der aktuellen Messwerte ordnet die einzelnen Läufe jedoch noch keinem der beiden Boards eindeutig zu; deshalb werden im Folgenden keine plattformspezifischen Aussagen getroffen.
+
+Berichtet werden Hostgenauigkeit, ESP32-Testgenauigkeit, Modellgröße, Laufzeit pro Inferenz, Energie pro Inferenz und mittlere Leistung. Für SNN sind zusätzlich mittlere Spike- und SynOps-Zahlen verfügbar. Das Projekt verwendet für Leistungsmessungen ein Joulescope. Messwiederholungen, Streuungsmaße, Abtastrate, Firmware- und Compilerstände sowie die genaue Abgrenzung von Vorverarbeitung und Initialisierung sind noch zu ergänzen.
+
+\subsection{Auswertung}
+Wir betrachten die Energie- und Laufzeitdifferenz innerhalb jeder Aufgabe sowie die Genauigkeitsdifferenz zwischen SNN und ANN. Ein niedrigerer Energiebedarf wird nicht isoliert als Vorteil bewertet: Er ist zusammen mit der Gerätegenauigkeit und der Laufzeit zu interpretieren. Einträge mit fehlenden oder widersprüchlichen Messfeldern werden als ungeklärt behandelt und nicht als belastbare Effizienznachweise interpretiert.
+
+\section{Ergebnisse}
+\subsection{Vorläufiger Messüberblick}
+Tabelle~\ref{tab:results} gibt die vom Autor bereitgestellten neuesten Messwerte wieder. Die Einträge sind vorläufig. Insbesondere sind doppelte KWS-ANN-Einträge, eine KWS-SNN-Variante mit null gemeldeten Spikes, ein MNIST-Lauf ohne gültige Kennzahlen sowie ein CIFAR-10-Lauf ohne Laufzeit- und Energiewerte zunächst nicht abschließend interpretierbar. Modell- und Backendzuordnung sowie Messstatus müssen vor der finalen Auswertung geklärt werden.
+
+\begin{longtable}{p{2.1cm}p{1.35cm}p{1.35cm}p{1.45cm}p{1.35cm}p{1.1cm}p{1.15cm}}
+\caption{Vorläufige Messwerte aus der neuesten bereitgestellten Zusammenfassung. Genauigkeit in Prozent; Laufzeit in ms; Energie in $\mu$J; Modellgröße in Byte.}\label{tab:results}\\
+\toprule
+Aufgabe/Modell & Typ & Host-Acc. & ESP32-Acc. & Größe & Zeit & Energie\\
+\midrule
+\endfirsthead
+\toprule
+Aufgabe/Modell & Typ & Host-Acc. & ESP32-Acc. & Größe & Zeit & Energie\\
+\midrule
+\endhead
+KWS Compact Transformer & ANN & 85.89 & 84.00 (84/100) & 77,452 & 153.69 & 16,508.06\\
+KWS Compact Transformer, Variante & ANN & 85.89 & 84.00 (84/100) & 94,868 & 164.40 & 17,825.49\\
+KWS Spike-Driven Transformer & SNN & 63.28 & 65.00 (65/100) & 76,428 & 136.84 & 14,876.63\\
+KWS Spike-Driven Transformer, Variante & SNN & 63.28 & 65.00 (65/100) & 214,688 & 375.94 & 41,617.56\\
+KWS Spiking Transformer & SNN & 71.01 & 70.00 (70/100) & 77,452 & 299.82 & 32,338.22\\
+MNIST CNN & ANN & 99.12 & 99.00 (495/500) & 425,248 & 795.53 & 89,307.78\\
+MNIST LIF CNN & SNN & 97.21 & 97.60 (488/500) & 423,464 & 170.42 & 19,393.84\\
+MNIST LIF CNN, Variante & SNN & 97.21 & 97.60 (488/500) & 532,388 & N/A & N/A\\
+PhysioNet EEGMI CNN & ANN & 66.80 & 66.80 (334/500) & 33,420 & 332.20 & 37,490.45\\
+PhysioNet EEGMI IF CNN & SNN & 66.54 & 65.80 (329/500) & 31,240 & 233.60 & 25,762.28\\
+FashionMNIST CNN & ANN & 91.68 & 91.60 (458/500) & 1,688,352 & 2,918.23 & 349,182.29\\
+FashionMNIST IF CNN & SNN & 88.62 & 90.00 (450/500) & 1,686,568 & 774.26 & 87,624.82\\
+CIFAR-10 CNN & ANN & 50.18 & 53.20 (266/500) & 607,008 & 849.85 & 101,764.14\\
+CIFAR-10 IF CNN & SNN & 51.36 & 51.00 (255/500) & 605,224 & 466.76 & 53,642.90\\
+CIFAR-10 IF CNN, Variante & SNN & 51.36 & 51.00 (255/500) & 711,988 & N/A & N/A\\
+KWS CNN & ANN & 82.70 & 77.00 (77/100) & 161,412 & 152.75 & 16,705.63\\
+KWS IF CNN & SNN & 72.58 & 72.00 (72/100) & 159,628 & 134.07 & 14,651.28\\
+\bottomrule
+\end{longtable}
+\smallskip
+\noindent\footnotesize Hinweis: Für mehrere Zeilen sind Spike-/SynOps-Metriken vorhanden; sie sind hier ausgelassen, um die Übersicht lesbar zu halten. Die vollständigen Werte und Statusangaben bleiben in der vom Autor bereitgestellten Rohzusammenfassung festzuhalten.\normalsize
+
+\subsection{Energie und Laufzeit der CNN- und Biosignalpaare}
+Bei MNIST benötigt das SNN laut vorläufiger Tabelle 19.39~mJ pro Inferenz gegenüber 89.31~mJ beim ANN; die Laufzeit sinkt von 795.53 auf 170.42~ms. Die ESP32-Genauigkeit liegt beim SNN um 1.4 Prozentpunkte niedriger. Für EEGMI werden 25.76~mJ und 233.60~ms beim SNN gegenüber 37.49~mJ und 332.20~ms beim ANN berichtet. Die Gerätegenauigkeiten unterscheiden sich um einen Prozentpunkt.
+
+Bei FashionMNIST sinken die berichtete Energie von 349.18 auf 87.62~mJ und die Laufzeit von 2,918.23 auf 774.26~ms. Die Hostgenauigkeit des SNN liegt unter der des ANN; die Gerätegenauigkeit beträgt in diesem Test jedoch 90.0\% gegenüber 91.6\%. Für CIFAR-10 werden 53.64~mJ und 466.76~ms beim SNN sowie 101.76~mJ und 849.85~ms beim ANN angegeben. Beide Modelle erreichen in diesem Test eine vergleichsweise niedrige Genauigkeit.
+
+Das KWS-CNN-SNN zeigt ebenfalls niedrigere Energie (14.65 gegenüber 16.71~mJ) und kürzere Laufzeit (134.07 gegenüber 152.75~ms). Dabei fällt die Gerätegenauigkeit von 77\% auf 72\%. Diese Vergleiche deuten auf einen Effizienzvorteil in den gemessenen Läufen hin, müssen aber angesichts fehlender Streuungsmaße und noch offener Messdetails vorsichtig interpretiert werden.
+
+\subsection{Transformerbasiertes Keyword Spotting}
+Für den Compact Transformer werden zwei ANN-Einträge mit 16.51 und 17.83~mJ berichtet. Die Spike-Driven-Variante mit 76,428 Byte erreicht 14.88~mJ und 136.84~ms, gegenüber 16.51~mJ und 153.69~ms in der ersten ANN-Zeile. Ihre Hostgenauigkeit beträgt jedoch 63.28\% gegenüber 85.89\%. Die zweite Spike-Driven-Zeile weist 214,688 Byte, 375.94~ms und 41.62~mJ auf. Der Spiking Transformer erreicht 32.34~mJ und 299.82~ms. Damit ist der Befund bei KWS deutlich von der konkreten Architekturvariante abhängig.
+
+\subsection{Spikes, SynOps und unvollständige Messungen}
+Die Tabelle enthält für viele SNN-Läufe mittlere Spike- und SynOps-Werte. Ein Spike-Driven-KWS-Lauf meldet jedoch null Spikes und null SynOps, obwohl Laufzeit und Energie vorhanden sind. Zwei weitere SNN-Zeilen enthalten keine gültigen Laufzeit- und Energiewerte. Ohne Klärung des Instrumentierungs- oder Messstatus sind diese Einträge nicht für eine quantitative Aktivitäts- oder Effizienzaussage geeignet.
+
+\section{Diskussion}
+Der vorläufige Messstand zeigt, dass mehrere SNN-Implementierungen für die hier getesteten Aufgaben sowohl kürzere Laufzeiten als auch geringere Energie pro Inferenz aufweisen. Da die mittlere Leistung zwischen ANN und SNN oft ähnlich ist, ist die geringere Energie in diesen Fällen mit der kürzeren gemessenen Laufzeit vereinbar. Die Messwerte erlauben jedoch keine kausale Zuordnung allein zur Spike-Sparsity; Backend, Modellstruktur und Firmware können ebenfalls maßgeblich sein.
+
+Die Effizienzgewinne stehen teilweise einer geringeren Genauigkeit gegenüber. Das ist besonders sichtbar bei den KWS-Varianten und bei der Hostgenauigkeit des FashionMNIST-SNN. Die Transformer-Ergebnisse unterstreichen, dass nicht jedes SNN-Modell effizienter ist: verschiedene spikende Architekturen zeigen stark unterschiedliche Energie- und Laufzeitwerte. Sinnvoll ist daher eine gemeinsame Betrachtung von Genauigkeit, Energie und Latenz statt eines einzelnen Kennwerts.
+
+\section{Limitationen}
+Die aktuelle Zusammenfassung enthält keine Streuungsmaße oder Wiederholungszahlen. Für einzelne Zeilen ist die Zuordnung zu ESP32-C6 oder ESP32-S3 und zum konkreten Deployment-Backend nicht angegeben. Doppelte Modellzeilen sowie fehlende oder widersprüchliche Metriken müssen bereinigt werden. Auch Testumfang, Messgrenzen, Firmware- und Compilerstände sowie mögliche Vorverarbeitungsanteile bedürfen einer genaueren Dokumentation. Die gemessene Energie kann zudem den Verbrauch des gesamten Boards umfassen und ist daher nicht notwendigerweise die isolierte Energie des neuronalen Modells.
+
+\section{Schlussfolgerung}
+Die vorläufigen Messungen legen nahe, dass SNN in mehreren der untersuchten Aufgaben auf dem ESP32 weniger Energie pro Inferenz benötigen und schneller laufen können als die verglichenen ANN. Der Vorteil ist jedoch nicht universell und muss zusammen mit Genauigkeit, Aufgabenart und konkreter Implementierung betrachtet werden. Vor einer endgültigen Schlussfolgerung sind die Board- und Backendzuordnung, die auffälligen Messzeilen sowie die Wiederholbarkeit der Ergebnisse zu klären.
+
+\section*{Daten- und Reproduzierbarkeitshinweis}
+Für eine reproduzierbare Fassung werden Rohmessdaten, Modellkonfigurationen, Checkpoints, Zufalls-Seeds, Firmware- und Compilerstände sowie Auswertungsskripte gemeinsam archiviert. Ablageort und Zitierangaben sind noch festzulegen.
+
+\begin{thebibliography}{9}
+\bibitem{tbd} Literaturangaben zu SNN, TinyML und Energie-Messmethoden werden ergänzt.
+\end{thebibliography}
+\end{document}
