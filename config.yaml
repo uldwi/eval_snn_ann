@@ -41,8 +41,12 @@ microcontroller:
       trigger_gpio: 4
   target: esp32c6
 models:
+  # Models with [cpp, tflm] are exported and measured through both deployment
+  # backends from the same checkpoint. Backend selection does not change the
+  # training cache signature.
   - name: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
     architecture: compact_transformer
+    deployment_backends: [cpp, tflm]
     batch_size: 64
     dataset: speech_commands
     dropout_rate: 0.1
@@ -71,6 +75,7 @@ models:
 
   - name: SNN_KWS_SpeechCommandsV02_35Words_SpikeDrivenTransformer
     architecture: spike_driven_transformer
+    deployment_backends: [cpp, tflm]
     ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
     batch_size: 64
     dataset: speech_commands
@@ -98,8 +103,8 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.4
-      temperature: 3.0
+      alpha: 0.7
+      temperature: 2.0
     step_supervision: true
     parameter_calibration:
       enabled: true
@@ -128,6 +133,7 @@ models:
 
   - name: SNN_KWS_SpeechCommandsV02_35Words_CompactSpikingTransformer_Matched
     architecture: spiking_transformer
+    deployment_backends: [cpp, tflm]
     ann_checkpoint: ANN_KWS_SpeechCommandsV02_35Words_CompactTransformer
     batch_size: 64
     beta: 0.7
@@ -153,8 +159,8 @@ models:
     spec_augment: true
     distillation:
       enabled: true
-      alpha: 0.4
-      temperature: 3.0
+      alpha: 0.7
+      temperature: 2.0
     step_supervision: true
     parameter_calibration:
       enabled: true
@@ -243,6 +249,7 @@ models:
         pool_size: 2
         stride: 1
     dataset: mnist
+    deployment_backends: [cpp, tflm]
     encoding_type: ttfs
     epochs: 20
     hidden_layers:
@@ -370,6 +377,7 @@ models:
         pool_size: 2
         stride: 1
     dataset: fashion_mnist
+    deployment_backends: [cpp, tflm]
     encoding_type: ttfs
     epochs: 10
     hidden_layers:
@@ -414,6 +422,7 @@ models:
         pool_size: 2
         stride: 1
     dataset: cifar10
+    deployment_backends: [cpp, tflm]
     dropout: 0.5
     early_stopping:
       enabled: true
@@ -478,6 +487,7 @@ models:
         pool_size: 2
         stride: 1
     dataset: speech_commands
+    deployment_backends: [cpp, tflm]
     encoding_type: ttfs
     execution_mode: event_based
     epochs: 60

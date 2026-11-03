@@ -15,7 +15,7 @@
 #include "esp_heap_caps.h"
 
 #ifndef HOST_TEST
-// TensorFlow Lite Micro (for ANN)
+// TensorFlow Lite Micro inference backend (ANN and supported standard SNNs)
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -42,9 +42,18 @@ namespace kiss_fft_float {
 
 static const char *TAG = "EVAL_SNN_ANN";
 
-// Tensor arena for TensorFlow Lite Micro (ANN only)
-constexpr size_t kTensorArenaSize = 192 * 1024;
+// Tensor arena shared by the TFLM ANN and standard SNN inference paths.
+// Leave headroom for the largest CNN activations and TFLM's planner metadata.
+// 192 KiB was insufficient for MNIST CNN graphs (they request ~214 KiB of
+// tensor storage after allocator overhead).
+constexpr size_t kTensorArenaSize = 256 * 1024;
 static uint8_t *tensor_arena = nullptr;
+#ifndef HOST_TEST
+static constexpr size_t kMaxTflmInputs = 128;
+static TfLiteTensor *s_tflm_inputs[kMaxTflmInputs] = {};
+static size_t s_tflm_input_count = 0;
+#endif
+static int snn_inference_steps(const snn_config_t &cfg);
 
 static int argmax_float(const float *arr, int len) {
     int max_idx = 0;
@@ -57,6 +66,79 @@ static int argmax_float(const float *arr, int len) {
     }
     return max_idx;
 }
+
+#ifndef HOST_TEST
+static void encode_snn_tflm_inputs(const float *sample) {
+    const int steps = snn_inference_steps(g_snn_config);
+    const int input_count = g_snn_config.temporal_input ? g_snn_config.flat_size : g_snn_config.input_size;
+    for (int t = 0; t < steps; ++t) {
+        TfLiteTensor *dst = s_tflm_inputs[t];
+        const int count = static_cast<int>(dst->bytes / sizeof(float));
+        float *out = dst->data.f;
+        for (int i = 0; i < count; ++i) {
+            const float raw = g_snn_config.temporal_input
+                ? sample[static_cast<size_t>(t) * input_count + i]
+                : sample[i];
+            float value = 0.0f;
+            switch (g_snn_config.encoding_type) {
+                case ENCODING_TTFS: {
+                    const float clipped = fminf(1.0f, fmaxf(0.0f, raw));
+                    const int first = static_cast<int>(lrintf((steps - 1) * (1.0f - clipped)));
+                    value = (raw > 0.0f && t == first) ? 1.0f : 0.0f;
+                    break;
+                }
+                case ENCODING_PERIODIC: {
+                    const float clipped = fminf(1.0f, fmaxf(0.0f, raw));
+                    const int active_steps = static_cast<int>(lrintf(clipped * steps));
+                    value = (t < active_steps) ? 1.0f : 0.0f;
+                    break;
+                }
+                case ENCODING_POISSON: {
+                    const float probability = fminf(1.0f, fmaxf(0.0f, raw));
+                    if (probability >= 1.0f) {
+                        value = 1.0f;
+                    } else if (probability > 0.0f) {
+                        const float random_value = static_cast<float>(esp_random() & 0xFFFF) / 65535.0f;
+                        value = random_value < probability ? 1.0f : 0.0f;
+                    }
+                    break;
+                }
+                default:
+                    // DIRECT encoding preserves the full analog input, including
+                    // negative values. This matches encode_input() in PyTorch and
+                    // the native C++ path; clamping here silently broke datasets
+                    // whose feature normalization is zero-centred.
+                    value = raw;
+                    break;
+            }
+            out[i] = value * g_snn_config.input_scale;
+        }
+    }
+}
+
+static void encode_transformer_tflm_inputs(const float *sample) {
+    const bool spiking = g_transformer_config.spiking != 0;
+    const int steps = spiking ? g_transformer_config.num_steps : 1;
+    const bool ttfs = g_transformer_config.spike_driven && g_transformer_config.input_ttfs;
+    const int input_count = g_transformer_config.input_features * g_transformer_config.tokens;
+    for (int step = 0; step < steps; ++step) {
+        float *dst = s_tflm_inputs[step]->data.f;
+        for (int i = 0; i < input_count; ++i) {
+            const float value = sample[i];
+            if (ttfs) {
+                const float clipped = fminf(1.0f, fmaxf(0.0f, value));
+                int event_step = static_cast<int>(floorf((1.0f - clipped) * steps));
+                if (event_step >= steps) event_step = steps - 1;
+                dst[i] = value > 0.0f && event_step == step ? 1.0f : 0.0f;
+            } else if (g_transformer_config.spike_driven) {
+                dst[i] = fminf(1.0f, fmaxf(0.0f, value));
+            } else {
+                dst[i] = value;
+            }
+        }
+    }
+}
+#endif
 
 // ESP32-S3 FP32 inference for the compact Transformer defined in Python.
 // Export dimensions are intentionally fixed so the workspace
@@ -3072,6 +3154,8 @@ extern "C" void app_main(void)
                                    (g_transformer_config.spiking ? "Spiking-Transformer" : "Transformer-ANN") : "ANN"));
     ESP_LOGI(TAG, "=== Initializing ESP32 inference: %s (%s, dataset: %s) ===",
              g_model_name, model_type_name, DATASET_NAME);
+    ESP_LOGI(TAG, "Inference backend: %s",
+             g_inference_backend == INFERENCE_BACKEND_TFLM ? "TensorFlow Lite Micro" : "native C++");
 
     // 1. Trigger-GPIO konfigurieren
     gpio_config_t io_conf = {
@@ -3084,13 +3168,17 @@ extern "C" void app_main(void)
     gpio_config(&io_conf);
     gpio_set_level(TRIGGER_GPIO, 0);
 
-    // 2. TensorFlow Lite Micro initialisieren (nur bei ANN)
+    // 2. Initialize TensorFlow Lite Micro when selected for this model.
     tflite::MicroInterpreter *interpreter = nullptr;
     TfLiteTensor *input = nullptr;
     TfLiteTensor *output = nullptr;
     int input_elements = 0;
 
-    if (g_model_type == MODEL_TYPE_ANN) {
+    if (g_inference_backend == INFERENCE_BACKEND_TFLM) {
+        if (g_model_len <= 8) {
+            ESP_LOGE(TAG, "TFLM backend selected, but the exported model FlatBuffer is empty.");
+            return;
+        }
         tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
         if (!tensor_arena) {
             ESP_LOGE(TAG, "Failed to allocate tensor arena (%d bytes)!", (int)kTensorArenaSize);
@@ -3103,9 +3191,10 @@ extern "C" void app_main(void)
                      model->version(), TFLITE_SCHEMA_VERSION);
             return;
         }
-        ESP_LOGI(TAG, "TensorFlow Lite Micro model loaded (size: %d bytes, type: ANN).", g_model_len);
+        ESP_LOGI(TAG, "TensorFlow Lite Micro model loaded (size: %d bytes, type: %s).",
+                 g_model_len, model_type_name);
 
-        static tflite::MicroMutableOpResolver<8> resolver;
+        static tflite::MicroMutableOpResolver<24> resolver;
         resolver.AddFullyConnected();
         resolver.AddRelu();
         resolver.AddConv2D();
@@ -3113,6 +3202,19 @@ extern "C" void app_main(void)
         resolver.AddAveragePool2D();
         resolver.AddReshape();
         resolver.AddSoftmax();
+        resolver.AddAdd();
+        resolver.AddMul();
+        resolver.AddGreater();
+        resolver.AddGreaterEqual();
+        resolver.AddSelectV2();
+        resolver.AddBatchMatMul();
+        resolver.AddTranspose();
+        resolver.AddMean();
+        resolver.AddRsqrt();
+        resolver.AddTanh();
+        resolver.AddSub();
+        resolver.AddDiv();
+        resolver.AddSum();
 
         static tflite::MicroInterpreter interp(model, resolver, tensor_arena, kTensorArenaSize);
         if (interp.AllocateTensors() != kTfLiteOk) {
@@ -3120,13 +3222,33 @@ extern "C" void app_main(void)
             return;
         }
         interpreter = &interp;
-        input = interpreter->input(0);
-        output = interpreter->output(0);
-        input_elements = 1;
-        for (int d = 0; d < input->dims->size; ++d) {
-            input_elements *= input->dims->data[d];
+        s_tflm_input_count = interpreter->inputs_size();
+        if (s_tflm_input_count == 0 || s_tflm_input_count > kMaxTflmInputs) {
+            ESP_LOGE(TAG, "Unsupported TFLM input tensor count: %d", (int)s_tflm_input_count);
+            return;
         }
-        if (input_elements > MNIST_IMAGE_SIZE) input_elements = MNIST_IMAGE_SIZE;
+        for (size_t i = 0; i < s_tflm_input_count; ++i) {
+            s_tflm_inputs[i] = interpreter->input(i);
+        }
+        input = s_tflm_inputs[0];
+        output = interpreter->output(0);
+        input_elements = static_cast<int>(input->bytes / sizeof(float));
+        if (g_model_type == MODEL_TYPE_SNN ||
+            (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking)) {
+            const int expected_inputs = g_model_type == MODEL_TYPE_SNN
+                ? snn_inference_steps(g_snn_config) : g_transformer_config.num_steps;
+            if (s_tflm_input_count != static_cast<size_t>(expected_inputs)) {
+                ESP_LOGE(TAG, "TFLM spiking graph has %d step inputs, expected %d.",
+                         (int)s_tflm_input_count, expected_inputs);
+                return;
+            }
+        } else if (g_model_type == MODEL_TYPE_TRANSFORMER && s_tflm_input_count != 1) {
+            ESP_LOGE(TAG, "TFLM ANN Transformer graph must have one input tensor.");
+            return;
+        }
+        if (g_model_type == MODEL_TYPE_ANN && input_elements > MNIST_IMAGE_SIZE) {
+            input_elements = MNIST_IMAGE_SIZE;
+        }
         ESP_LOGI(TAG, "TFLM engine initialized. Input dimensions: [%d, %d, %d, %d]",
                  input->dims->data[0],
                  (input->dims->size > 1) ? input->dims->data[1] : 1,
@@ -3289,10 +3411,17 @@ extern "C" void app_main(void)
             const int64_t model_start_us = esp_timer_get_time();
 #endif
 
-            if (g_model_type == MODEL_TYPE_ANN && interpreter) {
-                memcpy(input->data.f, model_input, (size_t)input_elements * sizeof(float));
+            if (g_inference_backend == INFERENCE_BACKEND_TFLM && interpreter) {
+                if (g_model_type == MODEL_TYPE_SNN) {
+                    encode_snn_tflm_inputs(model_input);
+                } else if (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking) {
+                    encode_transformer_tflm_inputs(model_input);
+                } else {
+                    memcpy(input->data.f, model_input, (size_t)input_elements * sizeof(float));
+                }
                 if (interpreter->Invoke() == kTfLiteOk) {
-                    predicted = argmax_float(output->data.f, MNIST_NUM_OUTPUTS);
+                    const int output_count = static_cast<int>(output->bytes / sizeof(float));
+                    predicted = argmax_float(output->data.f, output_count);
                 }
 #if SPIKCOMMANDER_AUDIO
             } else if (g_model_type == MODEL_TYPE_SPIKCOMMANDER) {
@@ -3367,7 +3496,8 @@ extern "C" void app_main(void)
                  (double)model_elapsed_us / (double)MNIST_TEST_SUBSET / 1000.0);
 #endif
 
-        if (g_model_type == MODEL_TYPE_SNN || g_model_type == MODEL_TYPE_SPIKCOMMANDER ||
+        if ((g_model_type == MODEL_TYPE_SNN && g_inference_backend == INFERENCE_BACKEND_CPP) ||
+            g_model_type == MODEL_TYPE_SPIKCOMMANDER ||
             (g_model_type == MODEL_TYPE_TRANSFORMER && g_transformer_config.spiking)) {
             float avg_spk_per_inf = (float)total_all_spikes / (float)MNIST_TEST_SUBSET;
             float avg_synops_per_inf = (float)total_all_synops / (float)MNIST_TEST_SUBSET;

@@ -10,6 +10,7 @@ import torch
 import tflite
 
 from .models import ConfigurableANN, ConfigurableSpikingJellySNN, get_encoding_code
+from .tflm_snn import export_spiking_snn_to_tflite
 
 def export_pytorch_to_tflite(model: Union[ConfigurableANN, ConfigurableSpikingJellySNN]) -> bytes:
     """
@@ -361,7 +362,8 @@ def export_c_files(
 ):
     """
     Generate model_data.h/cc and mnist_test_data.h in the target directory for ESP32.
-    Supports ANNs (TFLM FlatBuffer) and SNNs (LIF parameters and weights).
+    Exports standard ANN/SNN TFLite graphs when the TFLM backend is selected,
+    plus architecture-specific weights/configuration for existing native C++ paths.
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -403,6 +405,8 @@ def export_c_files(
         f.write("#define MODEL_TYPE_SNN 1\n\n")
         f.write("#define MODEL_TYPE_TRANSFORMER 2\n\n")
         f.write("#define MODEL_TYPE_SPIKCOMMANDER 3\n\n")
+        f.write("#define INFERENCE_BACKEND_CPP 0\n")
+        f.write("#define INFERENCE_BACKEND_TFLM 1\n\n")
         f.write("#define NEURON_TYPE_LIF 0\n")
         f.write("#define NEURON_TYPE_IF  1\n\n")
         f.write("#define ENCODING_DIRECT    0\n")
@@ -458,6 +462,7 @@ def export_c_files(
         f.write("\n")
         f.write("typedef struct { int tokens, input_features, embed_dim, num_heads, output_size; float beta, threshold; const float *p[40]; } spikcommander_weights_t;\n\n")
         f.write("extern const int g_model_type;\n")
+        f.write("extern const int g_inference_backend;\n")
         f.write("extern const char* const g_model_name;\n\n")
         f.write("// ANN-specific TensorFlow Lite Micro FlatBuffer\n")
         f.write("extern const unsigned char g_model[];\n")
@@ -487,6 +492,11 @@ def export_c_files(
     with open(cc_path, "w", encoding="utf-8") as f:
         f.write('#include "model_data.h"\n\n')
         f.write(f'const char* const g_model_name = "{model_name}";\n')
+
+        backend = str(model_entry.get("deployment_backend", "tflm" if model_type == "ann" else "cpp")).lower()
+        if backend not in ("cpp", "tflm"):
+            raise ValueError(f"Unsupported ESP32 inference backend: {backend!r}")
+        f.write(f"const int g_inference_backend = INFERENCE_BACKEND_{backend.upper()};\n")
 
         def emit_transformer_array(symbol: str, tensor: torch.Tensor) -> None:
             values = tensor.detach().cpu().numpy().astype(np.float32).reshape(-1)

@@ -7,7 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import DEFAULT_CONFIG, load_config, parse_conv_layers, parse_hidden_layers
 from .data.hub import AVAILABLE_DATASETS, get_dataset, normalize_dataset_name
-from .exporting import export_c_files, export_model_entry_to_main, export_pytorch_to_tflite
+from .exporting import (
+    export_c_files,
+    export_model_entry_to_main,
+    export_pytorch_to_tflite,
+    export_spiking_snn_to_tflite,
+)
+from .tflm_transformer import export_transformer_to_tflite
 from .models import ConfigurableANN, ConfigurableSpikingJellySNN
 from .optimization import compute_model_sparsity
 from .training import evaluate_subset, train_model
@@ -191,6 +197,9 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
                 "training": model_training,
                 "evaluation": model_evaluation,
                 "optimization": model_optimization,
+                # Deployment-only selection: excluded from the model's training
+                # signature so backend comparisons reuse the same checkpoint.
+                "deployment_backends": copy.deepcopy(m.get("deployment_backends", [])),
                 "microcontroller": global_microcontroller,
                 "joulescope": global_joulescope,
             })
@@ -321,6 +330,7 @@ def get_model_configs(config: Dict[str, Any], dataset_filter: Optional[str] = No
         "training": model_training,
         "evaluation": model_evaluation,
         "optimization": model_optimization,
+        "deployment_backends": copy.deepcopy(single_m.get("deployment_backends", [])),
         "microcontroller": global_microcontroller,
         "joulescope": global_joulescope,
     })
@@ -453,36 +463,64 @@ def train_all_models(
 
             deployable = bool(getattr(model, "deployable", True))
             is_transformer = bool(getattr(model, "is_compact_transformer", False) or getattr(model, "is_spiking_transformer", False))
-            tflite_bytes = export_pytorch_to_tflite(model) if m_type == "ann" and deployable and not is_transformer else b""
+            requested_backends = list(m_cfg.get("deployment_backends", []))
+            if not requested_backends:
+                requested_backends = ["tflm" if m_type == "ann" and not is_transformer else "cpp"]
+            requested_backends = [str(value).lower() for value in requested_backends]
+            if any(value not in ("cpp", "tflm") for value in requested_backends):
+                raise ValueError(f"Invalid deployment_backends for {m_cfg['name']}: {requested_backends}")
+            if m_type == "ann" and not is_transformer and "cpp" in requested_backends:
+                raise ValueError(
+                    f"'{m_cfg['name']}' is a standard ANN and currently has only the TFLM inference path; "
+                    "a separate C++ ANN kernel is not implemented."
+                )
+            ann_tflite = (export_transformer_to_tflite(model) if m_type == "ann" and is_transformer
+                          and deployable and "tflm" in requested_backends else
+                          export_pytorch_to_tflite(model)
+                          if m_type == "ann" and deployable and not is_transformer else b"")
+            snn_tflite = (export_transformer_to_tflite(model)
+                          if m_type == "snn" and is_transformer and deployable and "tflm" in requested_backends
+                          else export_spiking_snn_to_tflite(model)
+                          if m_type == "snn" and not is_transformer and deployable and "tflm" in requested_backends
+                          else b"")
+            if "tflm" in requested_backends and not (ann_tflite or snn_tflite):
+                raise ValueError(
+                    f"TFLM deployment was requested for '{m_cfg['name']}', but this architecture "
+                    "does not yet have a TFLM graph exporter."
+                )
 
             # Parameter count, sparsity, and model size
             total_params = sum(p.numel() for p in model.parameters())
             sparsity_info = compute_model_sparsity(model)
-            model_size_bytes = (total_params * 4) if m_type == "snn" or not tflite_bytes else len(tflite_bytes)
+            model_size_bytes = (total_params * 4) if m_type == "snn" or not ann_tflite else len(ann_tflite)
 
             num_steps = m_cfg["model"].get("num_steps") if m_type == "snn" else None
-            trained_entry = {
-                "name": f"{m_cfg['name']}{'_T' + str(num_steps) if num_steps is not None else ''}",
-                "type": m_type,
-                "dataset": ds,
-                "config": m_cfg,
-                "model": model,
-                "test_dataset": test_dataset,
-                "test_acc": test_acc,
-                "test_loss": test_loss,
-                "subset_acc": subset_acc,
-                "subset_test_acc": subset_acc,
-                "subset_correct": subset_correct,
-                "subset_total": subset_total,
-                "tflite_bytes": tflite_bytes,
-                "model_size_bytes": model_size_bytes,
-                "total_params": total_params,
-                "sparsity_pct": sparsity_info["sparsity_pct"],
-                "zero_weights": sparsity_info["zero_weights"],
-                "structure": model.get_structure_summary(),
-                "deployable": deployable,
-            }
-            trained_models.append(trained_entry)
+            base_name = f"{m_cfg['name']}{'_T' + str(num_steps) if num_steps is not None else ''}"
+            for backend in requested_backends:
+                variant = {
+                    "name": f"{base_name}_{backend.upper()}",
+                    "type": m_type,
+                    "dataset": ds,
+                    "config": m_cfg,
+                    "model": model,
+                    "test_dataset": test_dataset,
+                    "test_acc": test_acc,
+                    "test_loss": test_loss,
+                    "subset_acc": subset_acc,
+                    "subset_test_acc": subset_acc,
+                    "subset_correct": subset_correct,
+                    "subset_total": subset_total,
+                    "deployment_backend": backend,
+                    "tflite_bytes": (ann_tflite or snn_tflite) if backend == "tflm" else b"",
+                    "model_size_bytes": (len(ann_tflite or snn_tflite) if backend == "tflm"
+                                         else total_params * 4),
+                    "total_params": total_params,
+                    "sparsity_pct": sparsity_info["sparsity_pct"],
+                    "zero_weights": sparsity_info["zero_weights"],
+                    "structure": model.get_structure_summary(),
+                    "deployable": deployable,
+                }
+                trained_models.append(variant)
         else:
             print("[Evaluation] Skipped (--skip-evaluation).\n")
 

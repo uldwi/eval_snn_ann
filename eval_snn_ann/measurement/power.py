@@ -408,19 +408,24 @@ def print_comparison_summary(all_results: list):
     if not all_results:
         return
 
-    print("\n" + "=" * 184)
+    print()
     print("                                SUMMARY OF ALL MEASURED MODELS (ANN vs. SNN)")
-    print("=" * 184)
+    print("=" * 224)
 
-    header = f"{'Model name':<20} | {'Type':<5} | {'Network architecture':<38} | {'Host accuracy (10k)':<14} | {'ESP32 accuracy (test)':<18} | {'Size':<9} | {'Time/inf':<10} | {'Energy/inf':<12} | {'Avg. power':<14} | {'Total spikes (avg/inf)':<24} | {'Total SynOps (avg/inf)'}"
-    sub_hdr = f"{'':<20} | {'':<5} | {'':<38} | {'(%)':<14} | {'(% [correct])':<18} | {'(bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)':<14} | {'(count)':<24} | {'(count)'}"
+    header = f"{'Model name':<20} | {'Type':<5} | {'Backend':<7} | {'Device status':<15} | {'Network architecture':<38} | {'Host accuracy (10k)':<14} | {'ESP32 accuracy (test)':<18} | {'Size':<9} | {'Time/inf':<10} | {'Energy/inf':<12} | {'Avg. power':<14} | {'Total spikes (avg/inf)':<24} | {'Total SynOps (avg/inf)'}"
+    sub_hdr = f"{'':<20} | {'':<5} | {'':<7} | {'':<15} | {'':<38} | {'(%)':<14} | {'(% [correct])':<18} | {'(bytes)':<9} | {'(ms)':<10} | {'(µJ)':<12} | {'(mW)':<14} | {'(count)':<24} | {'(count)'}"
+    table_width = max(len(header), len(sub_hdr), 224)
+    print("=" * table_width)
     print(header)
     print(sub_hdr)
-    print("-" * 184)
+    print("-" * table_width)
 
     for res in all_results:
         name = res.get("name", "model")[:20]
         m_type = str(res.get("type", "ANN")).upper()[:5]
+        backend_value = str(res.get("deployment_backend", "-")).lower()
+        backend = {"cpp": "C++", "tflm": "TFLM"}.get(backend_value, backend_value.upper())[:7]
+        status = str(res.get("measurement_status", "measured"))[:15]
         structure = res.get("structure", "-")[:38]
         host_acc = f"{res['test_acc']:.2f} %" if res.get("test_acc") is not None else "N/A"
 
@@ -478,20 +483,24 @@ def print_comparison_summary(all_results: list):
             sample_count = metrics.get("esp32_total") or res.get("num_test_samples")
             spikes = metrics.get("esp32_spikes")
             synops = metrics.get("esp32_synops")
-            if spikes is not None:
+            if backend_value == "tflm":
+                # The current TFLM graph runtime does not instrument per-layer
+                # spike/SynOp counters; zero here would be misread as no activity.
+                spike_str = synops_str = "N/A"
+            elif spikes is not None:
                 spike_avg = spikes / sample_count if sample_count else None
                 spike_str = f"{spikes:,} ({spike_avg:.1f}/Inf)" if spike_avg is not None else f"{spikes:,}"
             else:
                 spike_str = "N/A"
-            if synops is not None:
+            if backend_value != "tflm" and synops is not None:
                 synops_avg = synops / sample_count if sample_count else None
                 synops_str = f"{synops:,} ({synops_avg:.1f}/Inf)" if synops_avg is not None else f"{synops:,}"
-            else:
+            elif backend_value != "tflm":
                 synops_str = "N/A"
 
-        print(f"{name:<20} | {m_type:<5} | {structure:<38} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg:<14} | {spike_str:<24} | {synops_str}")
+        print(f"{name:<20} | {m_type:<5} | {backend:<7} | {status:<15} | {structure:<38} | {host_acc:<14} | {esp32_acc_str:<18} | {size_str:<9} | {t_inf:<10} | {e_inf:<12} | {p_avg:<14} | {spike_str:<24} | {synops_str}")
 
-    print("=" * 184 + "\n")
+    print("=" * table_width + "\n")
 
 
 def measure_triggered(
@@ -1227,6 +1236,8 @@ def main():
                 all_results.append({
                     "name": model_name,
                     "type": model_entry.get("type", "ann"),
+                    "deployment_backend": model_entry.get("deployment_backend", "-"),
+                    "measurement_status": "host-only",
                     "structure": model_entry.get("structure", "-"),
                     "test_acc": model_entry.get("test_acc"),
                     "subset_acc": model_entry.get("subset_acc", model_entry.get("subset_test_acc")),
@@ -1273,6 +1284,25 @@ def main():
                             break
 
             if flash_failed:
+                all_results.append({
+                    "name": model_name,
+                    "type": model_entry.get("type", "ann"),
+                    "deployment_backend": model_entry.get("deployment_backend", "-"),
+                    "measurement_status": "flash failed",
+                    "structure": model_entry.get("structure", "-"),
+                    "test_acc": model_entry.get("test_acc"),
+                    "subset_acc": model_entry.get("subset_acc", model_entry.get("subset_test_acc")),
+                    "subset_test_acc": model_entry.get("subset_test_acc", model_entry.get("subset_acc")),
+                    "subset_correct": model_entry.get("subset_correct"),
+                    "subset_total": model_entry.get("subset_total"),
+                    "esp32_acc": None,
+                    "esp32_correct": None,
+                    "esp32_total": None,
+                    "model_size_bytes": model_entry.get("model_size_bytes"),
+                    "metrics": {},
+                    "num_test_samples": model_samples,
+                    "deployment_supported": model_entry.get("deployable", True),
+                })
                 continue
 
             # 3. Run the Joulescope measurement
@@ -1325,6 +1355,8 @@ def main():
             all_results.append({
                 "name": model_name,
                 "type": model_entry.get("type", "ann"),
+                "deployment_backend": model_entry.get("deployment_backend", "-"),
+                "measurement_status": "measured" if metrics else "no metrics",
                 "structure": model_entry.get("structure", "-"),
                 "test_acc": model_entry.get("test_acc"),
                 "subset_acc": model_entry.get("subset_acc", model_entry.get("subset_test_acc")),

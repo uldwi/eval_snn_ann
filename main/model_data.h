@@ -14,6 +14,9 @@ extern "C" {
 
 #define MODEL_TYPE_SPIKCOMMANDER 3
 
+#define INFERENCE_BACKEND_CPP 0
+#define INFERENCE_BACKEND_TFLM 1
+
 #define NEURON_TYPE_LIF 0
 #define NEURON_TYPE_IF  1
 
@@ -110,6 +113,7 @@ typedef struct { int tokens, input_features, embed_dim, num_heads, num_layers, f
 typedef struct { int tokens, input_features, embed_dim, num_heads, output_size; float beta, threshold; const float *p[40]; } spikcommander_weights_t;
 
 extern const int g_model_type;
+extern const int g_inference_backend;
 extern const char* const g_model_name;
 
 // ANN-specific TensorFlow Lite Micro FlatBuffer
