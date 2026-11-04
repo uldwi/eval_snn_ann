@@ -90,8 +90,10 @@ models:
     learning_rate: 0.0005
     # More training steps improve temporal feature learning; deployment remains
     # capped at eight steps to keep ESP32 inference cost unchanged.
-    num_steps: 16
+    num_steps: 24
     inference_steps: 8
+    # Emphasize the cumulative logits at the deployed eight-step horizon.
+    deployment_step_weight: 0.6
     early_exit:
       enabled: true
       min_steps: 2
@@ -153,8 +155,10 @@ models:
     learning_rate: 0.0005
     # More training steps improve temporal feature learning; deployment remains
     # capped at eight steps to keep ESP32 inference cost unchanged.
-    num_steps: 16
+    num_steps: 24
     inference_steps: 8
+    # Emphasize the cumulative logits at the deployed eight-step horizon.
+    deployment_step_weight: 0.6
     early_exit:
       enabled: true
       min_steps: 2

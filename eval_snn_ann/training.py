@@ -153,6 +153,7 @@ def compute_model_signature(config: Dict[str, Any], dataset_info: Any = None) ->
             "input_scale": float(model_cfg.get("input_scale", 1.0)),
             "distillation": copy.deepcopy(model_cfg.get("distillation", {})),
             "step_supervision": bool(model_cfg.get("step_supervision", False)),
+            "deployment_step_weight": float(model_cfg.get("deployment_step_weight", 0.0)),
             "ann_checkpoint": model_cfg.get("ann_checkpoint"),
         }
         if architecture in ("spike_driven_transformer", "spikedriven_transformer"):
@@ -1063,9 +1064,19 @@ def train_model(
                 output = step_outputs[-1]
                 step_weights = torch.arange(1, step_outputs.size(0) + 1, device=device, dtype=step_outputs.dtype)
                 step_weights = step_weights / step_weights.sum()
-                hard_loss = sum(
+                temporal_hard_loss = sum(
                     step_weights[index] * criterion(step_outputs[index], target)
                     for index in range(step_outputs.size(0))
+                )
+                deployment_step_weight = float(model_cfg.get("deployment_step_weight", 0.0))
+                if not 0.0 <= deployment_step_weight <= 1.0:
+                    raise ValueError("model.deployment_step_weight must be between 0 and 1.")
+                deployment_step = min(
+                    step_outputs.size(0), max(1, int(getattr(model, "inference_steps", step_outputs.size(0))))
+                ) - 1
+                hard_loss = (
+                    (1.0 - deployment_step_weight) * temporal_hard_loss
+                    + deployment_step_weight * criterion(step_outputs[deployment_step], target)
                 )
             else:
                 output = model(data)
@@ -1084,7 +1095,13 @@ def train_model(
                     for step_output in distillation_outputs
                 ]
                 if step_outputs is not None:
-                    soft_loss = sum(step_weights[index] * value for index, value in enumerate(soft_losses))
+                    temporal_soft_loss = sum(
+                        step_weights[index] * value for index, value in enumerate(soft_losses)
+                    )
+                    soft_loss = (
+                        (1.0 - deployment_step_weight) * temporal_soft_loss
+                        + deployment_step_weight * soft_losses[deployment_step]
+                    )
                 else:
                     soft_loss = soft_losses[0]
                 loss = (1.0 - distill_alpha) * hard_loss + distill_alpha * soft_loss
